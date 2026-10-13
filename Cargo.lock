@@ -519,6 +519,7 @@ dependencies = [
 name = "rfind-integration-tests"
 version = "0.1.0"
 dependencies = [
+ "rfind-config",
  "rfind-core",
  "rusqlite",
 ]

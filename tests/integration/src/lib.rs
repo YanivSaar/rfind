@@ -11,6 +11,22 @@ fn open() -> rusqlite::Connection {
     db::open(&db_path()).expect("Cannot open index database — is rfindd done scanning?")
 }
 
+fn search_by_glob(conn: &rusqlite::Connection, pattern: &str) -> rusqlite::Result<Vec<String>> {
+    let mut v = Vec::new();
+    db::search_by_glob_streaming(conn, pattern, None, None, |p| { v.push(p.to_string()); true })?;
+    Ok(v)
+}
+
+fn search_under(
+    conn: &rusqlite::Connection,
+    prefix: &str,
+    name: Option<&str>,
+) -> rusqlite::Result<Vec<String>> {
+    let mut v = Vec::new();
+    db::search_under_streaming(conn, prefix, name, None, None, |p| { v.push(p.to_string()); true })?;
+    Ok(v)
+}
+
 // -------------------------------------------------------------------------
 // Exact match
 // -------------------------------------------------------------------------
@@ -19,7 +35,7 @@ fn open() -> rusqlite::Connection {
 #[ignore]
 fn exact_match_passwd_returns_results() {
     let conn = open();
-    let results = db::search_by_glob(&conn, "passwd").unwrap();
+    let results = search_by_glob(&conn, "passwd").unwrap();
     assert!(!results.is_empty(), "Expected at least one 'passwd' entry");
 }
 
@@ -27,7 +43,7 @@ fn exact_match_passwd_returns_results() {
 #[ignore]
 fn exact_match_passwd_all_basenames_correct() {
     let conn = open();
-    let results = db::search_by_glob(&conn, "passwd").unwrap();
+    let results = search_by_glob(&conn, "passwd").unwrap();
     for path in &results {
         let basename = std::path::Path::new(path)
             .file_name()
@@ -46,8 +62,8 @@ fn exact_match_passwd_all_basenames_correct() {
 #[ignore]
 fn case_sensitive_uppercase_returns_nothing() {
     let conn = open();
-    let upper = db::search_by_glob(&conn, "PASSWD").unwrap();
-    let mixed = db::search_by_glob(&conn, "Passwd").unwrap();
+    let upper = search_by_glob(&conn, "PASSWD").unwrap();
+    let mixed = search_by_glob(&conn, "Passwd").unwrap();
     assert!(upper.is_empty(), "PASSWD should return 0 results on Linux, got: {upper:?}");
     assert!(mixed.is_empty(), "Passwd should return 0 results on Linux, got: {mixed:?}");
 }
@@ -56,7 +72,7 @@ fn case_sensitive_uppercase_returns_nothing() {
 #[ignore]
 fn case_sensitive_lowercase_returns_results() {
     let conn = open();
-    let results = db::search_by_glob(&conn, "passwd").unwrap();
+    let results = search_by_glob(&conn, "passwd").unwrap();
     assert!(!results.is_empty(), "passwd should return results");
 }
 
@@ -68,7 +84,7 @@ fn case_sensitive_lowercase_returns_results() {
 #[ignore]
 fn glob_star_matches_extension() {
     let conn = open();
-    let results = db::search_by_glob(&conn, "*.conf").unwrap();
+    let results = search_by_glob(&conn, "*.conf").unwrap();
     assert!(!results.is_empty(), "*.conf should match files");
     for path in &results {
         assert!(
@@ -84,7 +100,7 @@ fn glob_question_mark_matches_single_char() {
     let conn = open();
     // "pass??" should match "passwd" (5 chars after "pass" — wait, passwd
     // is 6 chars: p-a-s-s-w-d, so "pass??" matches it)
-    let results = db::search_by_glob(&conn, "pass??").unwrap();
+    let results = search_by_glob(&conn, "pass??").unwrap();
     assert!(
         results.iter().any(|p| p.ends_with("/passwd")),
         "pass?? should match passwd, got: {results:?}"
@@ -95,7 +111,7 @@ fn glob_question_mark_matches_single_char() {
 #[ignore]
 fn glob_no_match_returns_empty() {
     let conn = open();
-    let results = db::search_by_glob(&conn, "this_file_xyz_does_not_exist_abc123").unwrap();
+    let results = search_by_glob(&conn, "this_file_xyz_does_not_exist_abc123").unwrap();
     assert!(results.is_empty(), "Expected no results for nonexistent name");
 }
 
@@ -107,7 +123,7 @@ fn glob_no_match_returns_empty() {
 #[ignore]
 fn search_under_restricts_to_prefix() {
     let conn = open();
-    let results = db::search_under(&conn, "/etc", Some("*.conf")).unwrap();
+    let results = search_under(&conn, "/etc", Some("*.conf")).unwrap();
     assert!(!results.is_empty(), "Expected .conf files under /etc");
     for path in &results {
         assert!(
@@ -121,7 +137,7 @@ fn search_under_restricts_to_prefix() {
 #[ignore]
 fn search_under_nonexistent_dir_returns_empty() {
     let conn = open();
-    let results = db::search_under(&conn, "/nonexistent_dir_xyz", None).unwrap();
+    let results = search_under(&conn, "/nonexistent_dir_xyz", None).unwrap();
     assert!(results.is_empty(), "Expected no results under nonexistent dir");
 }
 
@@ -129,8 +145,8 @@ fn search_under_nonexistent_dir_returns_empty() {
 #[ignore]
 fn search_under_case_sensitive() {
     let conn = open();
-    let lower = db::search_under(&conn, "/etc", Some("passwd")).unwrap();
-    let upper = db::search_under(&conn, "/etc", Some("PASSWD")).unwrap();
+    let lower = search_under(&conn, "/etc", Some("passwd")).unwrap();
+    let upper = search_under(&conn, "/etc", Some("PASSWD")).unwrap();
     assert!(!lower.is_empty(), "/etc/passwd should exist");
     assert!(upper.is_empty(), "PASSWD under /etc should not exist on Linux");
 }
@@ -143,9 +159,11 @@ fn search_under_case_sensitive() {
 #[ignore]
 fn excluded_paths_not_indexed() {
     let conn = open();
-    let excluded = ["/proc", "/sys", "/dev", "/run", "/mnt", "/media"];
-    for prefix in &excluded {
-        let results = db::search_under(&conn, prefix, None).unwrap();
+    let cfg = rfind_config::load(std::path::Path::new(rfind_config::DEFAULT_CONFIG_PATH))
+        .expect("Cannot read rfindd config");
+    for prefix in &cfg.scan.exclude {
+        let prefix = prefix.to_string_lossy();
+        let results = search_under(&conn, &prefix, None).unwrap();
         assert!(
             results.is_empty(),
             "Excluded path {prefix} has {} indexed entries: {:?}",
@@ -170,53 +188,38 @@ fn entry_count_is_nonzero() {
 
 #[test]
 #[ignore]
-fn all_entries_have_nonempty_basename() {
+fn all_entries_have_nonempty_name() {
     let conn = open();
     let bad: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM entries WHERE basename = '' OR basename IS NULL",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT COUNT(*) FROM entries WHERE name = ''", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(bad, 0, "{bad} entries have empty or null basename");
+    assert_eq!(bad, 0, "{bad} entries have an empty name");
 }
 
 #[test]
 #[ignore]
-fn all_entries_have_nonempty_full_path() {
+fn every_entry_has_a_parent_directory_row() {
     let conn = open();
-    let bad: i64 = conn
+    let orphans: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM entries WHERE full_path = '' OR full_path IS NULL",
+            "SELECT COUNT(*) FROM entries e LEFT JOIN dirs d ON d.id = e.dir_id WHERE d.id IS NULL",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(bad, 0, "{bad} entries have empty or null full_path");
+    assert_eq!(orphans, 0, "{orphans} entries point at a missing directory row");
 }
 
 #[test]
 #[ignore]
-fn basename_matches_full_path_suffix() {
+fn directory_paths_are_normalized() {
     let conn = open();
-    // Sample 1000 entries and verify basename == last component of full_path.
-    let mut stmt = conn
-        .prepare("SELECT basename, full_path FROM entries LIMIT 1000")
+    let bad: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM dirs WHERE path LIKE '%/' OR (path <> '' AND path NOT LIKE '/%')",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
-    let rows: Vec<(String, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .unwrap()
-        .flatten()
-        .collect();
-    for (basename, full_path) in &rows {
-        let expected = std::path::Path::new(full_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-        assert_eq!(
-            basename, expected,
-            "Basename mismatch: stored={basename}, path={full_path}"
-        );
-    }
+    assert_eq!(bad, 0, "{bad} directory paths have a trailing or missing leading '/'");
 }

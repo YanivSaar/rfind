@@ -82,8 +82,26 @@ and kept current via kernel filesystem notifications. No more waiting for
 ### One-liner install
 
 ```bash
-git clone https://github.com/YanivSaar/rfind.git && cd rfind && bash scripts/install.sh
+curl -fsSL https://raw.githubusercontent.com/YanivSaar/rfind/main/scripts/install.sh | sudo bash
 ```
+
+Builds from source (installs a C compiler and Rust if missing), installs
+`rfind` + `rfindd` to `/usr/local/bin`, and enables the `rfindd` systemd
+service. On WSL2 a first install configures Windows drives as periodic roots.
+
+| Task | One-liner |
+|------|-----------|
+| Install / update | `curl -fsSL https://raw.githubusercontent.com/YanivSaar/rfind/main/scripts/install.sh \| sudo bash` |
+| From a clone | `git clone https://github.com/YanivSaar/rfind.git && cd rfind && sudo ./scripts/install.sh` |
+| Specific branch/tag | `curl -fsSL …/install.sh \| sudo RFIND_REF=v0.6.0 bash` |
+| Uninstall (keep index) | `curl -fsSL …/install.sh \| sudo bash -s -- --uninstall` |
+| Uninstall + purge | `curl -fsSL …/install.sh \| sudo bash -s -- --uninstall --purge` |
+| Watch first scan | `rfind status --watch` |
+| Benchmark vs find/locate | `sudo ./scripts/bench.sh --quick` |
+
+Updating is the same command: it rebuilds, swaps the binaries, restarts the
+daemon and never overwrites `/etc/rfindd/config.toml`. If the index format
+changed, rfindd rebuilds the index on its own.
 
 ### Search immediately after install
 
@@ -135,8 +153,8 @@ git clone https://github.com/YanivSaar/rfind.git
 cd rfind
 cargo build --release
 
-# Install
-sudo bash scripts/install.sh
+# Install (reuses the build above)
+sudo ./scripts/install.sh
 ```
 
 ---
@@ -253,9 +271,10 @@ rfind/
 │   ├── rfindd/           # Daemon binary
 │   └── rfind-cli/        # rfind CLI binary
 ├── tests/
-│   └── integration/      # 15 integration tests
+│   └── integration/      # Integration tests against the live index
 ├── scripts/
-│   └── install.sh        # Build + install script
+│   ├── install.sh        # Build + install / update / uninstall
+│   └── bench.sh          # Benchmark vs find and locate
 ├── packaging/
 │   └── systemd/          # rfindd.service unit file
 └── .github/
@@ -320,18 +339,33 @@ fanotify_mark(FAN_MARK_MOUNT, "/")
 
 ### Database schema
 
+Schema v4 is normalized: each directory path is stored once, and each entry
+stores only its name and its parent directory's id. A full path is
+`dirs.path || '/' || entries.name` (the root directory is stored as `''`).
+This halves the index compared with storing every full path (which SQLite
+also duplicated in the path index), and renaming a directory only rewrites
+`dirs` rows.
+
 ```sql
--- Core index: every filesystem entry
-CREATE TABLE entries (
-    id            INTEGER PRIMARY KEY,
-    parent_id     INTEGER,           -- directory relationship
-    basename      TEXT NOT NULL,     -- filename only (fast name search)
-    full_path     TEXT NOT NULL,     -- absolute path (fast path search)
-    is_dir        INTEGER NOT NULL,
-    mtime_sec     INTEGER NOT NULL,  -- modification time (Unix seconds)
-    mtime_nsec    INTEGER NOT NULL,  -- nanosecond precision
-    discovered_at INTEGER NOT NULL   -- when indexed
+-- One row per directory that has entries
+CREATE TABLE dirs (
+    id   INTEGER PRIMARY KEY,
+    path TEXT NOT NULL UNIQUE        -- no trailing '/'; root is ''
 );
+
+-- Every filesystem entry
+CREATE TABLE entries (
+    id         INTEGER PRIMARY KEY,
+    dir_id     INTEGER NOT NULL,     -- parent directory (dirs.id)
+    name       TEXT    NOT NULL,     -- basename
+    is_dir     INTEGER NOT NULL,
+    mtime_sec  INTEGER NOT NULL,     -- modification time (Unix seconds)
+    mtime_nsec INTEGER NOT NULL,
+    scan_gen   INTEGER NOT NULL      -- last scan generation that saw it
+);
+CREATE UNIQUE INDEX idx_entries_dir_name ON entries (dir_id, name);  -- upserts
+CREATE INDEX        idx_entries_name     ON entries (name);          -- name search
+CREATE INDEX        idx_entries_mtime    ON entries (mtime_sec);     -- rfind recent
 
 -- Durable event journal: survives daemon crashes and restarts
 CREATE TABLE pending_events (
@@ -344,9 +378,19 @@ CREATE TABLE pending_events (
     applied    INTEGER    -- 0=pending, 1=applied
 );
 
--- Daemon state: last scan time, entry count, monitoring mode
+-- Daemon state: last scan time, scan generation, monitoring mode
 CREATE TABLE scan_metadata (key TEXT PRIMARY KEY, value TEXT);
 ```
+
+The index is a cache of the filesystem: an index with an older schema
+version (`PRAGMA user_version`) is dropped and rebuilt by a full scan.
+
+**Consistency:** scans upsert rows tagged with a new generation, then delete
+the rows under their root that they didn't see — searches never see an
+empty index mid-scan. Journaled events are applied by re-checking each path
+on disk, in transactions that also mark them applied, so replays are
+harmless. Bind mounts of an already-indexed filesystem (e.g. WSL2's
+`/mnt/wslg/distro`) are detected from `/proc/self/mountinfo` and skipped.
 
 ### Restart behaviour
 
@@ -367,6 +411,15 @@ On daemon restart:
 
 | Entries | Index size (approx) |
 |--------:|--------------------:|
+| 150k | ~30 MB |
+| 1.5M | ~300 MB |
+| 10M | ~2 GB |
+| 100M | ~20 GB |
+
+Measured: 1.46M entries (WSL2, Linux + a Windows drive) → 296 MB, about
+215 bytes/entry including the name, directory and mtime indexes.
+
+--------:|--------------------:|
 | 136k | ~48 MB |
 | 1M | ~350 MB |
 | 10M | ~3.5 GB |
@@ -384,7 +437,7 @@ Normalized parent-ID schema avoids storing full paths redundantly.
 - Progress file at `/run/rfindd/progress.json` — world-readable (filenames only, no content)
 - Search queries read the index directly — no daemon IPC required
 - Symlinks are **not followed** during scan (prevents cycles)
-- Excluded paths (`/proc`, `/sys`, `/dev`, `/run`, `/mnt`, `/media`) are never indexed
+- Excluded paths (default `/proc`, `/sys`, `/dev`, `/run`, `/media`) are never indexed
 
 ---
 
@@ -396,6 +449,10 @@ cargo test -- --ignored
 
 # Run unit tests only (no daemon required)
 cargo test
+
+# Compare against find and locate on this machine (latency, accuracy, freshness)
+sudo ./scripts/bench.sh --quick     # Linux side only, ~1 min
+sudo ./scripts/bench.sh             # include periodic roots such as /mnt/c
 ```
 
 ### Test coverage (15 tests)

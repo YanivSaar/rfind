@@ -5,4 +5,5 @@ edition = "2021"
 
 [dependencies]
 rfind-core = { path = "../../crates/rfind-core" }
+rfind-config = { path = "../../crates/rfind-config" }
 rusqlite = { version = "0.32", features = ["bundled"] }

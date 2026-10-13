@@ -133,21 +133,19 @@ fn make_progress(
 }
 
 fn flush_batch(conn: &Connection, batch: &mut Vec<EntryInfo>, scan_gen: i64) {
-    let now = now_secs();
     let tx = match conn.unchecked_transaction() {
         Ok(t) => t,
         Err(e) => { error!("tx error: {e}"); batch.clear(); return; }
     };
-    for entry in batch.drain(..) {
-        let full_path = entry.path.to_string_lossy().to_string();
-        let basename  = entry.path.file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        if let Err(e) = db::insert_entry(
-            &tx, None, &basename, &full_path,
-            entry.is_dir, entry.mtime_sec, entry.mtime_nsec, now, Some(scan_gen),
-        ) {
-            error!("insert {full_path}: {e}");
+    {
+        let mut ins = db::Inserter::new(&tx);
+        for entry in batch.drain(..) {
+            let full_path = entry.path.to_string_lossy();
+            if let Err(e) = ins.insert(
+                &full_path, entry.is_dir, entry.mtime_sec, entry.mtime_nsec, Some(scan_gen),
+            ) {
+                error!("insert {full_path}: {e}");
+            }
         }
     }
     if let Err(e) = tx.commit() { error!("commit: {e}"); }
@@ -162,15 +160,7 @@ fn sync_path(conn: &Connection, cfg: &Config, path: &str) -> rusqlite::Result<()
     let p = Path::new(path);
     if is_excluded(cfg, p) { return Ok(()); }
     match fs::symlink_metadata(p) {
-        Ok(md) => {
-            let basename = p.file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            db::insert_entry(
-                conn, None, &basename, path, md.is_dir(),
-                md.mtime(), md.mtime_nsec(), now_secs(), None,
-            )
-        }
+        Ok(md) => db::insert_entry(conn, path, md.is_dir(), md.mtime(), md.mtime_nsec(), None),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             db::delete_entries_under(conn, path).map(|_| ())
         }
