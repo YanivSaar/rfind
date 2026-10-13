@@ -1,0 +1,8 @@
+[package]
+name = "rfind-integration-tests"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rfind-core = { path = "../../crates/rfind-core" }
+rusqlite = { version = "0.32", features = ["bundled"] }

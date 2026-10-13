@@ -23,14 +23,15 @@ enum Command {
         #[arg(short, long)]
         watch: bool,
     },
-    /// Search by filename (exact or glob: * and ? supported).
+    /// Search by filename (exact or glob: * and ? supported, case-sensitive).
     #[command(name = "--name", alias = "name")]
     Name {
         pattern: String,
+        /// Restrict results to this directory tree.
         #[arg(long)]
         under: Option<String>,
     },
-    /// Search by full path glob.
+    /// Search by full path glob (case-sensitive).
     #[command(name = "--path", alias = "path")]
     Path {
         pattern: String,
@@ -57,20 +58,6 @@ fn print_progress(p: &ScanProgress) {
     println!("Status      : {}", p.status_line);
 }
 
-fn glob_to_like(glob: &str) -> String {
-    let mut out = String::with_capacity(glob.len() + 4);
-    for ch in glob.chars() {
-        match ch {
-            '*' => out.push('%'),
-            '?' => out.push('_'),
-            '%' => { out.push('\\'); out.push('%'); }
-            '_' => { out.push('\\'); out.push('_'); }
-            c   => out.push(c),
-        }
-    }
-    out
-}
-
 fn open_db() -> Option<rusqlite::Connection> {
     match db::open(&db_path()) {
         Ok(c) => Some(c),
@@ -82,11 +69,19 @@ fn open_db() -> Option<rusqlite::Connection> {
     }
 }
 
-/// Print a result line, returning false if stdout is closed (broken pipe).
 fn print_result(path: &str) -> bool {
     let stdout = io::stdout();
     let mut handle = stdout.lock();
     writeln!(handle, "{path}").is_ok()
+}
+
+fn print_results(paths: Vec<String>) {
+    let mut count = 0usize;
+    for p in &paths {
+        if !print_result(p) { break; }
+        count += 1;
+    }
+    eprintln!("\n{count} result(s)");
 }
 
 fn main() {
@@ -122,37 +117,21 @@ fn main() {
 
         Command::Name { pattern, under } => {
             let conn = match open_db() { Some(c) => c, None => return };
-            let like = glob_to_like(&pattern);
             let results = if let Some(ref prefix) = under {
-                db::search_under(&conn, prefix, Some(&like))
+                db::search_under(&conn, prefix, Some(&pattern))
             } else {
-                db::search_by_glob(&conn, &like)
+                db::search_by_glob(&conn, &pattern)
             };
             match results {
-                Ok(paths) => {
-                    let mut count = 0usize;
-                    for p in &paths {
-                        if !print_result(p) { break; } // stdout closed (head, pipe)
-                        count += 1;
-                    }
-                    eprintln!("\n{count} result(s)");
-                }
+                Ok(paths) => print_results(paths),
                 Err(e) => eprintln!("Search error: {e}"),
             }
         }
 
         Command::Path { pattern } => {
             let conn = match open_db() { Some(c) => c, None => return };
-            let like = glob_to_like(&pattern);
-            match db::search_under(&conn, "", Some(&like)) {
-                Ok(paths) => {
-                    let mut count = 0usize;
-                    for p in &paths {
-                        if !print_result(p) { break; }
-                        count += 1;
-                    }
-                    eprintln!("\n{count} result(s)");
-                }
+            match db::search_by_path_glob(&conn, &pattern) {
+                Ok(paths) => print_results(paths),
                 Err(e) => eprintln!("Search error: {e}"),
             }
         }

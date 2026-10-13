@@ -428,6 +428,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rfind-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "rfind-core",
+ "rusqlite",
+]
+
+[[package]]
 name = "rfind-scanner"
 version = "0.1.0"
 dependencies = [

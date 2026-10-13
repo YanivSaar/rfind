@@ -1,37 +1,33 @@
 //! SQLite index: schema, insertion, and search queries.
 //!
-//! Schema
-//! ------
-//! One table: `entries`
+//! # Case sensitivity
+//! SQLite LIKE is case-insensitive for ASCII by default, which is wrong
+//! for Linux filesystems. We use GLOB instead, which is always
+//! case-sensitive and uses * / ? wildcards matching shell glob semantics.
+//! For exact lookups we use = which is always case-sensitive.
+//!
+//! # Schema
+//! entries table:
 //!   id        INTEGER PRIMARY KEY
 //!   parent_id INTEGER  (NULL for roots)
 //!   basename  TEXT NOT NULL
 //!   full_path TEXT NOT NULL
-//!   is_dir    INTEGER NOT NULL  (0/1)
+//!   is_dir    INTEGER NOT NULL
 //!
-//! Indexes
-//! -------
-//!   idx_basename   on basename          — exact name lookups
-//!   idx_full_path  on full_path         — full path lookups
-//!   idx_parent     on parent_id         — directory children
-//!
-//! WAL mode is enabled so reads never block writes during the initial scan.
+//! Indexes:
+//!   idx_basename  on basename   — exact and glob name lookups
+//!   idx_full_path on full_path  — path prefix and glob lookups
+//!   idx_parent    on parent_id  — directory children
 
 use rusqlite::{params, Connection, Result};
 use std::path::Path;
 
-/// Open (or create) the index database at the given path.
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
-
-    // WAL mode: readers don't block writers and vice versa.
     conn.execute_batch("PRAGMA journal_mode=WAL;")?;
-    // Relaxed durability during bulk insert — we can rebuild from a scan.
     conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
-    // 64 MB page cache.
     conn.execute_batch("PRAGMA cache_size=-65536;")?;
     conn.execute_batch("PRAGMA temp_store=MEMORY;")?;
-
     conn.execute_batch("
         CREATE TABLE IF NOT EXISTS entries (
             id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,11 +43,9 @@ pub fn open(path: &Path) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_parent
             ON entries (parent_id);
     ")?;
-
     Ok(conn)
 }
 
-/// Insert one entry. Returns the new row id.
 pub fn insert_entry(
     conn: &Connection,
     parent_id: Option<i64>,
@@ -67,8 +61,8 @@ pub fn insert_entry(
     Ok(conn.last_insert_rowid())
 }
 
-/// Search by exact basename.
-pub fn search_by_name(conn: &Connection, name: &str) -> Result<Vec<String>> {
+/// Exact basename lookup. Always case-sensitive (uses =).
+pub fn search_exact(conn: &Connection, name: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare_cached(
         "SELECT full_path FROM entries WHERE basename = ?1 ORDER BY full_path",
     )?;
@@ -76,35 +70,76 @@ pub fn search_by_name(conn: &Connection, name: &str) -> Result<Vec<String>> {
     rows.collect()
 }
 
-/// Search by basename glob (SQL LIKE pattern, case-sensitive on Linux).
-/// Caller should convert shell globs: * -> %, ? -> _
+/// Basename glob search. Case-sensitive (uses GLOB).
+/// Pattern uses * and ? — same as shell globs.
+/// If pattern contains no wildcards, falls through to exact match.
 pub fn search_by_glob(conn: &Connection, pattern: &str) -> Result<Vec<String>> {
+    if !pattern.contains('*') && !pattern.contains('?') {
+        return search_exact(conn, pattern);
+    }
     let mut stmt = conn.prepare_cached(
-        "SELECT full_path FROM entries WHERE basename LIKE ?1 ORDER BY full_path",
+        "SELECT full_path FROM entries WHERE basename GLOB ?1 ORDER BY full_path",
     )?;
     let rows = stmt.query_map(params![pattern], |row| row.get(0))?;
     rows.collect()
 }
 
-/// Search entries under a specific directory prefix.
+/// Search entries under a directory prefix, with optional glob on basename.
+/// Both the path prefix check and the name glob are case-sensitive.
 pub fn search_under(
     conn: &Connection,
     prefix: &str,
     name_pattern: Option<&str>,
 ) -> Result<Vec<String>> {
-    let path_pattern = format!("{}%", prefix);
-    let name_pat = name_pattern.unwrap_or("%");
+    match name_pattern {
+        None => {
+            // No name filter — return everything under prefix.
+            let mut stmt = conn.prepare_cached(
+                "SELECT full_path FROM entries
+                 WHERE full_path GLOB ?1
+                 ORDER BY full_path",
+            )?;
+            let glob_prefix = format!("{}*", prefix);
+            let rows = stmt.query_map(params![glob_prefix], |row| row.get(0))?;
+            rows.collect()
+        }
+        Some(name_pat) => {
+            if !name_pat.contains('*') && !name_pat.contains('?') {
+                // Exact name under prefix.
+                let mut stmt = conn.prepare_cached(
+                    "SELECT full_path FROM entries
+                     WHERE full_path GLOB ?1
+                       AND basename = ?2
+                     ORDER BY full_path",
+                )?;
+                let glob_prefix = format!("{}*", prefix);
+                let rows = stmt.query_map(params![glob_prefix, name_pat], |row| row.get(0))?;
+                rows.collect()
+            } else {
+                // Glob name under prefix.
+                let mut stmt = conn.prepare_cached(
+                    "SELECT full_path FROM entries
+                     WHERE full_path GLOB ?1
+                       AND basename GLOB ?2
+                     ORDER BY full_path",
+                )?;
+                let glob_prefix = format!("{}*", prefix);
+                let rows = stmt.query_map(params![glob_prefix, name_pat], |row| row.get(0))?;
+                rows.collect()
+            }
+        }
+    }
+}
+
+/// Full path glob search. Case-sensitive (uses GLOB).
+pub fn search_by_path_glob(conn: &Connection, pattern: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT full_path FROM entries
-         WHERE full_path LIKE ?1
-           AND basename LIKE ?2
-         ORDER BY full_path",
+        "SELECT full_path FROM entries WHERE full_path GLOB ?1 ORDER BY full_path",
     )?;
-    let rows = stmt.query_map(params![path_pattern, name_pat], |row| row.get(0))?;
+    let rows = stmt.query_map(params![pattern], |row| row.get(0))?;
     rows.collect()
 }
 
-/// Total number of indexed entries.
 pub fn entry_count(conn: &Connection) -> Result<i64> {
     conn.query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
 }
