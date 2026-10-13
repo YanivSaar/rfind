@@ -1,9 +1,15 @@
 //! SQLite index: schema, insertion, search, streaming, health, stats,
 //! and event journal.
 //!
-//! # Schema version 2
-//! entries gains: mtime_sec, mtime_nsec, discovered_at
-//! New indexes: idx_mtime, idx_discovered
+//! # Schema version 3
+//! entries gains: mtime_sec, mtime_nsec, discovered_at (v2), scan_gen (v3)
+//! full_path is UNIQUE (v3) so inserts are idempotent upserts.
+//!
+//! # Subtree queries
+//! Subtrees are selected with a half-open range on full_path
+//! (`p/` <= full_path < `p0`, since '0' follows '/' in ASCII) rather than
+//! GLOB, so paths containing `*?[]` match literally and `/a/b` never
+//! matches `/a/bc`.
 
 use rusqlite::{params, Connection, Result, Row};
 use std::path::Path;
@@ -27,18 +33,9 @@ pub fn open(path: &Path) -> Result<Connection> {
             is_dir        INTEGER NOT NULL DEFAULT 0,
             mtime_sec     INTEGER NOT NULL DEFAULT 0,
             mtime_nsec    INTEGER NOT NULL DEFAULT 0,
-            discovered_at INTEGER NOT NULL DEFAULT 0
+            discovered_at INTEGER NOT NULL DEFAULT 0,
+            scan_gen      INTEGER NOT NULL DEFAULT 0
         );
-        CREATE INDEX IF NOT EXISTS idx_basename
-            ON entries (basename);
-        CREATE INDEX IF NOT EXISTS idx_full_path
-            ON entries (full_path);
-        CREATE INDEX IF NOT EXISTS idx_parent
-            ON entries (parent_id);
-        CREATE INDEX IF NOT EXISTS idx_mtime
-            ON entries (mtime_sec);
-        CREATE INDEX IF NOT EXISTS idx_discovered
-            ON entries (discovered_at);
 
         CREATE TABLE IF NOT EXISTS pending_events (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,8 +54,18 @@ pub fn open(path: &Path) -> Result<Connection> {
             value TEXT NOT NULL
         );
     ")?;
-    // Migrate older schemas that lack the new columns.
+    // Migrate older schemas that lack the new columns, then index them.
     migrate(&conn)?;
+    conn.execute_batch("
+        CREATE INDEX IF NOT EXISTS idx_basename
+            ON entries (basename);
+        CREATE INDEX IF NOT EXISTS idx_parent
+            ON entries (parent_id);
+        CREATE INDEX IF NOT EXISTS idx_mtime
+            ON entries (mtime_sec);
+        CREATE INDEX IF NOT EXISTS idx_discovered
+            ON entries (discovered_at);
+    ")?;
     Ok(conn)
 }
 
@@ -68,18 +75,48 @@ fn migrate(conn: &Connection) -> Result<()> {
         "ALTER TABLE entries ADD COLUMN mtime_sec     INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE entries ADD COLUMN mtime_nsec    INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE entries ADD COLUMN discovered_at INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE entries ADD COLUMN scan_gen      INTEGER NOT NULL DEFAULT 0",
     ];
     for sql in &migrations {
         // Ignore "duplicate column" errors — that means it already exists.
         let _ = conn.execute_batch(sql);
     }
+
+    // v3: full_path becomes unique. Older indexes may hold duplicate rows
+    // (scan + replayed CREATE events), so dedupe before building the index.
+    let has_unique: bool = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type='index' AND name='idx_full_path_unique'",
+        [], |r| r.get::<_, i64>(0),
+    )? > 0;
+    if !has_unique {
+        conn.execute_batch("
+            BEGIN;
+            DELETE FROM entries WHERE id NOT IN
+                (SELECT MIN(id) FROM entries GROUP BY full_path);
+            DROP INDEX IF EXISTS idx_full_path;
+            CREATE UNIQUE INDEX idx_full_path_unique ON entries (full_path);
+            COMMIT;
+        ")?;
+    }
     Ok(())
+}
+
+/// Half-open range [lo, hi) of full_path values strictly under `path`.
+fn subtree_range(path: &str) -> (String, String) {
+    let base = path.trim_end_matches('/');
+    (format!("{base}/"), format!("{base}0"))
 }
 
 // ---------------------------------------------------------------------------
 // Entry operations
 // ---------------------------------------------------------------------------
 
+/// Insert or update the entry at `full_path`.
+///
+/// `scan_gen`: `Some(g)` marks the row as seen by scan generation `g`
+/// (scanner); `None` leaves an existing row's generation untouched
+/// (live events). `discovered_at` is kept from the first insert.
 pub fn insert_entry(
     conn: &Connection,
     parent_id: Option<i64>,
@@ -89,18 +126,24 @@ pub fn insert_entry(
     mtime_sec: i64,
     mtime_nsec: i64,
     discovered_at: i64,
-) -> Result<i64> {
-    conn.execute(
+    scan_gen: Option<i64>,
+) -> Result<()> {
+    conn.prepare_cached(
         "INSERT INTO entries
              (parent_id, basename, full_path, is_dir,
-              mtime_sec, mtime_nsec, discovered_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7)",
-        params![
-            parent_id, basename, full_path, is_dir as i32,
-            mtime_sec, mtime_nsec, discovered_at
-        ],
-    )?;
-    Ok(conn.last_insert_rowid())
+              mtime_sec, mtime_nsec, discovered_at, scan_gen)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,COALESCE(?8,0))
+         ON CONFLICT(full_path) DO UPDATE SET
+             basename   = excluded.basename,
+             is_dir     = excluded.is_dir,
+             mtime_sec  = excluded.mtime_sec,
+             mtime_nsec = excluded.mtime_nsec,
+             scan_gen   = COALESCE(?8, scan_gen)",
+    )?.execute(params![
+        parent_id, basename, full_path, is_dir as i32,
+        mtime_sec, mtime_nsec, discovered_at, scan_gen
+    ])?;
+    Ok(())
 }
 
 pub fn delete_entry_by_path(conn: &Connection, path: &str) -> Result<usize> {
@@ -110,29 +153,70 @@ pub fn delete_entry_by_path(conn: &Connection, path: &str) -> Result<usize> {
     )
 }
 
-pub fn delete_entries_under(conn: &Connection, prefix: &str) -> Result<usize> {
+/// Delete `path` itself and everything beneath it.
+pub fn delete_entries_under(conn: &Connection, path: &str) -> Result<usize> {
+    let (lo, hi) = subtree_range(path);
     conn.execute(
-        "DELETE FROM entries WHERE full_path GLOB ?1",
-        params![format!("{}*", prefix)],
+        "DELETE FROM entries
+         WHERE full_path = ?1 OR (full_path >= ?2 AND full_path < ?3)",
+        params![path, lo, hi],
     )
 }
 
+/// Move `old` (and its subtree) to `new`. Anything already indexed at
+/// `new` is replaced, matching rename(2) semantics. Returns the number of
+/// rows moved (0 if `old` was not indexed).
 pub fn rename_entry(conn: &Connection, old: &str, new: &str) -> Result<usize> {
+    if old == new { return Ok(0); }
     let new_basename = Path::new(new)
         .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
-    conn.execute(
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let (old_lo, old_hi) = subtree_range(old);
+    delete_entries_under(conn, new)?;
+    let mut moved = conn.execute(
         "UPDATE entries SET full_path=?1, basename=?2 WHERE full_path=?3",
         params![new, new_basename, old],
     )?;
-    conn.execute(
+    moved += conn.execute(
         "UPDATE entries
          SET full_path = ?1 || SUBSTR(full_path, LENGTH(?2)+1)
-         WHERE full_path GLOB ?3",
-        params![new, old, format!("{}/*", old)],
+         WHERE full_path >= ?3 AND full_path < ?4",
+        params![new, old.trim_end_matches('/'), old_lo, old_hi],
     )?;
-    Ok(1)
+    Ok(moved)
+}
+
+/// Delete rows under `root` not seen by scan generation `scan_gen`,
+/// leaving alone any subtree listed in `keep` (nested roots and excludes
+/// that are maintained separately).
+pub fn sweep_stale(
+    conn: &Connection,
+    root: &str,
+    keep: &[String],
+    scan_gen: i64,
+) -> Result<usize> {
+    let (lo, hi) = subtree_range(root);
+    let mut sql = String::from(
+        "DELETE FROM entries
+         WHERE scan_gen < ?1 AND full_path >= ?2 AND full_path < ?3",
+    );
+    let mut args: Vec<String> = vec![lo, hi];
+    for k in keep {
+        let (klo, khi) = subtree_range(k);
+        let n = args.len();
+        sql.push_str(&format!(
+            " AND full_path <> ?{} AND NOT (full_path >= ?{} AND full_path < ?{})",
+            n + 2, n + 3, n + 4,
+        ));
+        args.extend([k.clone(), klo, khi]);
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    stmt.raw_bind_parameter(1, scan_gen)?;
+    for (i, a) in args.iter().enumerate() {
+        stmt.raw_bind_parameter(i + 2, a)?;
+    }
+    stmt.raw_execute()
 }
 
 pub fn entry_exists(conn: &Connection, path: &str) -> Result<bool> {
@@ -594,12 +678,13 @@ pub fn insert_pending_event(
     Ok(conn.last_insert_rowid())
 }
 
-pub fn load_unapplied_events(conn: &Connection) -> Result<Vec<PendingEvent>> {
-    let mut stmt = conn.prepare(
+/// Load up to `limit` unapplied events, oldest first.
+pub fn load_unapplied_events(conn: &Connection, limit: usize) -> Result<Vec<PendingEvent>> {
+    let mut stmt = conn.prepare_cached(
         "SELECT id,event_type,path,new_path,is_dir,timestamp
-         FROM pending_events WHERE applied=0 ORDER BY id ASC",
+         FROM pending_events WHERE applied=0 ORDER BY id ASC LIMIT ?1",
     )?;
-    let rows = stmt.query_map([], |r| {
+    let rows = stmt.query_map(params![limit as i64], |r| {
         let et: String = r.get(1)?;
         Ok(PendingEvent {
             id:         r.get(0)?,
@@ -652,5 +737,100 @@ pub fn get_metadata(conn: &Connection, key: &str) -> Result<Option<String>> {
         Ok(v) => Ok(Some(v)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mem() -> Connection {
+        let dir = std::env::temp_dir().join(format!(
+            "rfind-db-test-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_file(&dir);
+        open(&dir).unwrap()
+    }
+
+    fn add(c: &Connection, p: &str, is_dir: bool, scan_gen: Option<i64>) {
+        let b = Path::new(p).file_name().unwrap().to_string_lossy().to_string();
+        insert_entry(c, None, &b, p, is_dir, 0, 0, 0, scan_gen).unwrap();
+    }
+
+    fn paths(c: &Connection) -> Vec<String> {
+        let mut s = c.prepare("SELECT full_path FROM entries ORDER BY full_path").unwrap();
+        s.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect()
+    }
+
+    #[test]
+    fn insert_is_idempotent() {
+        let c = mem();
+        add(&c, "/a/x", false, None);
+        add(&c, "/a/x", false, None);
+        assert_eq!(entry_count(&c).unwrap(), 1);
+    }
+
+    #[test]
+    fn delete_under_does_not_touch_sibling_prefix() {
+        let c = mem();
+        for p in ["/a/b", "/a/b/c", "/a/bc", "/a/b.txt"] { add(&c, p, false, None); }
+        delete_entries_under(&c, "/a/b").unwrap();
+        assert_eq!(paths(&c), vec!["/a/b.txt", "/a/bc"]);
+    }
+
+    #[test]
+    fn glob_metacharacters_in_paths_are_literal() {
+        let c = mem();
+        for p in ["/w/photo [1]", "/w/photo [1]/x.jpg", "/w/photo 1/y.jpg"] {
+            add(&c, p, false, None);
+        }
+        delete_entries_under(&c, "/w/photo [1]").unwrap();
+        assert_eq!(paths(&c), vec!["/w/photo 1/y.jpg"]);
+    }
+
+    #[test]
+    fn rename_moves_subtree_and_replaces_target() {
+        let c = mem();
+        for p in ["/a/d", "/a/d/f", "/a/dd/g", "/b/d", "/b/d/old"] { add(&c, p, false, None); }
+        assert_eq!(rename_entry(&c, "/a/d", "/b/d").unwrap(), 2);
+        assert_eq!(paths(&c), vec!["/a/dd/g", "/b/d", "/b/d/f"]);
+    }
+
+    #[test]
+    fn sweep_removes_unseen_rows_but_keeps_nested_roots() {
+        let c = mem();
+        add(&c, "/etc/old", false, Some(1));
+        add(&c, "/etc/new", false, Some(2));
+        add(&c, "/mnt/c/win", false, Some(1));
+        add(&c, "/mnt/cx", false, Some(1));
+        sweep_stale(&c, "/", &["/mnt/c".to_string()], 2).unwrap();
+        assert_eq!(paths(&c), vec!["/etc/new", "/mnt/c/win"]);
+    }
+
+    #[test]
+    fn live_upsert_keeps_scan_gen() {
+        let c = mem();
+        add(&c, "/x", false, Some(5));
+        add(&c, "/x", false, None);
+        let g: i64 = c.query_row("SELECT scan_gen FROM entries", [], |r| r.get(0)).unwrap();
+        assert_eq!(g, 5);
+    }
+
+    #[test]
+    fn migration_dedupes_existing_rows() {
+        let path = std::env::temp_dir().join(format!("rfind-mig-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch("
+                CREATE TABLE entries (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    parent_id INTEGER, basename TEXT NOT NULL, full_path TEXT NOT NULL,
+                    is_dir INTEGER NOT NULL DEFAULT 0);
+                CREATE INDEX idx_full_path ON entries (full_path);
+                INSERT INTO entries (basename, full_path) VALUES ('x','/x'),('x','/x'),('y','/y');
+            ").unwrap();
+        }
+        let c = open(&path).unwrap();
+        assert_eq!(entry_count(&c).unwrap(), 2);
+        let _ = std::fs::remove_file(&path);
     }
 }

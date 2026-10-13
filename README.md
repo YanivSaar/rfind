@@ -204,7 +204,7 @@ Default config is written to `/etc/rfindd/config.toml` on first run:
 ```toml
 [scan]
 roots = ["/"]
-exclude = ["/proc", "/sys", "/dev", "/run", "/mnt", "/media"]
+exclude = ["/proc", "/sys", "/dev", "/run", "/media"]
 workers = 0                    # 0 = auto-detect CPU count
 reindex_interval_hours = 6     # auto re-index every 6h in index-only mode
 collect_mtime = true           # collect file modification times (recommended)
@@ -217,6 +217,25 @@ batch_size = 10000
 prefer_fanotify = true         # try fanotify first (bare metal/VM)
 inotify_fallback = true        # fall back to inotify (WSL2/containers)
 ```
+
+### Periodic roots (WSL2 Windows drives, network mounts)
+
+Some mounts can't be monitored: on WSL2, inotify never sees changes made
+from Windows to `/mnt/c`, and watching a whole drive can exhaust
+`fs.inotify.max_user_watches`. Index them with periodic rescans instead:
+
+```toml
+[[scan.periodic_roots]]
+path = "/mnt/c"
+interval_hours = 12            # default 12
+```
+
+Periodic roots are rescanned in a background thread, so live events for
+other roots keep being applied during a long scan. A periodic root nested
+inside a live root (here `/mnt/c` under `/`) is skipped by the live scan.
+`rfind update` rescans live roots immediately and schedules periodic roots.
+At startup rfindd warns about any Windows drive under a live root that is
+neither excluded nor periodic.
 
 ---
 

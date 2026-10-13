@@ -18,8 +18,13 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ScanConfig {
-    /// Filesystem roots to index.
+    /// Filesystem roots to index and keep current via fanotify/inotify.
     pub roots: Vec<PathBuf>,
+    /// Roots kept current by periodic rescans only — no live monitoring.
+    /// Use for mounts where inotify is blind or too costly, e.g. WSL2's
+    /// /mnt/c (changes made from Windows never generate events).
+    /// A periodic root nested inside a live root is skipped by that root.
+    pub periodic_roots: Vec<PeriodicRoot>,
     /// Paths to skip entirely (no index, no recursion).
     pub exclude: Vec<PathBuf>,
     /// Worker thread count. 0 = num_cpus.
@@ -29,6 +34,16 @@ pub struct ScanConfig {
     /// Collect mtime via statx during scan (adds slight overhead).
     pub collect_mtime: bool,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeriodicRoot {
+    pub path: PathBuf,
+    /// Hours between rescans of this root.
+    #[serde(default = "default_periodic_interval")]
+    pub interval_hours: u64,
+}
+
+fn default_periodic_interval() -> u64 { 12 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -60,12 +75,12 @@ impl Default for ScanConfig {
     fn default() -> Self {
         Self {
             roots: vec![PathBuf::from("/")],
+            periodic_roots: Vec::new(),
             exclude: vec![
                 PathBuf::from("/proc"),
                 PathBuf::from("/sys"),
                 PathBuf::from("/dev"),
                 PathBuf::from("/run"),
-                PathBuf::from("/mnt"),
                 PathBuf::from("/media"),
             ],
             workers: 0,
@@ -127,4 +142,31 @@ pub fn write_default(path: &Path) -> std::io::Result<()> {
     let text = toml::to_string_pretty(&default)
         .expect("Default config serialization failed");
     std::fs::write(path, text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_periodic_roots() {
+        let cfg: Config = toml::from_str(r#"
+            [scan]
+            roots = ["/"]
+            [[scan.periodic_roots]]
+            path = "/mnt/c"
+            [[scan.periodic_roots]]
+            path = "/mnt/d"
+            interval_hours = 48
+        "#).unwrap();
+        assert_eq!(cfg.scan.periodic_roots.len(), 2);
+        assert_eq!(cfg.scan.periodic_roots[0].interval_hours, 12);
+        assert_eq!(cfg.scan.periodic_roots[1].interval_hours, 48);
+    }
+
+    #[test]
+    fn old_config_without_periodic_roots_still_loads() {
+        let cfg: Config = toml::from_str("[scan]\nroots = [\"/\"]\n").unwrap();
+        assert!(cfg.scan.periodic_roots.is_empty());
+    }
 }

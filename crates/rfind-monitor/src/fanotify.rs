@@ -4,10 +4,11 @@ use libc::{
     close, fanotify_event_metadata, fanotify_init, fanotify_mark, read,
     FAN_CLASS_NOTIF, FAN_CLOSE_WRITE, FAN_CREATE, FAN_DELETE,
     FAN_DELETE_SELF, FAN_EVENT_ON_CHILD, FAN_MARK_ADD, FAN_MARK_MOUNT,
-    FAN_MOVE, FAN_MOVE_SELF, FAN_NONBLOCK, FAN_ONDIR, O_LARGEFILE, O_RDONLY,
+    FAN_MOVE, FAN_MOVE_SELF, FAN_NONBLOCK, FAN_ONDIR, FAN_Q_OVERFLOW,
+    O_LARGEFILE, O_RDONLY,
 };
-use rfind_core::db::{insert_pending_event, EventType};
-use rusqlite::Connection;
+use crate::sink::EventSink;
+use rfind_core::db::EventType;
 use std::{
     ffi::CString,
     fs, mem,
@@ -15,10 +16,10 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     thread,
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 use thiserror::Error;
 use tracing::{debug, error, warn};
@@ -35,33 +36,42 @@ pub enum FanotifyError {
 }
 
 pub struct FanotifyMonitor {
-    stop:   Arc<AtomicBool>,
-    handle: Option<thread::JoinHandle<()>>,
+    stop:     Arc<AtomicBool>,
+    overflow: Arc<AtomicBool>,
+    handle:   Option<thread::JoinHandle<()>>,
+    writer:   Option<thread::JoinHandle<()>>,
 }
 
 impl FanotifyMonitor {
     pub fn start(
         mount: &PathBuf,
-        db: Arc<Mutex<Connection>>,
+        sink: (EventSink, thread::JoinHandle<()>),
         excludes: Vec<PathBuf>,
     ) -> Result<Self, FanotifyError> {
         let fd = init_fanotify()?;
         mark_mount(fd, mount)?;
 
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop2 = Arc::clone(&stop);
+        let (sink, writer) = sink;
+        let stop     = Arc::new(AtomicBool::new(false));
+        let overflow = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let (s, o) = (Arc::clone(&stop), Arc::clone(&overflow));
+            thread::spawn(move || {
+                event_loop(fd, sink, excludes, s, o);
+                unsafe { close(fd) };
+            })
+        };
 
-        let handle = thread::spawn(move || {
-            event_loop(fd, db, excludes, stop2);
-            unsafe { close(fd) };
-        });
-
-        Ok(Self { stop, handle: Some(handle) })
+        Ok(Self { stop, overflow, handle: Some(handle), writer: Some(writer) })
     }
+
+    /// True (once) if the kernel queue overflowed since the last call.
+    pub fn take_overflow(&self) -> bool { self.overflow.swap(false, Ordering::Relaxed) }
 
     pub fn stop(mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.handle.take() { let _ = h.join(); }
+        if let Some(h) = self.writer.take() { let _ = h.join(); }
     }
 }
 
@@ -102,18 +112,12 @@ fn fd_to_path(fd: libc::c_int) -> Option<PathBuf> {
     fs::read_link(format!("/proc/self/fd/{fd}")).ok()
 }
 
-fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
-}
-
 fn event_loop(
     fd: RawFd,
-    db: Arc<Mutex<Connection>>,
+    sink: EventSink,
     excludes: Vec<PathBuf>,
     stop: Arc<AtomicBool>,
+    overflow: Arc<AtomicBool>,
 ) {
     const BUF: usize = 4096;
     let mut buf = vec![0u8; BUF];
@@ -140,6 +144,10 @@ fn event_loop(
                 &*(buf.as_ptr().add(off) as *const fanotify_event_metadata)
             };
             if meta.vers != libc::FANOTIFY_METADATA_VERSION { break; }
+            if meta.mask & FAN_Q_OVERFLOW as u64 != 0 {
+                warn!("fanotify queue overflow — events lost, rescan scheduled");
+                overflow.store(true, Ordering::Relaxed);
+            }
 
             let efd = meta.fd;
             if efd >= 0 {
@@ -158,10 +166,7 @@ fn event_loop(
 
                         if let Some(et) = et {
                             let is_dir = path.is_dir();
-                            let c = db.lock().unwrap();
-                            if let Err(e) = insert_pending_event(
-                                &c, &et, &path.to_string_lossy(), None, is_dir, now_secs(),
-                            ) { error!("insert event: {e}"); }
+                            sink.send(et, path.to_string_lossy().to_string(), None, is_dir);
                         }
                     }
                 } else {

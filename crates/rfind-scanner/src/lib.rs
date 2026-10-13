@@ -122,10 +122,12 @@ fn statx_mtime(dirfd: RawFd, name: &CStr) -> (i64, i64) {
 // Work queue
 // ---------------------------------------------------------------------------
 
+/// A directory waiting to be read. Only the path is queued: the directory
+/// is opened when a worker picks it up, so open fds are bounded by the
+/// worker count rather than by queue width (wide trees such as a Windows
+/// drive queue tens of thousands of directories and hit EMFILE).
 struct WorkItem {
-    /// Parent directory file descriptor (owned, must be closed after use).
-    parent_fd: RawFd,
-    /// Absolute path of this directory (for constructing child paths).
+    /// Absolute path of this directory.
     path: PathBuf,
 }
 
@@ -240,13 +242,12 @@ pub fn run_scan(config: ScanConfig) -> u64 {
 
     // Seed queue with roots.
     for root in &config.roots {
-        let fd = open_dir_fd(root);
-        if fd < 0 {
+        if !root.is_dir() {
             warn!("Cannot open root {:?}", root);
             continue;
         }
         counters.in_flight.fetch_add(1, Ordering::SeqCst);
-        wq.push(WorkItem { parent_fd: fd, path: root.clone() });
+        wq.push(WorkItem { path: root.clone() });
     }
 
     let mut handles = Vec::with_capacity(config.workers);
@@ -328,10 +329,6 @@ fn open_dir_fd(path: &PathBuf) -> RawFd {
     unsafe { openat(AT_FDCWD, cpath.as_ptr(), O_RDONLY | O_DIRECTORY | O_CLOEXEC) }
 }
 
-fn open_dir_at(parent_fd: RawFd, name: &CStr) -> RawFd {
-    unsafe { openat(parent_fd, name.as_ptr(), O_RDONLY | O_DIRECTORY | O_CLOEXEC) }
-}
-
 fn worker_loop(
     wq:           Arc<WorkQueue>,
     counters:     Arc<Counters>,
@@ -349,8 +346,16 @@ fn worker_loop(
             None => { wq.wake_all(); break; }
         };
 
-        let dir_fd   = item.parent_fd;
         let dir_path = item.path;
+        let dir_fd   = open_dir_fd(&dir_path);
+        if dir_fd < 0 {
+            let err = std::io::Error::last_os_error();
+            on_error(&dir_path, &err.to_string());
+            counters.errors.fetch_add(1, Ordering::Relaxed);
+            let remaining = counters.in_flight.fetch_sub(1, Ordering::SeqCst) - 1;
+            if remaining == 0 { wq.wake_all(); }
+            continue;
+        }
 
         let mut local_count = 0u64;
         let mut offset      = 0usize;
@@ -425,18 +430,8 @@ fn worker_loop(
 
                 // Push subdirectories onto the work queue.
                 if is_dir {
-                    let child_fd = open_dir_at(dir_fd, name_cstr);
-                    if child_fd >= 0 {
-                        counters.in_flight.fetch_add(1, Ordering::SeqCst);
-                        wq.push(WorkItem {
-                            parent_fd: child_fd,
-                            path:      child_path,
-                        });
-                    } else {
-                        let err = std::io::Error::last_os_error();
-                        on_error(&child_path, &err.to_string());
-                        counters.errors.fetch_add(1, Ordering::Relaxed);
-                    }
+                    counters.in_flight.fetch_add(1, Ordering::SeqCst);
+                    wq.push(WorkItem { path: child_path });
                 }
 
                 pos += dent.d_reclen as usize;
