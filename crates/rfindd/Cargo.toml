@@ -8,12 +8,14 @@ name = "rfindd"
 path = "src/main.rs"
 
 [dependencies]
-rfind-core = { path = "../rfind-core" }
+num_cpus = "1"
+rfind-core    = { path = "../rfind-core" }
+rfind-config  = { path = "../rfind-config" }
 rfind-scanner = { path = "../rfind-scanner" }
 rfind-monitor = { path = "../rfind-monitor" }
-serde_json = "1"
-tracing = "0.1"
+serde_json    = "1"
+tracing       = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tokio = { version = "1", features = ["full"] }
-thiserror = "2"
-rusqlite = { version = "0.32", features = ["bundled"] }
+thiserror     = "2"
+rusqlite      = { version = "0.32", features = ["bundled"] }
+signal-hook   = "0.3"
