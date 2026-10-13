@@ -416,13 +416,15 @@ fn register_regexp(conn: &Connection) -> Result<()> {
         rusqlite::functions::FunctionFlags::SQLITE_UTF8
             | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
         |ctx| {
-            let pattern: String = ctx.get(0)?;
-            let text: String = ctx.get(1)?;
-            // Simple regex using standard library — no extra dep needed
-            // for basic patterns. For full regex support add the `regex` crate.
-            let re = regex_lite::Regex::new(&pattern)
-                .map_err(|e| rusqlite::Error::UserFunctionError(e.into()))?;
-            Ok(re.is_match(&text))
+            // Compile the pattern once per statement, not once per row.
+            let re: std::sync::Arc<regex_lite::Regex> = ctx.get_or_create_aux(
+                0,
+                |vr| -> std::result::Result<_, Box<dyn std::error::Error + Send + Sync>> {
+                    Ok(regex_lite::Regex::new(vr.as_str()?)?)
+                },
+            )?;
+            let text = ctx.get_raw(1).as_str().unwrap_or("");
+            Ok(re.is_match(text))
         },
     )
 }

@@ -399,6 +399,74 @@ fn due_periodic_root(conn: &Arc<Mutex<Connection>>, cfg: &Config) -> Option<Path
     }).map(|r| r.path.clone())
 }
 
+/// One line of /proc/self/mountinfo, reduced to what alias detection needs.
+#[derive(Debug, Clone)]
+struct MountEntry {
+    dev:    String,  // "major:minor"
+    fsroot: PathBuf, // directory of the filesystem shown at this mount
+    point:  PathBuf,
+}
+
+fn parse_mountinfo(text: &str) -> Vec<MountEntry> {
+    // Fields: id parent major:minor root mountpoint ... ; octal escapes
+    // (\040 = space) are decoded in root and mountpoint.
+    fn unescape(s: &str) -> String {
+        let b = s.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'\\' && i + 3 < b.len() {
+                if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 4], 8) {
+                    out.push(v);
+                    i += 4;
+                    continue;
+                }
+            }
+            out.push(b[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+    text.lines().filter_map(|l| {
+        let f: Vec<&str> = l.split(' ').collect();
+        (f.len() > 4).then(|| MountEntry {
+            dev:    f[2].to_string(),
+            fsroot: PathBuf::from(unescape(f[3])),
+            point:  PathBuf::from(unescape(f[4])),
+        })
+    }).collect()
+}
+
+/// Mount points whose content is already reachable through another mount
+/// of the same filesystem (bind mounts, e.g. WSL2's /mnt/wslg/distro is
+/// a second view of /). Indexing both would duplicate every entry, and
+/// inotify returns one watch per inode, so events would be attributed to
+/// whichever path registered last. find and updatedb skip these as
+/// filesystem loops.
+///
+/// For each filesystem the canonical mount is the shallowest mount point
+/// whose fsroot contains the other's; ties go to the earlier mount.
+fn alias_mounts(mounts: &[MountEntry]) -> Vec<(PathBuf, PathBuf)> {
+    let depth = |p: &Path| p.components().count();
+    let mut aliases = Vec::new();
+    for (i, b) in mounts.iter().enumerate() {
+        let canonical = mounts.iter().enumerate()
+            .filter(|(j, a)| {
+                *j != i && a.dev == b.dev && b.fsroot.starts_with(&a.fsroot)
+                    && a.point.join(b.fsroot.strip_prefix(&a.fsroot).unwrap()) != b.point
+                    && !a.point.starts_with(&b.point)
+                    && (depth(&a.point), *j) < (depth(&b.point), i)
+            })
+            .min_by_key(|(j, a)| (depth(&a.point), *j));
+        if let Some((_, a)) = canonical {
+            let rel = b.fsroot.strip_prefix(&a.fsroot).unwrap();
+            let target = if rel.as_os_str().is_empty() { a.point.clone() } else { a.point.join(rel) };
+            aliases.push((b.point.clone(), target));
+        }
+    }
+    aliases
+}
+
 /// Warn about Windows drives (WSL2 drvfs) that would be monitored live:
 /// inotify never sees changes made from Windows, and watching a whole
 /// drive can exhaust the inotify watch limit.
@@ -449,6 +517,16 @@ fn main() {
         Ok(c)  => { info!("Config loaded from {:?}", config_path); c }
         Err(e) => { warn!("Config error: {e} — using defaults"); Config::default() }
     };
+
+    // Skip bind-mount aliases of filesystems that are indexed elsewhere.
+    let mut cfg = cfg;
+    if let Ok(text) = fs::read_to_string("/proc/self/mountinfo") {
+        for (alias, canonical) in alias_mounts(&parse_mountinfo(&text)) {
+            if is_excluded(&cfg, &alias) { continue; }
+            info!("Skipping {} (bind mount; same files as {})", alias.display(), canonical.display());
+            cfg.scan.exclude.push(alias);
+        }
+    }
 
     info!("Roots: {:?}", cfg.scan.roots);
     for r in &cfg.scan.periodic_roots {
@@ -647,3 +725,59 @@ fn main() {
 
 // Bring thread::spawn into scope.
 use std::thread;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn aliases(mi: &str) -> Vec<(String, String)> {
+        alias_mounts(&parse_mountinfo(mi)).into_iter()
+            .map(|(a, c)| (a.display().to_string(), c.display().to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn wsl_distro_bind_of_root_is_an_alias() {
+        let mi = "\
+24 1 8:48 / / rw - ext4 /dev/sdd rw
+30 24 0:40 / /mnt/wslg rw - tmpfs none rw
+31 30 8:48 / /mnt/wslg/distro rw - ext4 /dev/sdd rw
+40 24 0:70 / /mnt/c rw - 9p drvfs rw
+50 24 0:88 / /run/user/1000 rw - tmpfs none rw
+51 30 0:88 / /mnt/wslg/run/user/1000 rw - tmpfs none rw
+";
+        assert_eq!(aliases(mi), vec![
+            ("/mnt/wslg/distro".into(), "/".into()),
+            ("/mnt/wslg/run/user/1000".into(), "/run/user/1000".into()),
+        ]);
+    }
+
+    #[test]
+    fn subdirectory_bind_mount_maps_to_canonical_path() {
+        let mi = "\
+1 0 8:1 / / rw - ext4 /dev/sda1 rw
+2 1 8:1 /home/app/data /srv/data rw - ext4 /dev/sda1 rw
+";
+        assert_eq!(aliases(mi), vec![("/srv/data".into(), "/home/app/data".into())]);
+    }
+
+    #[test]
+    fn separate_filesystems_and_self_nesting_are_not_aliases() {
+        let mi = "\
+1 0 8:1 / / rw - ext4 /dev/sda1 rw
+2 1 8:2 / /home rw - ext4 /dev/sda2 rw
+3 1 8:1 /var /var rw - ext4 /dev/sda1 rw
+";
+        // /var is the same fs mounted at its own path: not reachable elsewhere.
+        assert!(aliases(mi).is_empty());
+    }
+
+    #[test]
+    fn escaped_mount_points_are_decoded() {
+        let mi = "\
+1 0 8:1 / / rw - ext4 /dev/sda1 rw
+2 1 8:1 / /mnt/my\\040disk rw - ext4 /dev/sda1 rw
+";
+        assert_eq!(aliases(mi), vec![("/mnt/my disk".into(), "/".into())]);
+    }
+}
