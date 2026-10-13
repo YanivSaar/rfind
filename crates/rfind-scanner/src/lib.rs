@@ -20,8 +20,8 @@ use libc::{
     c_char, close, openat, syscall, SYS_getdents64, AT_FDCWD, AT_SYMLINK_NOFOLLOW, O_CLOEXEC,
     O_DIRECTORY, O_RDONLY,
 };
-use rfind_config::Config;
 use rfind_core::{DaemonPhase, ScanProgress};
+use std::os::unix::ffi::OsStrExt;
 use std::{
     collections::VecDeque,
     ffi::{CStr, CString},
@@ -52,7 +52,6 @@ struct LinuxDirent64 {
 
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
-const DT_LNK: u8 = 10;
 const DT_UNKNOWN: u8 = 0;
 
 // ---------------------------------------------------------------------------
@@ -95,7 +94,6 @@ struct Statx {
 }
 
 const STATX_MTIME: u32 = 0x40;
-const SYS_STATX: i64 = 332; // x86_64
 
 /// Call statx(dirfd, name, AT_SYMLINK_NOFOLLOW, STATX_MTIME, out).
 /// Returns (mtime_sec, mtime_nsec) or (0,0) on error.
@@ -103,7 +101,7 @@ fn statx_mtime(dirfd: RawFd, name: &CStr) -> (i64, i64) {
     let mut stx = Statx::default();
     let ret = unsafe {
         syscall(
-            SYS_STATX as libc::c_long,
+            libc::SYS_statx, // per-architecture number (332 on x86_64, 291 on aarch64)
             dirfd as libc::c_long,
             name.as_ptr() as libc::c_long,
             AT_SYMLINK_NOFOLLOW as libc::c_long,
@@ -187,15 +185,20 @@ pub struct EntryInfo {
     pub mtime_nsec: i64,
 }
 
+pub type ProgressFn = Box<dyn Fn(ScanProgress) + Send + Sync + 'static>;
+pub type EntryFn = Box<dyn Fn(EntryInfo) + Send + Sync + 'static>;
+pub type ErrorFn = Box<dyn Fn(&PathBuf, &str) + Send + Sync + 'static>;
+pub type SkipDirFn = Box<dyn Fn(&PathBuf) -> bool + Send + Sync + 'static>;
+
 pub struct ScanConfig {
     pub roots: Vec<PathBuf>,
     pub workers: usize,
     pub progress_interval: Duration,
     pub collect_mtime: bool,
-    pub on_progress: Box<dyn Fn(ScanProgress) + Send + Sync + 'static>,
-    pub on_entry: Box<dyn Fn(EntryInfo) + Send + Sync + 'static>,
-    pub on_error: Box<dyn Fn(&PathBuf, &str) + Send + Sync + 'static>,
-    pub skip_dir: Box<dyn Fn(&PathBuf) -> bool + Send + Sync + 'static>,
+    pub on_progress: ProgressFn,
+    pub on_entry: EntryFn,
+    pub on_error: ErrorFn,
+    pub skip_dir: SkipDirFn,
 }
 
 impl ScanConfig {
@@ -343,7 +346,7 @@ pub fn run_scan(config: ScanConfig) -> u64 {
 // Worker
 // ---------------------------------------------------------------------------
 
-fn open_dir_fd(path: &PathBuf) -> RawFd {
+fn open_dir_fd(path: &std::path::Path) -> RawFd {
     let cpath = match CString::new(path.as_os_str().as_encoded_bytes()) {
         Ok(c) => c,
         Err(_) => return -1,
@@ -354,9 +357,9 @@ fn open_dir_fd(path: &PathBuf) -> RawFd {
 fn worker_loop(
     wq: Arc<WorkQueue>,
     counters: Arc<Counters>,
-    on_entry: Arc<Box<dyn Fn(EntryInfo) + Send + Sync + 'static>>,
-    on_error: Arc<Box<dyn Fn(&PathBuf, &str) + Send + Sync + 'static>>,
-    skip_dir: Arc<Box<dyn Fn(&PathBuf) -> bool + Send + Sync + 'static>>,
+    on_entry: Arc<EntryFn>,
+    on_error: Arc<ErrorFn>,
+    skip_dir: Arc<SkipDirFn>,
     collect_mtime: bool,
 ) {
     const BUF_SIZE: usize = 65536;
@@ -385,7 +388,6 @@ fn worker_loop(
         }
 
         let mut local_count = 0u64;
-        let mut offset = 0usize;
 
         // Read directory entries via getdents64.
         loop {
@@ -427,8 +429,8 @@ fn worker_loop(
                 }
 
                 let is_dir = dent.d_type == DT_DIR;
-                let child_path =
-                    dir_path.join(std::str::from_utf8(name_bytes).unwrap_or("\u{FFFD}"));
+                // Keep the raw bytes: a lossy name could not be reopened.
+                let child_path = dir_path.join(std::ffi::OsStr::from_bytes(name_bytes));
 
                 if is_dir && skip_dir(&child_path) {
                     pos += dent.d_reclen as usize;

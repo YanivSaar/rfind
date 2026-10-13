@@ -286,12 +286,11 @@ pub fn rename_entry(conn: &Connection, old: &str, new: &str) -> Result<usize> {
 pub fn sweep_stale(conn: &Connection, root: &str, keep: &[String], scan_gen: i64) -> Result<usize> {
     let root = norm_dir(root);
     let (lo, hi) = subtree_range(root);
-    let mut sql = format!(
-        "DELETE FROM entries WHERE id IN (
+    let mut sql = "DELETE FROM entries WHERE id IN (
              SELECT e.id FROM entries e JOIN dirs d ON d.id = e.dir_id
              WHERE e.scan_gen < ?1
                AND (d.path = ?2 OR (d.path >= ?3 AND d.path < ?4))"
-    );
+        .to_string();
     let mut args: Vec<String> = vec![root.to_string(), lo, hi];
     for k in keep {
         let k = norm_dir(k);
@@ -497,11 +496,13 @@ pub fn search_by_path_glob_streaming(
     }
 }
 
-/// Regex search using SQLite REGEXP (user-defined function registered here).
+/// Regex search using SQLite REGEXP (user-defined function registered here),
+/// optionally restricted to the subtree under directory `under`.
 pub fn search_by_regex_streaming(
     conn: &Connection,
     pattern: &str,
     field: &str, // "basename" or "full_path"
+    under: Option<&str>,
     type_filter: Option<bool>,
     limit: Option<usize>,
     mut on_result: impl FnMut(&str) -> bool,
@@ -512,15 +513,30 @@ pub fn search_by_regex_streaming(
     } else {
         "e.name"
     };
+    let dir = under.map(norm_dir).unwrap_or("");
+    let (lo, hi) = subtree_range(dir);
     let sql = format!(
         "SELECT {PATH_EXPR} FROM entries e JOIN dirs d ON d.id = e.dir_id
-         WHERE {target} REGEXP ?1{} ORDER BY 1",
-        type_clause(type_filter, 2),
+         WHERE (d.path = ?2 OR (d.path >= ?3 AND d.path < ?4))
+           AND {target} REGEXP ?1{} ORDER BY 1",
+        type_clause(type_filter, 5),
     );
     let d = type_filter.map(|d| d as i32);
     match &d {
-        Some(d) => stream_paths(conn, &sql, &[&pattern, d], limit, &mut on_result),
-        None => stream_paths(conn, &sql, &[&pattern], limit, &mut on_result),
+        Some(d) => stream_paths(
+            conn,
+            &sql,
+            &[&pattern, &dir, &lo, &hi, d],
+            limit,
+            &mut on_result,
+        ),
+        None => stream_paths(
+            conn,
+            &sql,
+            &[&pattern, &dir, &lo, &hi],
+            limit,
+            &mut on_result,
+        ),
     }
 }
 
@@ -766,7 +782,7 @@ impl EventType {
             EventType::Modify => "MODIFY",
         }
     }
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "CREATE" => Some(EventType::Create),
             "DELETE" => Some(EventType::Delete),
@@ -820,7 +836,7 @@ pub fn load_unapplied_events(conn: &Connection, limit: usize) -> Result<Vec<Pend
         let et: String = r.get(1)?;
         Ok(PendingEvent {
             id: r.get(0)?,
-            event_type: EventType::from_str(&et).unwrap_or(EventType::Modify),
+            event_type: EventType::parse(&et).unwrap_or(EventType::Modify),
             path: r.get(2)?,
             new_path: r.get(3)?,
             is_dir: r.get::<_, i32>(4)? != 0,
@@ -1039,14 +1055,36 @@ mod tests {
             add(&c, p, false, None);
         }
         let mut v = Vec::new();
-        search_by_regex_streaming(&c, r"^lib.*\.so\.[0-9]+$", "basename", None, None, |p| {
+        search_by_regex_streaming(
+            &c,
+            r"^lib.*\.so\.[0-9]+$",
+            "basename",
+            None,
+            None,
+            None,
+            |p| {
+                v.push(p.to_string());
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(v, vec!["/lib/libz.so.1"]);
+        let mut v = Vec::new();
+        search_by_regex_streaming(&c, "^/opt/", "full_path", None, None, None, |p| {
             v.push(p.to_string());
             true
         })
         .unwrap();
-        assert_eq!(v, vec!["/lib/libz.so.1"]);
+        assert_eq!(v, vec!["/opt/lib/x"]);
+        // --under restricts the subtree; the regex still applies to names.
         let mut v = Vec::new();
-        search_by_regex_streaming(&c, "^/opt/", "full_path", None, None, |p| {
+        search_by_regex_streaming(&c, "^lib", "basename", Some("/opt"), None, None, |p| {
+            v.push(p.to_string());
+            true
+        })
+        .unwrap();
+        assert!(v.is_empty());
+        search_by_regex_streaming(&c, "^x$", "basename", Some("/opt"), None, None, |p| {
             v.push(p.to_string());
             true
         })

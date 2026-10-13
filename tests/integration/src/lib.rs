@@ -5,6 +5,8 @@
 //!   cargo test -- --ignored
 //! or in CI after the daemon has completed a scan.
 
+#![cfg(test)]
+
 use rfind_core::{db, db_path};
 
 fn open() -> rusqlite::Connection {

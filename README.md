@@ -19,13 +19,17 @@
 
 | Operation | rfind | GNU find | Speedup |
 |-----------|------:|--------:|--------:|
-| Search by exact name | **40ms** | ~3 min | ~4,500× |
-| Search by glob `*.conf` | **120ms** | ~3 min | ~1,500× |
-| Initial index build (136k entries) | **3s** | — | — |
-| Re-index after restart (journal only) | **<1s** | — | — |
+| Search by exact name | **6 ms** | 1.8 s | ~300× |
+| Search by glob `*.conf` | **116 ms** | 1.9 s | ~16× |
+| Regex `^lib.*\.so\.[0-9]+$` | **189 ms** | 2.0 s | ~10× |
+| Under a directory (`/etc`, `*.conf`) | **5 ms** | 8 ms | ~1.6× |
+| Change visible after create / rename / delete | **≤ 5 s** | immediate | — |
+| Initial index build, Linux side (146k entries) | **2.0 s** | — | — |
 
-> Benchmarks on Ubuntu 26.04, WSL2, ~136k indexed entries, debug build.
-> Release build (`--release`) is significantly faster.
+> Release build, WSL2 (4 cores), 1.46M indexed entries (Linux + a Windows
+> drive). `find` timings cover the Linux side only (146k entries); rfind
+> searched all 1.46M. Every query returned exactly `find`'s results.
+> Reproduce on your machine: `sudo ./scripts/bench.sh`.
 
 ---
 
@@ -93,7 +97,7 @@ service. On WSL2 a first install configures Windows drives as periodic roots.
 |------|-----------|
 | Install / update | `curl -fsSL https://raw.githubusercontent.com/YanivSaar/rfind/main/scripts/install.sh \| sudo bash` |
 | From a clone | `git clone https://github.com/YanivSaar/rfind.git && cd rfind && sudo ./scripts/install.sh` |
-| Specific branch/tag | `curl -fsSL …/install.sh \| sudo RFIND_REF=v0.6.0 bash` |
+| Specific branch/tag | `curl -fsSL …/install.sh \| sudo RFIND_REF=<branch-or-tag> bash` |
 | Uninstall (keep index) | `curl -fsSL …/install.sh \| sudo bash -s -- --uninstall` |
 | Uninstall + purge | `curl -fsSL …/install.sh \| sudo bash -s -- --uninstall --purge` |
 | Watch first scan | `rfind status --watch` |
@@ -133,13 +137,13 @@ rfind path "/usr/lib/python*/*.py"
 
 | Requirement | Version |
 |-------------|---------|
-| Linux kernel | 5.1+ (6.x recommended) |
-| Rust | 1.70+ (for building) |
-| Root access | Required (fanotify/inotify) |
-| WSL2 | ✅ Fully supported (kernel 5.15+) |
-| Bare metal | ✅ Full fanotify support |
-| VM (KVM/VMware) | ✅ Full fanotify support |
-| Container | ⚠️ Index-only mode |
+| Linux kernel | 5.9+ for fanotify (5.17+ for single-event renames); older kernels use inotify |
+| Rust | 1.77+ (for building; the installer sets it up) |
+| Architecture | x86_64, aarch64 (any Linux target with `statx`) |
+| Root access | Required: the daemon needs it to monitor, and searches need it because the index lists every file name |
+| WSL2 | ✅ fanotify on `/`; Windows drives as periodic roots |
+| Bare metal / VM / VPS | ✅ fanotify, one mark per filesystem |
+| Container | ⚠️ inotify or index-only, depending on capabilities |
 
 ### Manual build
 
@@ -232,8 +236,8 @@ db_path = "/var/lib/rfindd/index.db"
 batch_size = 10000
 
 [monitor]
-prefer_fanotify = true         # try fanotify first (bare metal/VM)
-inotify_fallback = true        # fall back to inotify (WSL2/containers)
+prefer_fanotify = true         # one mark per filesystem (kernel 5.9+, root)
+inotify_fallback = true        # per-directory watches if fanotify is unavailable
 ```
 
 ### Periodic roots (WSL2 Windows drives, network mounts)
@@ -306,32 +310,37 @@ Result: 3–10× faster than `std::fs::read_dir` with mtime collection essential
 
 ### Monitoring backends
 
-| Backend | Coverage | Watches needed | Environment |
-|---------|----------|----------------|-------------|
-| **fanotify** | Entire mount point | **1** | Bare metal, full VM |
-| **inotify** | Per-directory | ~9,000 (all indexed dirs) | WSL2, containers |
-| **index-only** | None (periodic rescan) | 0 | Restricted containers |
+| Backend | Coverage | Kernel objects | Used when |
+|---------|----------|----------------|-----------|
+| **fanotify** | Whole filesystem | **1 mark per filesystem** | Kernel 5.9+ with root (bare metal, VM, VPS, WSL2) |
+| **inotify** | Per directory | 1 watch per directory | fanotify unavailable (older kernels, restricted containers) |
+| **index-only** | None (periodic rescan) | 0 | Neither is available |
 
-### Why fanotify fails on WSL2
+fanotify runs in FID mode (`FAN_REPORT_DFID_NAME`): each event carries the
+parent directory's file handle and the entry name, which rfindd resolves to a
+path with `open_by_handle_at()` against that filesystem's mount. Directory
+create, delete and move events are only reported in this mode — requesting
+them on a plain mount mark is what makes `fanotify_mark` fail with `EINVAL`.
+On kernel 5.17+ a rename arrives as one `FAN_RENAME` event carrying both
+paths; on 5.9–5.16 it arrives as a move-from/move-to pair and a moved
+directory is re-walked.
 
-WSL2's Microsoft-built kernel restricts `FAN_MARK_MOUNT` on the root filesystem.
-`fanotify_init` succeeds but `fanotify_mark(FAN_MARK_MOUNT)` returns `EINVAL` (errno 22).
-
-rfind detects this immediately and falls back to inotify automatically — no configuration needed.
-On a production Linux server or full VM, fanotify activates instead, covering the entire
-filesystem with a single watch descriptor.
+rfindd marks each local filesystem under the live roots once. Pseudo
+filesystems (`proc`, `sysfs`, …), bind-mount aliases and excluded paths are
+skipped; network, overlay and read-only filesystems are indexed but not
+monitored live (the log suggests `scan.periodic_roots` for them).
 
 **Fallback chain:**
 
 ```
-fanotify_mark(FAN_MARK_MOUNT, "/")
+fanotify_init(FID mode) + FAN_MARK_FILESYSTEM on each filesystem
         │
-        ├── OK  →  fanotify active, one watch covers everything
+        ├── OK  →  fanotify active, no per-directory watches
         │
-        └── EINVAL/EPERM
+        └── fails (old kernel, no CAP_SYS_ADMIN)
                 │
-                ├── inotify_init1 OK  →  inotify active, one watch per directory
-                │                        auto-registers new directories on CREATE
+                ├── inotify_init1 OK  →  inotify active, one watch per directory,
+                │                        watches added before each directory is read
                 │
                 └── inotify fails  →  index-only mode
                                        periodic re-index every N hours
@@ -433,6 +442,8 @@ Normalized parent-ID schema avoids storing full paths redundantly.
 ## 🔒 Security
 
 - Daemon runs as **root** (required for fanotify/inotify on system directories)
+- The index is **root-only** (`/var/lib/rfindd` is `0700`, the database `0600`): it lists every
+  file name on the system, including other users' files, so `rfind` searches need `sudo`
 - Index at `/var/lib/rfindd/index.db` — root-owned
 - Progress file at `/run/rfindd/progress.json` — world-readable (filenames only, no content)
 - Search queries read the index directly — no daemon IPC required
@@ -475,7 +486,7 @@ All tests pass in ~0.2s.
 
 - [x] Parallel scanner with `getdents64` + `statx`
 - [x] SQLite persistent index with WAL mode
-- [x] fanotify monitoring (bare metal / VM)
+- [x] fanotify monitoring: per-filesystem marks in FID mode (kernel 5.9+)
 - [x] inotify fallback (WSL2 / containers)
 - [x] Durable event journal with reconciliation
 - [x] Smart restart (journal-only when index is fresh)
@@ -519,6 +530,6 @@ MIT — see [LICENSE](LICENSE)
 
 Built with ❤️ in Rust &nbsp;•&nbsp; Designed for Linux &nbsp;•&nbsp; Fast by design
 
-*From `find / -name passwd` taking 3 minutes to `rfind name passwd` taking 40ms*
+*From `find / -name passwd` taking seconds to minutes to `rfind name passwd` taking 6 ms*
 
 </div>

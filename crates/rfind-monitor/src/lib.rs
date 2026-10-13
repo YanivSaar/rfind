@@ -40,9 +40,13 @@ pub enum Monitor {
 impl Monitor {
     /// Start monitoring. Tries fanotify first, then inotify.
     /// Returns the active monitor and a string describing the mode.
+    ///
+    /// `mark_points`: one mount point per filesystem to cover (fanotify).
+    /// `dirs`: directories to watch up front (inotify fast restart).
     pub fn start(
-        mount: &PathBuf,
-        dirs: Vec<String>, // for inotify: list of dirs to watch
+        roots: &[PathBuf],
+        mark_points: &[PathBuf],
+        dirs: Vec<String>,
         db: Arc<Mutex<Connection>>,
         excludes: Vec<PathBuf>,
         prefer_fanotify: bool,
@@ -50,7 +54,7 @@ impl Monitor {
     ) -> Result<(Self, String), MonitorError> {
         if prefer_fanotify {
             let sink = sink::spawn_writer(Arc::clone(&db));
-            match FanotifyMonitor::start(mount, sink, excludes.clone()) {
+            match FanotifyMonitor::start(mark_points, roots.to_vec(), sink, excludes.clone()) {
                 Ok(m) => return Ok((Monitor::Fanotify(m), "fanotify".to_string())),
                 Err(e) => {
                     tracing::warn!("fanotify unavailable: {e}");

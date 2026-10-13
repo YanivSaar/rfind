@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 num_cpus = "1"
+libc = "0.2"
 rfind-core    = { path = "../rfind-core" }
 rfind-config  = { path = "../rfind-config" }
 rfind-scanner = { path = "../rfind-scanner" }

@@ -40,7 +40,7 @@
 use rfind_config::{load as load_config, write_default, Config, DEFAULT_CONFIG_PATH};
 use rfind_core::{
     db::{self, EventType},
-    db_path, progress_file_path, DaemonPhase, ScanProgress,
+    mounts, progress_file_path, DaemonPhase, ScanProgress,
 };
 use rfind_monitor::DirWatcher;
 use rfind_monitor::Monitor;
@@ -88,6 +88,8 @@ fn write_progress(progress: &ScanProgress) {
     }
 }
 
+// One argument per ScanProgress field; a builder would add nothing.
+#[allow(clippy::too_many_arguments)]
 fn make_progress(
     phase: DaemonPhase,
     entries: u64,
@@ -395,10 +397,18 @@ fn live_reindex(
         info!("Scanning live root {}", root.display());
         scan_root(conn, cfg, root, watcher.cloned(), true, monitoring_mode);
     }
-    reconcile_and_mark_ready(conn, cfg, monitoring_mode);
+    reconcile_and_mark_ready(conn, cfg, monitoring_mode, true);
 }
 
-fn reconcile_and_mark_ready(conn: &Arc<Mutex<Connection>>, cfg: &Config, monitoring_mode: &str) {
+/// `scanned`: the live roots were just fully scanned. A fast restart only
+/// replays the journal, so it must not reset the index age — otherwise
+/// frequent restarts would postpone the periodic full rescan forever.
+fn reconcile_and_mark_ready(
+    conn: &Arc<Mutex<Connection>>,
+    cfg: &Config,
+    monitoring_mode: &str,
+    scanned: bool,
+) {
     {
         let ep = conn
             .lock()
@@ -430,7 +440,9 @@ fn reconcile_and_mark_ready(conn: &Arc<Mutex<Connection>>, cfg: &Config, monitor
     let c = conn.lock().unwrap();
     let _ = c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     let count = db::entry_count(&c).unwrap_or(0);
-    let _ = db::set_metadata(&c, "last_scan_completed", &now_secs().to_string());
+    if scanned {
+        let _ = db::set_metadata(&c, "last_scan_completed", &now_secs().to_string());
+    }
     let _ = db::set_metadata(&c, "last_entry_count", &count.to_string());
     let _ = db::set_metadata(&c, "monitoring_mode", monitoring_mode);
     let p = make_progress(
@@ -472,91 +484,10 @@ fn due_periodic_root(conn: &Arc<Mutex<Connection>>, cfg: &Config) -> Option<Path
         .map(|r| r.path.clone())
 }
 
-/// One line of /proc/self/mountinfo, reduced to what alias detection needs.
-#[derive(Debug, Clone)]
-struct MountEntry {
-    dev: String,     // "major:minor"
-    fsroot: PathBuf, // directory of the filesystem shown at this mount
-    point: PathBuf,
-}
-
-fn parse_mountinfo(text: &str) -> Vec<MountEntry> {
-    // Fields: id parent major:minor root mountpoint ... ; octal escapes
-    // (\040 = space) are decoded in root and mountpoint.
-    fn unescape(s: &str) -> String {
-        let b = s.as_bytes();
-        let mut out = Vec::with_capacity(b.len());
-        let mut i = 0;
-        while i < b.len() {
-            if b[i] == b'\\' && i + 3 < b.len() {
-                if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 4], 8) {
-                    out.push(v);
-                    i += 4;
-                    continue;
-                }
-            }
-            out.push(b[i]);
-            i += 1;
-        }
-        String::from_utf8_lossy(&out).into_owned()
-    }
-    text.lines()
-        .filter_map(|l| {
-            let f: Vec<&str> = l.split(' ').collect();
-            (f.len() > 4).then(|| MountEntry {
-                dev: f[2].to_string(),
-                fsroot: PathBuf::from(unescape(f[3])),
-                point: PathBuf::from(unescape(f[4])),
-            })
-        })
-        .collect()
-}
-
-/// Mount points whose content is already reachable through another mount
-/// of the same filesystem (bind mounts, e.g. WSL2's /mnt/wslg/distro is
-/// a second view of /). Indexing both would duplicate every entry, and
-/// inotify returns one watch per inode, so events would be attributed to
-/// whichever path registered last. find and updatedb skip these as
-/// filesystem loops.
-///
-/// For each filesystem the canonical mount is the shallowest mount point
-/// whose fsroot contains the other's; ties go to the earlier mount.
-fn alias_mounts(mounts: &[MountEntry]) -> Vec<(PathBuf, PathBuf)> {
-    let depth = |p: &Path| p.components().count();
-    let mut aliases = Vec::new();
-    for (i, b) in mounts.iter().enumerate() {
-        let canonical = mounts
-            .iter()
-            .enumerate()
-            .filter(|(j, a)| {
-                *j != i
-                    && a.dev == b.dev
-                    && b.fsroot.starts_with(&a.fsroot)
-                    && a.point.join(b.fsroot.strip_prefix(&a.fsroot).unwrap()) != b.point
-                    && !a.point.starts_with(&b.point)
-                    && (depth(&a.point), *j) < (depth(&b.point), i)
-            })
-            .min_by_key(|(j, a)| (depth(&a.point), *j));
-        if let Some((_, a)) = canonical {
-            let rel = b.fsroot.strip_prefix(&a.fsroot).unwrap();
-            let target = if rel.as_os_str().is_empty() {
-                a.point.clone()
-            } else {
-                a.point.join(rel)
-            };
-            aliases.push((b.point.clone(), target));
-        }
-    }
-    aliases
-}
-
 /// Warn about Windows drives (WSL2 drvfs) that would be monitored live:
 /// inotify never sees changes made from Windows, and watching a whole
 /// drive can exhaust the inotify watch limit.
-fn warn_drvfs_under_live_roots(cfg: &Config) {
-    let Ok(mounts) = fs::read_to_string("/proc/self/mounts") else {
-        return;
-    };
+fn warn_drvfs_under_live_roots(cfg: &Config, mounts: &[mounts::MountEntry]) {
     let handled: Vec<PathBuf> = cfg
         .scan
         .exclude
@@ -564,24 +495,29 @@ fn warn_drvfs_under_live_roots(cfg: &Config) {
         .cloned()
         .chain(periodic_paths(cfg))
         .collect();
-    for line in mounts.lines() {
-        let f: Vec<&str> = line.split_whitespace().collect();
-        if f.len() < 4 {
-            continue;
-        }
-        let drvfs = f[2] == "drvfs" || (f[2] == "9p" && f[3].contains("aname=drvfs"));
-        if !drvfs {
-            continue;
-        }
-        let mp = PathBuf::from(f[1]);
-        let live = cfg.scan.roots.iter().any(|r| mp.starts_with(r));
-        if live && !handled.iter().any(|h| mp.starts_with(h)) {
+    for m in mounts.iter().filter(|m| m.is_drvfs()) {
+        let live = cfg.scan.roots.iter().any(|r| m.point.starts_with(r));
+        if live && !handled.iter().any(|h| m.point.starts_with(h)) {
             warn!(
                 "{} is a Windows drive under a live root: inotify cannot see changes \
                  made from Windows. Add it to scan.periodic_roots (or scan.exclude).",
-                mp.display()
+                m.point.display()
             );
         }
+    }
+}
+
+/// Make the index directory and files readable by root only: the index
+/// lists every file name on the system.
+fn restrict_index_permissions(db_file: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(dir) = db_file.parent() {
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    }
+    for suffix in ["", "-wal", "-shm"] {
+        let mut p = db_file.as_os_str().to_owned();
+        p.push(suffix);
+        let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o600));
     }
 }
 
@@ -597,6 +533,9 @@ fn main() {
 
     info!("rfindd starting");
 
+    // Everything rfindd creates (index, WAL, progress file) is root-only.
+    unsafe { libc::umask(0o077) };
+
     // Load config.
     let config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
     if !config_path.exists() {
@@ -606,31 +545,31 @@ fn main() {
             info!("Wrote default config to {:?}", config_path);
         }
     }
-    let cfg = match load_config(&config_path) {
+    // A broken config must not silently fall back to defaults: those could
+    // index (and live-monitor) paths the admin deliberately excluded.
+    let mut cfg = match load_config(&config_path) {
         Ok(c) => {
             info!("Config loaded from {:?}", config_path);
             c
         }
         Err(e) => {
-            warn!("Config error: {e} — using defaults");
-            Config::default()
+            error!("Config error: {e}");
+            std::process::exit(1);
         }
     };
 
     // Skip bind-mount aliases of filesystems that are indexed elsewhere.
-    let mut cfg = cfg;
-    if let Ok(text) = fs::read_to_string("/proc/self/mountinfo") {
-        for (alias, canonical) in alias_mounts(&parse_mountinfo(&text)) {
-            if is_excluded(&cfg, &alias) {
-                continue;
-            }
-            info!(
-                "Skipping {} (bind mount; same files as {})",
-                alias.display(),
-                canonical.display()
-            );
-            cfg.scan.exclude.push(alias);
+    let mount_table = mounts::read_mountinfo();
+    for (alias, canonical) in mounts::alias_mounts(&mount_table) {
+        if is_excluded(&cfg, &alias) {
+            continue;
         }
+        info!(
+            "Skipping {} (bind mount; same files as {})",
+            alias.display(),
+            canonical.display()
+        );
+        cfg.scan.exclude.push(alias);
     }
 
     info!("Roots: {:?}", cfg.scan.roots);
@@ -652,7 +591,7 @@ fn main() {
     );
     info!("Collect mtime: {}", cfg.scan.collect_mtime);
     info!("Reindex interval: {}h", cfg.scan.reindex_interval_hours);
-    warn_drvfs_under_live_roots(&cfg);
+    warn_drvfs_under_live_roots(&cfg, &mount_table);
 
     // Ensure directories exist.
     let db_file = cfg.index.db_path.clone();
@@ -661,6 +600,7 @@ fn main() {
     let conn = Arc::new(Mutex::new(
         db::open(&db_file).expect("Failed to open database"),
     ));
+    restrict_index_permissions(&db_file);
 
     // ── Signal handling ──────────────────────────────────────────────────────
     let force_reindex = Arc::new(AtomicBool::new(false));
@@ -745,19 +685,42 @@ fn main() {
         Vec::new()
     };
 
-    let monitor_result = Monitor::start(
-        &cfg.scan.roots[0],
-        dirs_for_inotify,
-        Arc::clone(&conn),
-        monitor_excludes,
-        cfg.monitor.prefer_fanotify,
-        cfg.monitor.inotify_fallback,
-    );
+    let (mut mark_points, unmonitored) =
+        mounts::fanotify_mark_points(&mount_table, &cfg.scan.roots, &monitor_excludes);
+    // Files bind-mounted over files (e.g. WSL2's /init) can't be marked.
+    mark_points.retain(|p| p.is_dir());
+    for m in &unmonitored {
+        if !m.is_drvfs() && m.point.is_dir() {
+            info!(
+                "{} ({}) is indexed but not monitored live; consider scan.periodic_roots",
+                m.point.display(),
+                m.fstype
+            );
+        }
+    }
+
+    let monitor_result = if cfg.scan.roots.is_empty() {
+        Err(rfind_monitor::MonitorError::NotSupported)
+    } else {
+        Monitor::start(
+            &cfg.scan.roots,
+            &mark_points,
+            dirs_for_inotify,
+            Arc::clone(&conn),
+            monitor_excludes,
+            cfg.monitor.prefer_fanotify,
+            cfg.monitor.inotify_fallback,
+        )
+    };
 
     let (monitor_opt, monitoring_mode) = match monitor_result {
         Ok((m, mode)) => {
             info!("Monitoring: {mode}");
             (Some(m), mode)
+        }
+        Err(_) if cfg.scan.roots.is_empty() => {
+            info!("No live roots — periodic roots only");
+            (None, "periodic-only".to_string())
         }
         Err(e) => {
             warn!("Monitoring unavailable: {e}");
@@ -773,7 +736,7 @@ fn main() {
         info!("Starting full scan");
         live_reindex(&conn, &cfg, watcher.as_ref(), &monitoring_mode);
     } else {
-        reconcile_and_mark_ready(&conn, &cfg, &monitoring_mode);
+        reconcile_and_mark_ready(&conn, &cfg, &monitoring_mode, false);
     }
 
     info!("Daemon ready | monitoring: {monitoring_mode}");
@@ -830,7 +793,7 @@ fn main() {
         // Periodic re-index in index-only mode.
         if monitor_opt.is_none()
             && cfg.scan.reindex_interval_hours > 0
-            && tick % (cfg.scan.reindex_interval_hours * 720) == 0
+            && tick.is_multiple_of(cfg.scan.reindex_interval_hours * 720)
         {
             info!(
                 "Periodic re-index (index-only mode, interval {}h)",
@@ -865,7 +828,7 @@ fn main() {
         }
 
         // Log heartbeat every 5 minutes.
-        if tick % 60 == 0 {
+        if tick.is_multiple_of(60) {
             let c = conn.lock().unwrap();
             let cnt = db::entry_count(&c).unwrap_or(0);
             info!("Heartbeat | {cnt} entries | monitoring: {monitoring_mode}");
@@ -875,66 +838,3 @@ fn main() {
 
 // Bring thread::spawn into scope.
 use std::thread;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn aliases(mi: &str) -> Vec<(String, String)> {
-        alias_mounts(&parse_mountinfo(mi))
-            .into_iter()
-            .map(|(a, c)| (a.display().to_string(), c.display().to_string()))
-            .collect()
-    }
-
-    #[test]
-    fn wsl_distro_bind_of_root_is_an_alias() {
-        let mi = "\
-24 1 8:48 / / rw - ext4 /dev/sdd rw
-30 24 0:40 / /mnt/wslg rw - tmpfs none rw
-31 30 8:48 / /mnt/wslg/distro rw - ext4 /dev/sdd rw
-40 24 0:70 / /mnt/c rw - 9p drvfs rw
-50 24 0:88 / /run/user/1000 rw - tmpfs none rw
-51 30 0:88 / /mnt/wslg/run/user/1000 rw - tmpfs none rw
-";
-        assert_eq!(
-            aliases(mi),
-            vec![
-                ("/mnt/wslg/distro".into(), "/".into()),
-                ("/mnt/wslg/run/user/1000".into(), "/run/user/1000".into()),
-            ]
-        );
-    }
-
-    #[test]
-    fn subdirectory_bind_mount_maps_to_canonical_path() {
-        let mi = "\
-1 0 8:1 / / rw - ext4 /dev/sda1 rw
-2 1 8:1 /home/app/data /srv/data rw - ext4 /dev/sda1 rw
-";
-        assert_eq!(
-            aliases(mi),
-            vec![("/srv/data".into(), "/home/app/data".into())]
-        );
-    }
-
-    #[test]
-    fn separate_filesystems_and_self_nesting_are_not_aliases() {
-        let mi = "\
-1 0 8:1 / / rw - ext4 /dev/sda1 rw
-2 1 8:2 / /home rw - ext4 /dev/sda2 rw
-3 1 8:1 /var /var rw - ext4 /dev/sda1 rw
-";
-        // /var is the same fs mounted at its own path: not reachable elsewhere.
-        assert!(aliases(mi).is_empty());
-    }
-
-    #[test]
-    fn escaped_mount_points_are_decoded() {
-        let mi = "\
-1 0 8:1 / / rw - ext4 /dev/sda1 rw
-2 1 8:1 / /mnt/my\\040disk rw - ext4 /dev/sda1 rw
-";
-        assert_eq!(aliases(mi), vec![("/mnt/my disk".into(), "/".into())]);
-    }
-}

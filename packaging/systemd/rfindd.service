@@ -1,6 +1,6 @@
 [Unit]
 Description=rfind filesystem indexing daemon
-Documentation=https://github.com/yourname/rfind
+Documentation=https://github.com/YanivSaar/rfind
 After=local-fs.target
 Wants=local-fs.target
 
@@ -19,9 +19,10 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=rfindd
 
-# Show progress in systemctl status (last journal line)
-# This is what appears under "Status:" in systemctl status output
-ExecStartPost=/bin/sh -c 'sleep 2 && systemd-notify --ready || true'
+# The index lists every file name on the system: keep it root-only.
+UMask=0077
+StateDirectory=rfindd
+StateDirectoryMode=0700
 
 [Install]
 WantedBy=multi-user.target

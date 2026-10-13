@@ -9,6 +9,7 @@ use thiserror::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct Config {
     pub scan: ScanConfig,
     pub index: IndexConfig,
@@ -61,16 +62,6 @@ pub struct MonitorConfig {
     pub prefer_fanotify: bool,
     /// Fall back to inotify if fanotify is unavailable.
     pub inotify_fallback: bool,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            scan: ScanConfig::default(),
-            index: IndexConfig::default(),
-            monitor: MonitorConfig::default(),
-        }
-    }
 }
 
 impl Default for ScanConfig {

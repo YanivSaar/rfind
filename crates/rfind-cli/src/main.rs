@@ -5,15 +5,17 @@
 //!   name     — search by filename (glob, exact, regex)
 //!   path     — search by full path glob
 //!   recent   — recently modified files
+//!
+//! Searching requires root: the index lists every file on the system.
 //!   health   — index health report
 //!   stats    — index statistics
 //!   update   — trigger re-index via SIGUSR1
 
 use clap::{Parser, Subcommand, ValueEnum};
-use rfind_config::{load as load_config, Config, DEFAULT_CONFIG_PATH};
+use rfind_config::{load as load_config, DEFAULT_CONFIG_PATH};
 use rfind_core::{
-    db::{self, HealthInfo, IndexStats, RecentEntry},
-    db_path, progress_file_path, DaemonPhase, ScanProgress,
+    db::{self},
+    progress_file_path, DaemonPhase, ScanProgress,
 };
 use std::{
     fs,
@@ -158,6 +160,12 @@ fn print_progress(p: &ScanProgress) {
 
 fn open_db() -> Option<rusqlite::Connection> {
     let cfg = load_config(&PathBuf::from(DEFAULT_CONFIG_PATH)).unwrap_or_default();
+    // The index lists every file name on the system, so it is root-only.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("rfind needs root: the index lists every file on the system.");
+        eprintln!("Run it with sudo, e.g.  sudo rfind name passwd");
+        return None;
+    }
     match db::open(&cfg.index.db_path) {
         Ok(c) => Some(c),
         Err(e) => {
@@ -201,25 +209,18 @@ fn format_bytes(b: u64) -> String {
     }
 }
 
-/// Parse YYYY-MM-DD into a Unix timestamp at start of day UTC.
+/// Parse YYYY-MM-DD into the Unix timestamp of local midnight that day
+/// (results are displayed in local time too). None for invalid dates.
 fn parse_date(s: &str) -> Option<i64> {
-    let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    let y: i64 = parts[0].parse().ok()?;
-    let m: i64 = parts[1].parse().ok()?;
-    let d: i64 = parts[2].parse().ok()?;
-    // Rough Unix timestamp (ignores leap seconds, good enough for date ranges).
-    let days_since_epoch = {
-        let y = y - 1970;
-        y * 365 + y / 4 - y / 100
-            + y / 400
-            + [0i64, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334][(m - 1) as usize]
-            + d
-            - 1
-    };
-    Some(days_since_epoch * 86400)
+    use chrono::TimeZone;
+    let day = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()?;
+    let midnight = day.and_hms_opt(0, 0, 0)?;
+    Some(
+        chrono::Local
+            .from_local_datetime(&midnight)
+            .earliest()?
+            .timestamp(),
+    )
 }
 
 fn format_mtime(sec: i64) -> String {
@@ -279,15 +280,18 @@ fn main() {
             let mut count = 0u64;
 
             let result = if regex {
-                let field = if under.is_some() {
-                    "full_path"
-                } else {
-                    "basename"
-                };
-                db::search_by_regex_streaming(&conn, &pattern, field, type_filter, limit, |p| {
-                    count += 1;
-                    emit(p)
-                })
+                db::search_by_regex_streaming(
+                    &conn,
+                    &pattern,
+                    "basename",
+                    under.as_deref(),
+                    type_filter,
+                    limit,
+                    |p| {
+                        count += 1;
+                        emit(p)
+                    },
+                )
             } else if let Some(ref prefix) = under {
                 db::search_under_streaming(&conn, prefix, Some(&pattern), type_filter, limit, |p| {
                     count += 1;
@@ -399,14 +403,17 @@ fn main() {
 
                     let age = h
                         .last_scan_completed
-                        .map(|t| format_duration(now - t))
+                        .map(|t| format!("{} ago", format_duration(now - t)))
                         .unwrap_or_else(|| "never".to_string());
+                    let live = matches!(h.monitoring_mode.as_str(), "fanotify" | "inotify");
 
                     let status = if h.pending_events > 0 {
                         format!("UPDATING ({} events pending)", h.pending_events)
                     } else {
                         match h.last_scan_completed {
                             None => "NO INDEX".to_string(),
+                            // Monitored: current regardless of scan age.
+                            Some(_) if live => "LIVE".to_string(),
                             Some(t) if now - t < 3600 => "FRESH".to_string(),
                             Some(t) if now - t < 86400 => "RECENT".to_string(),
                             _ => "STALE".to_string(),
@@ -414,7 +421,7 @@ fn main() {
                     };
 
                     println!("Status         : {status}");
-                    println!("Index age      : {age}");
+                    println!("Last full scan : {age}");
                     println!("Entries        : {}", h.entry_count);
                     println!("Directories    : {}", h.dir_count);
                     println!("Files          : {}", h.file_count);

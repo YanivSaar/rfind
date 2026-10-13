@@ -180,21 +180,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
-name = "crossbeam-channel"
-version = "0.5.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98b0cc327b5bc766e7fda9c9260cc0fa81b43a8e240440422dff70788e3f9ef1"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
-name = "crossbeam-utils"
-version = "0.8.23"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
-
-[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -539,10 +524,8 @@ dependencies = [
 name = "rfind-scanner"
 version = "0.1.0"
 dependencies = [
- "crossbeam-channel",
  "libc",
  "num_cpus",
- "rfind-config",
  "rfind-core",
  "thiserror",
  "tracing",
@@ -552,6 +535,7 @@ dependencies = [
 name = "rfindd"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "num_cpus",
  "rfind-config",
  "rfind-core",
