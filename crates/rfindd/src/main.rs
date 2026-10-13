@@ -1,42 +1,62 @@
 //! rfindd — rfind indexing daemon.
-//!
-//! Runs a parallel filesystem scan, writes live progress to
-//! /run/rfindd/progress.json, and logs structured status to the
-//! systemd journal so `systemctl status rfindd` shows real progress.
 
-use rfind_core::{progress_file_path, ScanProgress};
+use rfind_core::{db, db_path, progress_file_path, ScanProgress};
 use rfind_scanner::{run_scan, ScanConfig};
+use rusqlite::Connection;
 use std::{
     fs,
     io::Write,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+/// Filesystem roots to skip entirely.
+/// These are pseudo-filesystems, remote mounts, or Windows interop layers
+/// that either have no useful file data or cause enumeration problems.
+const DEFAULT_EXCLUDES: &[&str] = &[
+    "/proc",
+    "/sys",
+    "/dev",
+    "/run",
+    "/mnt",        // WSL Windows mounts, network mounts
+    "/media",      // removable media
+];
+
+fn is_excluded(path: &PathBuf) -> bool {
+    DEFAULT_EXCLUDES.iter().any(|ex| path.starts_with(ex))
+}
 
 fn write_progress(progress: &ScanProgress) {
     let path = progress_file_path();
-
-    // Ensure /run/rfindd/ exists.
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-
-    match serde_json::to_string(progress) {
-        Ok(json) => {
-            // Write atomically: write to .tmp then rename.
-            let tmp = path.with_extension("tmp");
-            if let Ok(mut f) = fs::File::create(&tmp) {
-                let _ = f.write_all(json.as_bytes());
-                let _ = fs::rename(&tmp, &path);
-            }
+    if let Ok(json) = serde_json::to_string(progress) {
+        let tmp = path.with_extension("tmp");
+        if let Ok(mut f) = fs::File::create(&tmp) {
+            let _ = f.write_all(json.as_bytes());
+            let _ = fs::rename(&tmp, &path);
         }
-        Err(e) => error!("Failed to serialize progress: {e}"),
+    }
+}
+
+fn flush_batch(conn: &Connection, batch: &mut Vec<(Option<i64>, String, String, bool)>) {
+    let tx = match conn.unchecked_transaction() {
+        Ok(t) => t,
+        Err(e) => { error!("Failed to begin transaction: {e}"); batch.clear(); return; }
+    };
+    for (parent_id, basename, full_path, is_dir) in batch.drain(..) {
+        if let Err(e) = db::insert_entry(&tx, parent_id, &basename, &full_path, is_dir) {
+            error!("Insert error for {full_path}: {e}");
+        }
+    }
+    if let Err(e) = tx.commit() {
+        error!("Transaction commit failed: {e}");
     }
 }
 
 fn main() {
-    // Initialize structured logging to stdout (captured by systemd journal).
     tracing_subscriber::fmt()
         .with_target(false)
         .with_level(true)
@@ -44,50 +64,98 @@ fn main() {
 
     info!("rfindd starting");
 
-    // Default: index the entire filesystem from root.
-    // Later this will come from a config file.
+    let db_file = db_path();
+    if let Some(parent) = db_file.parent() {
+        fs::create_dir_all(parent).expect("Failed to create /var/lib/rfindd");
+    }
+
+    let conn = db::open(&db_file).expect("Failed to open index database");
+    conn.execute_batch("DELETE FROM entries;").expect("Failed to clear entries");
+    info!("Database opened at {:?}", db_file);
+    info!("Excluding paths: {:?}", DEFAULT_EXCLUDES);
+
+    let conn = Arc::new(Mutex::new(conn));
+    let conn_for_entries = Arc::clone(&conn);
+    let conn_for_flush = Arc::clone(&conn);
+    let conn_for_checkpoint = Arc::clone(&conn);
+
+    const BATCH_SIZE: usize = 10_000;
+    let batch: Arc<Mutex<Vec<(Option<i64>, String, String, bool)>>> =
+        Arc::new(Mutex::new(Vec::with_capacity(BATCH_SIZE)));
+    let batch_for_entries = Arc::clone(&batch);
+    let batch_for_flush = Arc::clone(&batch);
+
+    // Scan from root, excluding pseudo-filesystems.
     let roots: Vec<PathBuf> = vec![PathBuf::from("/")];
-
     info!("Scanning roots: {:?}", roots);
-    info!("Progress file: {:?}", progress_file_path());
 
-    // Write initial progress so the CLI shows something immediately.
-    let initial = ScanProgress::new_scanning();
-    write_progress(&initial);
+    write_progress(&rfind_core::ScanProgress::new_scanning());
 
-    let last_progress: Arc<Mutex<Option<ScanProgress>>> = Arc::new(Mutex::new(None));
-    let last_for_final = Arc::clone(&last_progress);
+    let config = ScanConfig::new(
+        roots,
+        move |progress| {
+            info!("{}", progress.status_line);
+            write_progress(&progress);
+        },
+        move |path, is_dir| {
+            // Skip excluded paths entirely — don't index or recurse.
+            if is_excluded(path) {
+                return;
+            }
 
-    let config = ScanConfig::new(roots, move |progress| {
-        // Log one-line status to the journal (visible in systemctl status).
-        info!("{}", progress.status_line);
+            let full_path = path.to_string_lossy().to_string();
+            let basename = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
 
-        // Write JSON snapshot for the CLI.
-        write_progress(&progress);
+            let mut buf = batch_for_entries.lock().unwrap();
+            buf.push((None, basename, full_path, is_dir));
 
-        // Keep a copy for the final summary.
-        if let Ok(mut guard) = last_progress.lock() {
-            *guard = Some(progress);
-        }
+            if buf.len() >= BATCH_SIZE {
+                let conn = conn_for_entries.lock().unwrap();
+                flush_batch(&conn, &mut buf);
+            }
+        },
+    );
+
+    let config = config.with_error_handler(|path, err| {
+        warn!("Cannot read dir {}: {}", path.display(), err);
     });
 
     let total = run_scan(config);
 
-    // Log final summary.
-    if let Ok(guard) = last_for_final.lock() {
-        if let Some(ref p) = *guard {
-            info!(
-                "Scan complete: {} entries, {} dirs, {} errors, {:.0} entries/s peak",
-                p.entries_found, p.dirs_completed, p.errors, p.entries_per_sec
-            );
+    // Flush remaining entries.
+    {
+        let conn = conn_for_flush.lock().unwrap();
+        let mut buf = batch_for_flush.lock().unwrap();
+        if !buf.is_empty() {
+            info!("Flushing final batch of {} entries", buf.len());
+            flush_batch(&conn, &mut buf);
         }
     }
 
-    info!("rfindd scan complete. Total entries indexed: {total}");
-    info!("Daemon entering watch mode (event monitoring not yet implemented)");
+    // Checkpoint WAL into main database file so reads are fast.
+    info!("Checkpointing WAL...");
+    {
+        let conn = conn_for_checkpoint.lock().unwrap();
+        match conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+            Ok(_) => info!("WAL checkpoint complete"),
+            Err(e) => warn!("WAL checkpoint failed: {e}"),
+        }
+    }
 
-    // Hold here so systemd sees the daemon as running.
-    // In a future milestone this becomes the inotify/fanotify event loop.
+    {
+        let conn = conn.lock().unwrap();
+        match db::entry_count(&conn) {
+            Ok(n) => info!("Index complete: {n} entries in database"),
+            Err(e) => error!("Count query failed: {e}"),
+        }
+    }
+
+    info!("Total entries discovered by scanner: {total}");
+    info!("Daemon holding (inotify event monitoring coming in next milestone)");
+
     loop {
         std::thread::sleep(std::time::Duration::from_secs(60));
     }
