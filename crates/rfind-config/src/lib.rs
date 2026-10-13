@@ -43,7 +43,9 @@ pub struct PeriodicRoot {
     pub interval_hours: u64,
 }
 
-fn default_periodic_interval() -> u64 { 12 }
+fn default_periodic_interval() -> u64 {
+    12
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -139,8 +141,7 @@ pub fn write_default(path: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let default = Config::default();
-    let text = toml::to_string_pretty(&default)
-        .expect("Default config serialization failed");
+    let text = toml::to_string_pretty(&default).expect("Default config serialization failed");
     std::fs::write(path, text)
 }
 
@@ -150,7 +151,8 @@ mod tests {
 
     #[test]
     fn parses_periodic_roots() {
-        let cfg: Config = toml::from_str(r#"
+        let cfg: Config = toml::from_str(
+            r#"
             [scan]
             roots = ["/"]
             [[scan.periodic_roots]]
@@ -158,7 +160,9 @@ mod tests {
             [[scan.periodic_roots]]
             path = "/mnt/d"
             interval_hours = 48
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         assert_eq!(cfg.scan.periodic_roots.len(), 2);
         assert_eq!(cfg.scan.periodic_roots[0].interval_hours, 12);
         assert_eq!(cfg.scan.periodic_roots[1].interval_hours, 48);

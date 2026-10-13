@@ -17,8 +17,8 @@
 //! full channel). The in_flight counter drives termination detection.
 
 use libc::{
-    c_char, close, openat, syscall, AT_FDCWD, AT_SYMLINK_NOFOLLOW,
-    O_CLOEXEC, O_DIRECTORY, O_RDONLY, SYS_getdents64,
+    c_char, close, openat, syscall, SYS_getdents64, AT_FDCWD, AT_SYMLINK_NOFOLLOW, O_CLOEXEC,
+    O_DIRECTORY, O_RDONLY,
 };
 use rfind_config::Config;
 use rfind_core::{DaemonPhase, ScanProgress};
@@ -43,10 +43,10 @@ use tracing::warn;
 
 #[repr(C)]
 struct LinuxDirent64 {
-    d_ino:    u64,
-    d_off:    i64,
+    d_ino: u64,
+    d_off: i64,
     d_reclen: u16,
-    d_type:   u8,
+    d_type: u8,
     // d_name follows: variable-length null-terminated string
 }
 
@@ -62,36 +62,36 @@ const DT_UNKNOWN: u8 = 0;
 #[repr(C)]
 #[derive(Default)]
 struct StatxTimestamp {
-    tv_sec:  i64,
+    tv_sec: i64,
     tv_nsec: u32,
-    _pad:    i32,
+    _pad: i32,
 }
 
 #[repr(C)]
 #[derive(Default)]
 struct Statx {
-    stx_mask:            u32,
-    stx_blksize:         u32,
-    stx_attributes:      u64,
-    stx_nlink:           u32,
-    stx_uid:             u32,
-    stx_gid:             u32,
-    stx_mode:            u16,
-    _pad1:               u16,
-    stx_ino:             u64,
-    stx_size:            u64,
-    stx_blocks:          u64,
+    stx_mask: u32,
+    stx_blksize: u32,
+    stx_attributes: u64,
+    stx_nlink: u32,
+    stx_uid: u32,
+    stx_gid: u32,
+    stx_mode: u16,
+    _pad1: u16,
+    stx_ino: u64,
+    stx_size: u64,
+    stx_blocks: u64,
     stx_attributes_mask: u64,
-    stx_atime:           StatxTimestamp,
-    stx_btime:           StatxTimestamp,
-    stx_ctime:           StatxTimestamp,
-    stx_mtime:           StatxTimestamp,
-    stx_rdev_major:      u32,
-    stx_rdev_minor:      u32,
-    stx_dev_major:       u32,
-    stx_dev_minor:       u32,
-    stx_mnt_id:          u64,
-    _pad2:               [u64; 13],
+    stx_atime: StatxTimestamp,
+    stx_btime: StatxTimestamp,
+    stx_ctime: StatxTimestamp,
+    stx_mtime: StatxTimestamp,
+    stx_rdev_major: u32,
+    stx_rdev_minor: u32,
+    stx_dev_major: u32,
+    stx_dev_minor: u32,
+    stx_mnt_id: u64,
+    _pad2: [u64; 13],
 }
 
 const STATX_MTIME: u32 = 0x40;
@@ -132,14 +132,14 @@ struct WorkItem {
 }
 
 struct WorkQueue {
-    queue:   Mutex<VecDeque<WorkItem>>,
+    queue: Mutex<VecDeque<WorkItem>>,
     condvar: Condvar,
 }
 
 impl WorkQueue {
     fn new() -> Self {
         Self {
-            queue:   Mutex::new(VecDeque::new()),
+            queue: Mutex::new(VecDeque::new()),
             condvar: Condvar::new(),
         }
     }
@@ -152,13 +152,19 @@ impl WorkQueue {
     fn pop_or_done(&self, in_flight: &AtomicI64) -> Option<WorkItem> {
         let mut q = self.queue.lock().unwrap();
         loop {
-            if let Some(item) = q.pop_front() { return Some(item); }
-            if in_flight.load(Ordering::SeqCst) == 0 { return None; }
+            if let Some(item) = q.pop_front() {
+                return Some(item);
+            }
+            if in_flight.load(Ordering::SeqCst) == 0 {
+                return None;
+            }
             q = self.condvar.wait(q).unwrap();
         }
     }
 
-    fn wake_all(&self) { self.condvar.notify_all(); }
+    fn wake_all(&self) {
+        self.condvar.notify_all();
+    }
 }
 
 #[derive(Default)]
@@ -187,9 +193,9 @@ pub struct ScanConfig {
     pub progress_interval: Duration,
     pub collect_mtime: bool,
     pub on_progress: Box<dyn Fn(ScanProgress) + Send + Sync + 'static>,
-    pub on_entry:    Box<dyn Fn(EntryInfo) + Send + Sync + 'static>,
-    pub on_error:    Box<dyn Fn(&PathBuf, &str) + Send + Sync + 'static>,
-    pub skip_dir:    Box<dyn Fn(&PathBuf) -> bool + Send + Sync + 'static>,
+    pub on_entry: Box<dyn Fn(EntryInfo) + Send + Sync + 'static>,
+    pub on_error: Box<dyn Fn(&PathBuf, &str) + Send + Sync + 'static>,
+    pub skip_dir: Box<dyn Fn(&PathBuf) -> bool + Send + Sync + 'static>,
 }
 
 impl ScanConfig {
@@ -197,7 +203,7 @@ impl ScanConfig {
         roots: Vec<PathBuf>,
         collect_mtime: bool,
         on_progress: impl Fn(ScanProgress) + Send + Sync + 'static,
-        on_entry:    impl Fn(EntryInfo) + Send + Sync + 'static,
+        on_entry: impl Fn(EntryInfo) + Send + Sync + 'static,
     ) -> Self {
         Self {
             roots,
@@ -205,14 +211,16 @@ impl ScanConfig {
             progress_interval: Duration::from_secs(1),
             collect_mtime,
             on_progress: Box::new(on_progress),
-            on_entry:    Box::new(on_entry),
-            on_error:    Box::new(|p, e| eprintln!("SCAN ERROR {}: {}", p.display(), e)),
-            skip_dir:    Box::new(|_| false),
+            on_entry: Box::new(on_entry),
+            on_error: Box::new(|p, e| eprintln!("SCAN ERROR {}: {}", p.display(), e)),
+            skip_dir: Box::new(|_| false),
         }
     }
 
     pub fn with_workers(mut self, n: usize) -> Self {
-        if n > 0 { self.workers = n; }
+        if n > 0 {
+            self.workers = n;
+        }
         self
     }
 
@@ -224,17 +232,14 @@ impl ScanConfig {
         self
     }
 
-    pub fn with_skip_dir(
-        mut self,
-        f: impl Fn(&PathBuf) -> bool + Send + Sync + 'static,
-    ) -> Self {
+    pub fn with_skip_dir(mut self, f: impl Fn(&PathBuf) -> bool + Send + Sync + 'static) -> Self {
         self.skip_dir = Box::new(f);
         self
     }
 }
 
 pub fn run_scan(config: ScanConfig) -> u64 {
-    let wq       = Arc::new(WorkQueue::new());
+    let wq = Arc::new(WorkQueue::new());
     let counters = Arc::new(Counters::default());
     let on_entry = Arc::new(config.on_entry);
     let on_error = Arc::new(config.on_error);
@@ -252,7 +257,7 @@ pub fn run_scan(config: ScanConfig) -> u64 {
 
     let mut handles = Vec::with_capacity(config.workers);
     for _ in 0..config.workers {
-        let wq       = Arc::clone(&wq);
+        let wq = Arc::clone(&wq);
         let counters = Arc::clone(&counters);
         let on_entry = Arc::clone(&on_entry);
         let on_error = Arc::clone(&on_error);
@@ -272,48 +277,65 @@ pub fn run_scan(config: ScanConfig) -> u64 {
     loop {
         thread::sleep(config.progress_interval);
 
-        let entries   = counters.entries_found.load(Ordering::Relaxed);
+        let entries = counters.entries_found.load(Ordering::Relaxed);
         let dirs_done = counters.dirs_completed.load(Ordering::Relaxed);
-        let errors    = counters.errors.load(Ordering::Relaxed);
+        let errors = counters.errors.load(Ordering::Relaxed);
         let in_flight = counters.in_flight.load(Ordering::Relaxed).max(0) as u64;
-        let done      = in_flight == 0;
+        let done = in_flight == 0;
 
         let tick_secs = last_tick.elapsed().as_secs_f64();
         let rate = if tick_secs > 0.0 {
             (entries.saturating_sub(last_entries)) as f64 / tick_secs
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         last_entries = entries;
-        last_tick    = Instant::now();
+        last_tick = Instant::now();
 
         let elapsed = start.elapsed().as_secs_f64();
         let status = format!(
             "{} | {} entries | {} dirs | {:.0} entries/s | {:.1}s{}",
             if done { "Ready" } else { "Scanning" },
-            entries, dirs_done, rate, elapsed,
-            if errors > 0 { format!(" | {} errors", errors) } else { String::new() },
+            entries,
+            dirs_done,
+            rate,
+            elapsed,
+            if errors > 0 {
+                format!(" | {} errors", errors)
+            } else {
+                String::new()
+            },
         );
 
         (config.on_progress)(ScanProgress {
-            phase: if done { DaemonPhase::Ready } else { DaemonPhase::Scanning },
-            entries_found:   entries,
-            dirs_completed:  dirs_done,
-            dirs_pending:    in_flight,
+            phase: if done {
+                DaemonPhase::Ready
+            } else {
+                DaemonPhase::Scanning
+            },
+            entries_found: entries,
+            dirs_completed: dirs_done,
+            dirs_pending: in_flight,
             entries_per_sec: rate,
             errors,
-            timestamp_secs:  SystemTime::now()
+            timestamp_secs: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            status_line:     status,
-            events_pending:  0,
-            events_applied:  0,
+            status_line: status,
+            events_pending: 0,
+            events_applied: 0,
             monitoring_mode: String::new(),
         });
 
-        if done { break; }
+        if done {
+            break;
+        }
     }
 
-    for h in handles { let _ = h.join(); }
+    for h in handles {
+        let _ = h.join();
+    }
     counters.entries_found.load(Ordering::Relaxed)
 }
 
@@ -330,11 +352,11 @@ fn open_dir_fd(path: &PathBuf) -> RawFd {
 }
 
 fn worker_loop(
-    wq:           Arc<WorkQueue>,
-    counters:     Arc<Counters>,
-    on_entry:     Arc<Box<dyn Fn(EntryInfo) + Send + Sync + 'static>>,
-    on_error:     Arc<Box<dyn Fn(&PathBuf, &str) + Send + Sync + 'static>>,
-    skip_dir:     Arc<Box<dyn Fn(&PathBuf) -> bool + Send + Sync + 'static>>,
+    wq: Arc<WorkQueue>,
+    counters: Arc<Counters>,
+    on_entry: Arc<Box<dyn Fn(EntryInfo) + Send + Sync + 'static>>,
+    on_error: Arc<Box<dyn Fn(&PathBuf, &str) + Send + Sync + 'static>>,
+    skip_dir: Arc<Box<dyn Fn(&PathBuf) -> bool + Send + Sync + 'static>>,
     collect_mtime: bool,
 ) {
     const BUF_SIZE: usize = 65536;
@@ -343,22 +365,27 @@ fn worker_loop(
     loop {
         let item = match wq.pop_or_done(&counters.in_flight) {
             Some(i) => i,
-            None => { wq.wake_all(); break; }
+            None => {
+                wq.wake_all();
+                break;
+            }
         };
 
         let dir_path = item.path;
-        let dir_fd   = open_dir_fd(&dir_path);
+        let dir_fd = open_dir_fd(&dir_path);
         if dir_fd < 0 {
             let err = std::io::Error::last_os_error();
             on_error(&dir_path, &err.to_string());
             counters.errors.fetch_add(1, Ordering::Relaxed);
             let remaining = counters.in_flight.fetch_sub(1, Ordering::SeqCst) - 1;
-            if remaining == 0 { wq.wake_all(); }
+            if remaining == 0 {
+                wq.wake_all();
+            }
             continue;
         }
 
         let mut local_count = 0u64;
-        let mut offset      = 0usize;
+        let mut offset = 0usize;
 
         // Read directory entries via getdents64.
         loop {
@@ -377,21 +404,21 @@ fn worker_loop(
                 counters.errors.fetch_add(1, Ordering::Relaxed);
                 break;
             }
-            if n == 0 { break; } // end of directory
+            if n == 0 {
+                break;
+            } // end of directory
 
             let mut pos = 0usize;
             let n = n as usize;
 
             while pos < n {
-                let dent = unsafe {
-                    &*(buf.as_ptr().add(pos) as *const LinuxDirent64)
-                };
+                let dent = unsafe { &*(buf.as_ptr().add(pos) as *const LinuxDirent64) };
 
                 // Name starts after the fixed fields.
                 let name_offset = mem::offset_of!(LinuxDirent64, d_type) + 1;
-                let name_ptr    = unsafe { buf.as_ptr().add(pos + name_offset) as *const c_char };
-                let name_cstr   = unsafe { CStr::from_ptr(name_ptr) };
-                let name_bytes  = name_cstr.to_bytes();
+                let name_ptr = unsafe { buf.as_ptr().add(pos + name_offset) as *const c_char };
+                let name_cstr = unsafe { CStr::from_ptr(name_ptr) };
+                let name_bytes = name_cstr.to_bytes();
 
                 // Skip . and ..
                 if name_bytes == b"." || name_bytes == b".." {
@@ -400,10 +427,8 @@ fn worker_loop(
                 }
 
                 let is_dir = dent.d_type == DT_DIR;
-                let child_path = dir_path.join(
-                    std::str::from_utf8(name_bytes)
-                        .unwrap_or("\u{FFFD}")
-                );
+                let child_path =
+                    dir_path.join(std::str::from_utf8(name_bytes).unwrap_or("\u{FFFD}"));
 
                 if is_dir && skip_dir(&child_path) {
                     pos += dent.d_reclen as usize;
@@ -412,8 +437,7 @@ fn worker_loop(
 
                 // Get mtime via statx(dirfd, relative_name).
                 let (mtime_sec, mtime_nsec) = if collect_mtime
-                    && (dent.d_type == DT_REG || dent.d_type == DT_DIR
-                        || dent.d_type == DT_UNKNOWN)
+                    && (dent.d_type == DT_REG || dent.d_type == DT_DIR || dent.d_type == DT_UNKNOWN)
                 {
                     statx_mtime(dir_fd, name_cstr)
                 } else {
@@ -439,10 +463,14 @@ fn worker_loop(
         }
 
         unsafe { close(dir_fd) };
-        counters.entries_found.fetch_add(local_count, Ordering::Relaxed);
+        counters
+            .entries_found
+            .fetch_add(local_count, Ordering::Relaxed);
         counters.dirs_completed.fetch_add(1, Ordering::Relaxed);
 
         let remaining = counters.in_flight.fetch_sub(1, Ordering::SeqCst) - 1;
-        if remaining == 0 { wq.wake_all(); }
+        if remaining == 0 {
+            wq.wake_all();
+        }
     }
 }

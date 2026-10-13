@@ -38,16 +38,16 @@
 //!   replaying an event twice, or after a fresh scan, is harmless.
 
 use rfind_config::{load as load_config, write_default, Config, DEFAULT_CONFIG_PATH};
-use rfind_monitor::DirWatcher;
 use rfind_core::{
     db::{self, EventType},
     db_path, progress_file_path, DaemonPhase, ScanProgress,
 };
+use rfind_monitor::DirWatcher;
 use rfind_monitor::Monitor;
 use rfind_scanner::{run_scan, EntryInfo, ScanConfig};
 use rusqlite::Connection;
 use signal_hook::{
-    consts::{SIGUSR1, SIGTERM},
+    consts::{SIGTERM, SIGUSR1},
     iterator::Signals,
 };
 use std::{
@@ -76,7 +76,9 @@ fn now_secs() -> i64 {
 
 fn write_progress(progress: &ScanProgress) {
     let path = progress_file_path();
-    if let Some(p) = path.parent() { let _ = fs::create_dir_all(p); }
+    if let Some(p) = path.parent() {
+        let _ = fs::create_dir_all(p);
+    }
     if let Ok(json) = serde_json::to_string(progress) {
         let tmp = path.with_extension("tmp");
         if let Ok(mut f) = fs::File::create(&tmp) {
@@ -101,8 +103,15 @@ fn make_progress(
     let status = match &phase {
         DaemonPhase::Scanning => format!(
             "Scanning | {} entries | {} dirs | {:.0}/s | {:.1}s{}",
-            entries, dirs, rate, elapsed,
-            if errors > 0 { format!(" | {} errors", errors) } else { String::new() }
+            entries,
+            dirs,
+            rate,
+            elapsed,
+            if errors > 0 {
+                format!(" | {} errors", errors)
+            } else {
+                String::new()
+            }
         ),
         DaemonPhase::Reconciling => format!(
             "Reconciling | {} events pending | {} applied",
@@ -116,16 +125,16 @@ fn make_progress(
     };
     ScanProgress {
         phase,
-        entries_found:   entries,
-        dirs_completed:  dirs,
-        dirs_pending:    pending,
+        entries_found: entries,
+        dirs_completed: dirs,
+        dirs_pending: pending,
         entries_per_sec: rate,
         errors,
-        timestamp_secs:  SystemTime::now()
+        timestamp_secs: SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
-        status_line:     status,
+        status_line: status,
         events_pending,
         events_applied,
         monitoring_mode: monitoring_mode.to_string(),
@@ -135,20 +144,30 @@ fn make_progress(
 fn flush_batch(conn: &Connection, batch: &mut Vec<EntryInfo>, scan_gen: i64) {
     let tx = match conn.unchecked_transaction() {
         Ok(t) => t,
-        Err(e) => { error!("tx error: {e}"); batch.clear(); return; }
+        Err(e) => {
+            error!("tx error: {e}");
+            batch.clear();
+            return;
+        }
     };
     {
         let mut ins = db::Inserter::new(&tx);
         for entry in batch.drain(..) {
             let full_path = entry.path.to_string_lossy();
             if let Err(e) = ins.insert(
-                &full_path, entry.is_dir, entry.mtime_sec, entry.mtime_nsec, Some(scan_gen),
+                &full_path,
+                entry.is_dir,
+                entry.mtime_sec,
+                entry.mtime_nsec,
+                Some(scan_gen),
             ) {
                 error!("insert {full_path}: {e}");
             }
         }
     }
-    if let Err(e) = tx.commit() { error!("commit: {e}"); }
+    if let Err(e) = tx.commit() {
+        error!("commit: {e}");
+    }
 }
 
 fn is_excluded(cfg: &Config, path: &Path) -> bool {
@@ -158,7 +177,9 @@ fn is_excluded(cfg: &Config, path: &Path) -> bool {
 /// Make the index agree with the filesystem for one path.
 fn sync_path(conn: &Connection, cfg: &Config, path: &str) -> rusqlite::Result<()> {
     let p = Path::new(path);
-    if is_excluded(cfg, p) { return Ok(()); }
+    if is_excluded(cfg, p) {
+        return Ok(());
+    }
     match fs::symlink_metadata(p) {
         Ok(md) => db::insert_entry(conn, path, md.is_dir(), md.mtime(), md.mtime_nsec(), None),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -193,17 +214,27 @@ fn reconcile(conn: &Arc<Mutex<Connection>>, cfg: &Config) -> (u64, u64) {
     loop {
         let c = conn.lock().unwrap();
         let events = db::load_unapplied_events(&c, RECONCILE_BATCH).unwrap_or_default();
-        if events.is_empty() { break; }
-        if applied == 0 { info!("Reconciling events"); }
+        if events.is_empty() {
+            break;
+        }
+        if applied == 0 {
+            info!("Reconciling events");
+        }
         let tx = match c.unchecked_transaction() {
             Ok(t) => t,
-            Err(e) => { error!("reconcile tx: {e}"); break; }
+            Err(e) => {
+                error!("reconcile tx: {e}");
+                break;
+            }
         };
         for event in &events {
             apply_event(&tx, event, cfg);
             let _ = db::mark_event_applied(&tx, event.id);
         }
-        if let Err(e) = tx.commit() { error!("reconcile commit: {e}"); break; }
+        if let Err(e) = tx.commit() {
+            error!("reconcile commit: {e}");
+            break;
+        }
         applied += events.len() as u64;
     }
     if applied > 0 {
@@ -219,13 +250,20 @@ fn reconcile(conn: &Arc<Mutex<Connection>>, cfg: &Config) -> (u64, u64) {
 // ---------------------------------------------------------------------------
 
 fn periodic_paths(cfg: &Config) -> Vec<PathBuf> {
-    cfg.scan.periodic_roots.iter().map(|r| r.path.clone()).collect()
+    cfg.scan
+        .periodic_roots
+        .iter()
+        .map(|r| r.path.clone())
+        .collect()
 }
 
 /// Other configured roots strictly inside `root`; each is maintained by
 /// its own scan, so `root`'s scan skips them and its sweep keeps them.
 fn nested_roots(cfg: &Config, root: &Path) -> Vec<PathBuf> {
-    cfg.scan.roots.iter().cloned()
+    cfg.scan
+        .roots
+        .iter()
+        .cloned()
         .chain(periodic_paths(cfg))
         .filter(|r| r != root && r.starts_with(root))
         .collect()
@@ -233,9 +271,12 @@ fn nested_roots(cfg: &Config, root: &Path) -> Vec<PathBuf> {
 
 fn next_scan_gen(conn: &Arc<Mutex<Connection>>) -> i64 {
     let c = conn.lock().unwrap();
-    let g = db::get_metadata(&c, "scan_gen").ok().flatten()
+    let g = db::get_metadata(&c, "scan_gen")
+        .ok()
+        .flatten()
         .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(0) + 1;
+        .unwrap_or(0)
+        + 1;
     let _ = db::set_metadata(&c, "scan_gen", &g.to_string());
     g
 }
@@ -262,46 +303,55 @@ fn scan_root(
     let mut skip: Vec<PathBuf> = cfg.scan.exclude.clone();
     skip.extend(nested.iter().cloned());
 
-    if let Some(w) = &watcher { w.watch(root); }
+    if let Some(w) = &watcher {
+        w.watch(root);
+    }
 
     let batch_size = cfg.index.batch_size;
-    let batch: Arc<Mutex<Vec<EntryInfo>>> =
-        Arc::new(Mutex::new(Vec::with_capacity(batch_size)));
+    let batch: Arc<Mutex<Vec<EntryInfo>>> = Arc::new(Mutex::new(Vec::with_capacity(batch_size)));
 
     let scan_cfg = ScanConfig::new(
         vec![root.to_path_buf()],
         cfg.scan.collect_mtime,
         {
             let conn = Arc::clone(conn);
-            let mm   = monitoring_mode.to_string();
+            let mm = monitoring_mode.to_string();
             move |mut progress| {
-                if !report { return; }
-                let ep = conn.lock().ok()
+                if !report {
+                    return;
+                }
+                let ep = conn
+                    .lock()
+                    .ok()
                     .and_then(|c| db::pending_event_count(&c).ok())
                     .unwrap_or(0) as u64;
                 // The scanner reports Ready when it finishes, but the
                 // daemon is not ready until events are reconciled.
-                progress.phase           = DaemonPhase::Scanning;
-                progress.events_pending  = ep;
+                progress.phase = DaemonPhase::Scanning;
+                progress.events_pending = ep;
                 progress.monitoring_mode = mm.clone();
                 info!("{} | {} events queued", progress.status_line, ep);
                 write_progress(&progress);
             }
         },
         {
-            let conn  = Arc::clone(conn);
+            let conn = Arc::clone(conn);
             let batch = Arc::clone(&batch);
             move |entry: EntryInfo| {
                 // Watch before the scanner reads this directory.
                 if entry.is_dir {
-                    if let Some(w) = &watcher { w.watch(&entry.path); }
+                    if let Some(w) = &watcher {
+                        w.watch(&entry.path);
+                    }
                 }
                 // Swap the full batch out so the batch lock is never held
                 // while waiting for the DB lock.
                 let full = {
                     let mut buf = batch.lock().unwrap();
                     buf.push(entry);
-                    if buf.len() < batch_size { return; }
+                    if buf.len() < batch_size {
+                        return;
+                    }
                     std::mem::replace(&mut *buf, Vec::with_capacity(batch_size))
                 };
                 let mut full = full;
@@ -317,9 +367,14 @@ fn scan_root(
 
     let mut rest = std::mem::take(&mut *batch.lock().unwrap());
     let c = conn.lock().unwrap();
-    if !rest.is_empty() { flush_batch(&c, &mut rest, scan_gen); }
+    if !rest.is_empty() {
+        flush_batch(&c, &mut rest, scan_gen);
+    }
 
-    let keep: Vec<String> = nested.iter().map(|p| p.to_string_lossy().to_string()).collect();
+    let keep: Vec<String> = nested
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
     match db::sweep_stale(&c, &root.to_string_lossy(), &keep, scan_gen) {
         Ok(n) if n > 0 => info!("Removed {n} stale entries under {}", root.display()),
         Ok(_) => {}
@@ -345,15 +400,27 @@ fn live_reindex(
 
 fn reconcile_and_mark_ready(conn: &Arc<Mutex<Connection>>, cfg: &Config, monitoring_mode: &str) {
     {
-        let ep = conn.lock().ok()
+        let ep = conn
+            .lock()
+            .ok()
             .and_then(|c| db::pending_event_count(&c).ok())
             .unwrap_or(0) as u64;
-        let total = conn.lock().ok()
+        let total = conn
+            .lock()
+            .ok()
             .and_then(|c| db::entry_count(&c).ok())
             .unwrap_or(0) as u64;
         let p = make_progress(
-            DaemonPhase::Reconciling, total, 0, 0, 0.0, 0,
-            ep, 0, 0.0, monitoring_mode,
+            DaemonPhase::Reconciling,
+            total,
+            0,
+            0,
+            0.0,
+            0,
+            ep,
+            0,
+            0.0,
+            monitoring_mode,
         );
         write_progress(&p);
         info!("{}", p.status_line);
@@ -364,11 +431,19 @@ fn reconcile_and_mark_ready(conn: &Arc<Mutex<Connection>>, cfg: &Config, monitor
     let _ = c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     let count = db::entry_count(&c).unwrap_or(0);
     let _ = db::set_metadata(&c, "last_scan_completed", &now_secs().to_string());
-    let _ = db::set_metadata(&c, "last_entry_count",   &count.to_string());
-    let _ = db::set_metadata(&c, "monitoring_mode",    monitoring_mode);
+    let _ = db::set_metadata(&c, "last_entry_count", &count.to_string());
+    let _ = db::set_metadata(&c, "monitoring_mode", monitoring_mode);
     let p = make_progress(
-        DaemonPhase::Ready, count as u64, 0, 0, 0.0, 0,
-        0, events_applied, 0.0, monitoring_mode,
+        DaemonPhase::Ready,
+        count as u64,
+        0,
+        0,
+        0.0,
+        0,
+        0,
+        events_applied,
+        0.0,
+        monitoring_mode,
     );
     write_progress(&p);
     info!("{}", p.status_line);
@@ -378,23 +453,31 @@ fn reconcile_and_mark_ready(conn: &Arc<Mutex<Connection>>, cfg: &Config, monitor
 fn due_periodic_root(conn: &Arc<Mutex<Connection>>, cfg: &Config) -> Option<PathBuf> {
     let c = conn.lock().unwrap();
     let now = now_secs();
-    cfg.scan.periodic_roots.iter().find(|r| {
-        if !r.path.is_dir() { return false; } // unmounted: keep the old entries
-        let last = db::get_metadata(&c, &root_scan_key(&r.path)).ok().flatten()
-            .and_then(|v| v.parse::<i64>().ok());
-        match last {
-            None => true,
-            Some(t) => r.interval_hours > 0 && now - t >= r.interval_hours as i64 * 3600,
-        }
-    }).map(|r| r.path.clone())
+    cfg.scan
+        .periodic_roots
+        .iter()
+        .find(|r| {
+            if !r.path.is_dir() {
+                return false;
+            } // unmounted: keep the old entries
+            let last = db::get_metadata(&c, &root_scan_key(&r.path))
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<i64>().ok());
+            match last {
+                None => true,
+                Some(t) => r.interval_hours > 0 && now - t >= r.interval_hours as i64 * 3600,
+            }
+        })
+        .map(|r| r.path.clone())
 }
 
 /// One line of /proc/self/mountinfo, reduced to what alias detection needs.
 #[derive(Debug, Clone)]
 struct MountEntry {
-    dev:    String,  // "major:minor"
+    dev: String,     // "major:minor"
     fsroot: PathBuf, // directory of the filesystem shown at this mount
-    point:  PathBuf,
+    point: PathBuf,
 }
 
 fn parse_mountinfo(text: &str) -> Vec<MountEntry> {
@@ -417,14 +500,16 @@ fn parse_mountinfo(text: &str) -> Vec<MountEntry> {
         }
         String::from_utf8_lossy(&out).into_owned()
     }
-    text.lines().filter_map(|l| {
-        let f: Vec<&str> = l.split(' ').collect();
-        (f.len() > 4).then(|| MountEntry {
-            dev:    f[2].to_string(),
-            fsroot: PathBuf::from(unescape(f[3])),
-            point:  PathBuf::from(unescape(f[4])),
+    text.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split(' ').collect();
+            (f.len() > 4).then(|| MountEntry {
+                dev: f[2].to_string(),
+                fsroot: PathBuf::from(unescape(f[3])),
+                point: PathBuf::from(unescape(f[4])),
+            })
         })
-    }).collect()
+        .collect()
 }
 
 /// Mount points whose content is already reachable through another mount
@@ -440,9 +525,13 @@ fn alias_mounts(mounts: &[MountEntry]) -> Vec<(PathBuf, PathBuf)> {
     let depth = |p: &Path| p.components().count();
     let mut aliases = Vec::new();
     for (i, b) in mounts.iter().enumerate() {
-        let canonical = mounts.iter().enumerate()
+        let canonical = mounts
+            .iter()
+            .enumerate()
             .filter(|(j, a)| {
-                *j != i && a.dev == b.dev && b.fsroot.starts_with(&a.fsroot)
+                *j != i
+                    && a.dev == b.dev
+                    && b.fsroot.starts_with(&a.fsroot)
                     && a.point.join(b.fsroot.strip_prefix(&a.fsroot).unwrap()) != b.point
                     && !a.point.starts_with(&b.point)
                     && (depth(&a.point), *j) < (depth(&b.point), i)
@@ -450,7 +539,11 @@ fn alias_mounts(mounts: &[MountEntry]) -> Vec<(PathBuf, PathBuf)> {
             .min_by_key(|(j, a)| (depth(&a.point), *j));
         if let Some((_, a)) = canonical {
             let rel = b.fsroot.strip_prefix(&a.fsroot).unwrap();
-            let target = if rel.as_os_str().is_empty() { a.point.clone() } else { a.point.join(rel) };
+            let target = if rel.as_os_str().is_empty() {
+                a.point.clone()
+            } else {
+                a.point.join(rel)
+            };
             aliases.push((b.point.clone(), target));
         }
     }
@@ -461,15 +554,25 @@ fn alias_mounts(mounts: &[MountEntry]) -> Vec<(PathBuf, PathBuf)> {
 /// inotify never sees changes made from Windows, and watching a whole
 /// drive can exhaust the inotify watch limit.
 fn warn_drvfs_under_live_roots(cfg: &Config) {
-    let Ok(mounts) = fs::read_to_string("/proc/self/mounts") else { return };
-    let handled: Vec<PathBuf> = cfg.scan.exclude.iter().cloned()
+    let Ok(mounts) = fs::read_to_string("/proc/self/mounts") else {
+        return;
+    };
+    let handled: Vec<PathBuf> = cfg
+        .scan
+        .exclude
+        .iter()
+        .cloned()
         .chain(periodic_paths(cfg))
         .collect();
     for line in mounts.lines() {
         let f: Vec<&str> = line.split_whitespace().collect();
-        if f.len() < 4 { continue; }
+        if f.len() < 4 {
+            continue;
+        }
         let drvfs = f[2] == "drvfs" || (f[2] == "9p" && f[3].contains("aname=drvfs"));
-        if !drvfs { continue; }
+        if !drvfs {
+            continue;
+        }
         let mp = PathBuf::from(f[1]);
         let live = cfg.scan.roots.iter().any(|r| mp.starts_with(r));
         if live && !handled.iter().any(|h| mp.starts_with(h)) {
@@ -504,34 +607,56 @@ fn main() {
         }
     }
     let cfg = match load_config(&config_path) {
-        Ok(c)  => { info!("Config loaded from {:?}", config_path); c }
-        Err(e) => { warn!("Config error: {e} — using defaults"); Config::default() }
+        Ok(c) => {
+            info!("Config loaded from {:?}", config_path);
+            c
+        }
+        Err(e) => {
+            warn!("Config error: {e} — using defaults");
+            Config::default()
+        }
     };
 
     // Skip bind-mount aliases of filesystems that are indexed elsewhere.
     let mut cfg = cfg;
     if let Ok(text) = fs::read_to_string("/proc/self/mountinfo") {
         for (alias, canonical) in alias_mounts(&parse_mountinfo(&text)) {
-            if is_excluded(&cfg, &alias) { continue; }
-            info!("Skipping {} (bind mount; same files as {})", alias.display(), canonical.display());
+            if is_excluded(&cfg, &alias) {
+                continue;
+            }
+            info!(
+                "Skipping {} (bind mount; same files as {})",
+                alias.display(),
+                canonical.display()
+            );
             cfg.scan.exclude.push(alias);
         }
     }
 
     info!("Roots: {:?}", cfg.scan.roots);
     for r in &cfg.scan.periodic_roots {
-        info!("Periodic root: {} (every {}h)", r.path.display(), r.interval_hours);
+        info!(
+            "Periodic root: {} (every {}h)",
+            r.path.display(),
+            r.interval_hours
+        );
     }
     info!("Excludes: {:?}", cfg.scan.exclude);
-    info!("Workers: {}", if cfg.scan.workers == 0 { num_cpus::get() } else { cfg.scan.workers });
+    info!(
+        "Workers: {}",
+        if cfg.scan.workers == 0 {
+            num_cpus::get()
+        } else {
+            cfg.scan.workers
+        }
+    );
     info!("Collect mtime: {}", cfg.scan.collect_mtime);
     info!("Reindex interval: {}h", cfg.scan.reindex_interval_hours);
     warn_drvfs_under_live_roots(&cfg);
 
     // Ensure directories exist.
     let db_file = cfg.index.db_path.clone();
-    fs::create_dir_all(db_file.parent().unwrap())
-        .expect("Failed to create db directory");
+    fs::create_dir_all(db_file.parent().unwrap()).expect("Failed to create db directory");
 
     let conn = Arc::new(Mutex::new(
         db::open(&db_file).expect("Failed to open database"),
@@ -539,17 +664,22 @@ fn main() {
 
     // ── Signal handling ──────────────────────────────────────────────────────
     let force_reindex = Arc::new(AtomicBool::new(false));
-    let shutdown      = Arc::new(AtomicBool::new(false));
+    let shutdown = Arc::new(AtomicBool::new(false));
     {
         let fr = Arc::clone(&force_reindex);
         let sd = Arc::clone(&shutdown);
-        let mut signals = Signals::new([SIGUSR1, SIGTERM])
-            .expect("Failed to register signals");
+        let mut signals = Signals::new([SIGUSR1, SIGTERM]).expect("Failed to register signals");
         thread::spawn(move || {
             for sig in signals.forever() {
                 match sig {
-                    SIGUSR1 => { info!("SIGUSR1: forcing re-index"); fr.store(true, Ordering::Relaxed); }
-                    SIGTERM => { info!("SIGTERM: shutting down");    sd.store(true, Ordering::Relaxed); }
+                    SIGUSR1 => {
+                        info!("SIGUSR1: forcing re-index");
+                        fr.store(true, Ordering::Relaxed);
+                    }
+                    SIGTERM => {
+                        info!("SIGTERM: shutting down");
+                        sd.store(true, Ordering::Relaxed);
+                    }
                     _ => {}
                 }
             }
@@ -575,11 +705,20 @@ fn main() {
     if needs_full_scan {
         info!(
             "Full scan needed ({})",
-            if last_scan.is_none() { "first run".to_string() }
-            else { format!("index age {}s > interval {}s", age_secs, reindex_interval_secs) }
+            if last_scan.is_none() {
+                "first run".to_string()
+            } else {
+                format!(
+                    "index age {}s > interval {}s",
+                    age_secs, reindex_interval_secs
+                )
+            }
         );
     } else {
-        info!("Index age {}s < interval {}s — fast restart, journal only", age_secs, reindex_interval_secs);
+        info!(
+            "Index age {}s < interval {}s — fast restart, journal only",
+            age_secs, reindex_interval_secs
+        );
     }
 
     // ── Start monitor ────────────────────────────────────────────────────────
@@ -593,8 +732,14 @@ fn main() {
     // scan instead registers watches as it discovers directories.
     let dirs_for_inotify: Vec<String> = if !needs_full_scan {
         let c = conn.lock().unwrap();
-        db::get_all_dirs(&c).unwrap_or_default().into_iter()
-            .filter(|d| !monitor_excludes.iter().any(|ex| Path::new(d).starts_with(ex)))
+        db::get_all_dirs(&c)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|d| {
+                !monitor_excludes
+                    .iter()
+                    .any(|ex| Path::new(d).starts_with(ex))
+            })
             .collect()
     } else {
         Vec::new()
@@ -643,7 +788,9 @@ fn main() {
 
         if shutdown.load(Ordering::Relaxed) {
             info!("Shutting down cleanly");
-            if let Some(m) = monitor_opt { m.stop(); }
+            if let Some(m) = monitor_opt {
+                m.stop();
+            }
             break;
         }
 
@@ -658,7 +805,10 @@ fn main() {
             }
         }
         if forced || overflowed {
-            info!("Re-index triggered by {}", if forced { "SIGUSR1" } else { "event overflow" });
+            info!(
+                "Re-index triggered by {}",
+                if forced { "SIGUSR1" } else { "event overflow" }
+            );
             live_reindex(&conn, &cfg, watcher.as_ref(), &monitoring_mode);
             // This re-index already covers any SIGUSR1 that arrived
             // while it ran.
@@ -667,7 +817,9 @@ fn main() {
         }
 
         // Apply pending events.
-        let pending = conn.lock().ok()
+        let pending = conn
+            .lock()
+            .ok()
             .and_then(|c| db::pending_event_count(&c).ok())
             .unwrap_or(0);
         if pending > 0 {
@@ -680,8 +832,10 @@ fn main() {
             && cfg.scan.reindex_interval_hours > 0
             && tick % (cfg.scan.reindex_interval_hours * 720) == 0
         {
-            info!("Periodic re-index (index-only mode, interval {}h)",
-                  cfg.scan.reindex_interval_hours);
+            info!(
+                "Periodic re-index (index-only mode, interval {}h)",
+                cfg.scan.reindex_interval_hours
+            );
             live_reindex(&conn, &cfg, None, &monitoring_mode);
         }
 
@@ -691,14 +845,20 @@ fn main() {
             if let Some(root) = due_periodic_root(&conn, &cfg) {
                 bg_scanning.store(true, Ordering::Release);
                 let (conn, cfg, mm, flag) = (
-                    Arc::clone(&conn), cfg.clone(), monitoring_mode.clone(), Arc::clone(&bg_scanning),
+                    Arc::clone(&conn),
+                    cfg.clone(),
+                    monitoring_mode.clone(),
+                    Arc::clone(&bg_scanning),
                 );
                 thread::spawn(move || {
                     info!("Background scan of periodic root {}", root.display());
                     let t = std::time::Instant::now();
                     let n = scan_root(&conn, &cfg, &root, None, false, &mm);
-                    info!("Background scan of {} done: {n} entries in {:.1}s",
-                          root.display(), t.elapsed().as_secs_f64());
+                    info!(
+                        "Background scan of {} done: {n} entries in {:.1}s",
+                        root.display(),
+                        t.elapsed().as_secs_f64()
+                    );
                     flag.store(false, Ordering::Release);
                 });
             }
@@ -721,7 +881,8 @@ mod tests {
     use super::*;
 
     fn aliases(mi: &str) -> Vec<(String, String)> {
-        alias_mounts(&parse_mountinfo(mi)).into_iter()
+        alias_mounts(&parse_mountinfo(mi))
+            .into_iter()
             .map(|(a, c)| (a.display().to_string(), c.display().to_string()))
             .collect()
     }
@@ -736,10 +897,13 @@ mod tests {
 50 24 0:88 / /run/user/1000 rw - tmpfs none rw
 51 30 0:88 / /mnt/wslg/run/user/1000 rw - tmpfs none rw
 ";
-        assert_eq!(aliases(mi), vec![
-            ("/mnt/wslg/distro".into(), "/".into()),
-            ("/mnt/wslg/run/user/1000".into(), "/run/user/1000".into()),
-        ]);
+        assert_eq!(
+            aliases(mi),
+            vec![
+                ("/mnt/wslg/distro".into(), "/".into()),
+                ("/mnt/wslg/run/user/1000".into(), "/run/user/1000".into()),
+            ]
+        );
     }
 
     #[test]
@@ -748,7 +912,10 @@ mod tests {
 1 0 8:1 / / rw - ext4 /dev/sda1 rw
 2 1 8:1 /home/app/data /srv/data rw - ext4 /dev/sda1 rw
 ";
-        assert_eq!(aliases(mi), vec![("/srv/data".into(), "/home/app/data".into())]);
+        assert_eq!(
+            aliases(mi),
+            vec![("/srv/data".into(), "/home/app/data".into())]
+        );
     }
 
     #[test]

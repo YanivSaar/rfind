@@ -21,11 +21,11 @@ use tracing::error;
 const MAX_BATCH: usize = 5000;
 
 struct RawEvent {
-    et:       EventType,
-    path:     String,
+    et: EventType,
+    path: String,
     new_path: Option<String>,
-    is_dir:   bool,
-    ts:       i64,
+    is_dir: bool,
+    ts: i64,
 }
 
 /// Cloneable handle for submitting events. The writer thread exits once
@@ -41,7 +41,13 @@ impl EventSink {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        let _ = self.tx.send(RawEvent { et, path, new_path, is_dir, ts });
+        let _ = self.tx.send(RawEvent {
+            et,
+            path,
+            new_path,
+            is_dir,
+            ts,
+        });
     }
 }
 
@@ -64,15 +70,26 @@ fn writer_loop(db: Arc<Mutex<Connection>>, rx: Receiver<RawEvent>) {
         let c = db.lock().unwrap();
         let tx = match c.unchecked_transaction() {
             Ok(t) => t,
-            Err(e) => { error!("event journal tx: {e}"); batch.clear(); continue; }
+            Err(e) => {
+                error!("event journal tx: {e}");
+                batch.clear();
+                continue;
+            }
         };
         for ev in batch.drain(..) {
             if let Err(e) = insert_pending_event(
-                &tx, &ev.et, &ev.path, ev.new_path.as_deref(), ev.is_dir, ev.ts,
+                &tx,
+                &ev.et,
+                &ev.path,
+                ev.new_path.as_deref(),
+                ev.is_dir,
+                ev.ts,
             ) {
                 error!("journal event {}: {e}", ev.path);
             }
         }
-        if let Err(e) = tx.commit() { error!("event journal commit: {e}"); }
+        if let Err(e) = tx.commit() {
+            error!("event journal commit: {e}");
+        }
     }
 }

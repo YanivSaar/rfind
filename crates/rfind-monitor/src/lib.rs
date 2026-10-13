@@ -42,7 +42,7 @@ impl Monitor {
     /// Returns the active monitor and a string describing the mode.
     pub fn start(
         mount: &PathBuf,
-        dirs: Vec<String>,       // for inotify: list of dirs to watch
+        dirs: Vec<String>, // for inotify: list of dirs to watch
         db: Arc<Mutex<Connection>>,
         excludes: Vec<PathBuf>,
         prefer_fanotify: bool,
@@ -85,7 +85,7 @@ impl Monitor {
     /// fanotify, whose mount mark already covers new directories.
     pub fn dir_watcher(&self) -> Option<DirWatcher> {
         match self {
-            Monitor::Inotify(m)  => Some(m.watcher()),
+            Monitor::Inotify(m) => Some(m.watcher()),
             Monitor::Fanotify(_) => None,
         }
     }
@@ -95,14 +95,14 @@ impl Monitor {
     pub fn take_overflow(&self) -> bool {
         match self {
             Monitor::Fanotify(m) => m.take_overflow(),
-            Monitor::Inotify(m)  => m.take_overflow(),
+            Monitor::Inotify(m) => m.take_overflow(),
         }
     }
 
     pub fn stop(self) {
         match self {
             Monitor::Fanotify(m) => m.stop(),
-            Monitor::Inotify(m)  => m.stop(),
+            Monitor::Inotify(m) => m.stop(),
         }
     }
 }

@@ -1,13 +1,12 @@
 //! fanotify backend — one mount watch covers the entire filesystem.
 
-use libc::{
-    close, fanotify_event_metadata, fanotify_init, fanotify_mark, read,
-    FAN_CLASS_NOTIF, FAN_CLOSE_WRITE, FAN_CREATE, FAN_DELETE,
-    FAN_DELETE_SELF, FAN_EVENT_ON_CHILD, FAN_MARK_ADD, FAN_MARK_MOUNT,
-    FAN_MOVE, FAN_MOVE_SELF, FAN_NONBLOCK, FAN_ONDIR, FAN_Q_OVERFLOW,
-    O_LARGEFILE, O_RDONLY,
-};
 use crate::sink::EventSink;
+use libc::{
+    close, fanotify_event_metadata, fanotify_init, fanotify_mark, read, FAN_CLASS_NOTIF,
+    FAN_CLOSE_WRITE, FAN_CREATE, FAN_DELETE, FAN_DELETE_SELF, FAN_EVENT_ON_CHILD, FAN_MARK_ADD,
+    FAN_MARK_MOUNT, FAN_MOVE, FAN_MOVE_SELF, FAN_NONBLOCK, FAN_ONDIR, FAN_Q_OVERFLOW, O_LARGEFILE,
+    O_RDONLY,
+};
 use rfind_core::db::EventType;
 use std::{
     ffi::CString,
@@ -24,8 +23,14 @@ use std::{
 use thiserror::Error;
 use tracing::{debug, error, warn};
 
-const WATCH_MASK: u64 = (FAN_CREATE | FAN_DELETE | FAN_MOVE | FAN_CLOSE_WRITE
-    | FAN_DELETE_SELF | FAN_MOVE_SELF | FAN_ONDIR | FAN_EVENT_ON_CHILD) as u64;
+const WATCH_MASK: u64 = (FAN_CREATE
+    | FAN_DELETE
+    | FAN_MOVE
+    | FAN_CLOSE_WRITE
+    | FAN_DELETE_SELF
+    | FAN_MOVE_SELF
+    | FAN_ONDIR
+    | FAN_EVENT_ON_CHILD) as u64;
 
 #[derive(Debug, Error)]
 pub enum FanotifyError {
@@ -36,10 +41,10 @@ pub enum FanotifyError {
 }
 
 pub struct FanotifyMonitor {
-    stop:     Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
     overflow: Arc<AtomicBool>,
-    handle:   Option<thread::JoinHandle<()>>,
-    writer:   Option<thread::JoinHandle<()>>,
+    handle: Option<thread::JoinHandle<()>>,
+    writer: Option<thread::JoinHandle<()>>,
 }
 
 impl FanotifyMonitor {
@@ -52,7 +57,7 @@ impl FanotifyMonitor {
         mark_mount(fd, mount)?;
 
         let (sink, writer) = sink;
-        let stop     = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
         let overflow = Arc::new(AtomicBool::new(false));
         let handle = {
             let (s, o) = (Arc::clone(&stop), Arc::clone(&overflow));
@@ -62,20 +67,33 @@ impl FanotifyMonitor {
             })
         };
 
-        Ok(Self { stop, overflow, handle: Some(handle), writer: Some(writer) })
+        Ok(Self {
+            stop,
+            overflow,
+            handle: Some(handle),
+            writer: Some(writer),
+        })
     }
 
     /// True (once) if the kernel queue overflowed since the last call.
-    pub fn take_overflow(&self) -> bool { self.overflow.swap(false, Ordering::Relaxed) }
+    pub fn take_overflow(&self) -> bool {
+        self.overflow.swap(false, Ordering::Relaxed)
+    }
 
     pub fn stop(mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(h) = self.handle.take() { let _ = h.join(); }
-        if let Some(h) = self.writer.take() { let _ = h.join(); }
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.writer.take() {
+            let _ = h.join();
+        }
     }
 }
 
-fn errno() -> i32 { unsafe { *libc::__errno_location() } }
+fn errno() -> i32 {
+    unsafe { *libc::__errno_location() }
+}
 
 fn init_fanotify() -> Result<RawFd, FanotifyError> {
     let fd = unsafe {
@@ -86,8 +104,10 @@ fn init_fanotify() -> Result<RawFd, FanotifyError> {
     };
     if fd < 0 {
         let e = errno();
-        return Err(FanotifyError::Init(e,
-            std::io::Error::from_raw_os_error(e).to_string()));
+        return Err(FanotifyError::Init(
+            e,
+            std::io::Error::from_raw_os_error(e).to_string(),
+        ));
     }
     Ok(fd)
 }
@@ -96,14 +116,21 @@ fn mark_mount(fd: RawFd, mount: &Path) -> Result<(), FanotifyError> {
     let c = CString::new(mount.as_os_str().as_encoded_bytes())
         .map_err(|_| FanotifyError::Mark(0, "invalid path".into()))?;
     let ret = unsafe {
-        fanotify_mark(fd, FAN_MARK_ADD | FAN_MARK_MOUNT,
-                      WATCH_MASK, libc::AT_FDCWD, c.as_ptr())
+        fanotify_mark(
+            fd,
+            FAN_MARK_ADD | FAN_MARK_MOUNT,
+            WATCH_MASK,
+            libc::AT_FDCWD,
+            c.as_ptr(),
+        )
     };
     if ret < 0 {
         let e = errno();
         unsafe { close(fd) };
-        return Err(FanotifyError::Mark(e,
-            std::io::Error::from_raw_os_error(e).to_string()));
+        return Err(FanotifyError::Mark(
+            e,
+            std::io::Error::from_raw_os_error(e).to_string(),
+        ));
     }
     Ok(())
 }
@@ -123,7 +150,9 @@ fn event_loop(
     let mut buf = vec![0u8; BUF];
 
     loop {
-        if stop.load(Ordering::Relaxed) { break; }
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
 
         let len = unsafe { read(fd, buf.as_mut_ptr() as *mut _, BUF) };
 
@@ -136,14 +165,17 @@ fn event_loop(
             error!("fanotify read: {e}");
             break;
         }
-        if len == 0 { thread::sleep(Duration::from_millis(50)); continue; }
+        if len == 0 {
+            thread::sleep(Duration::from_millis(50));
+            continue;
+        }
 
         let mut off = 0usize;
         while off + mem::size_of::<fanotify_event_metadata>() <= len as usize {
-            let meta = unsafe {
-                &*(buf.as_ptr().add(off) as *const fanotify_event_metadata)
-            };
-            if meta.vers != libc::FANOTIFY_METADATA_VERSION { break; }
+            let meta = unsafe { &*(buf.as_ptr().add(off) as *const fanotify_event_metadata) };
+            if meta.vers != libc::FANOTIFY_METADATA_VERSION {
+                break;
+            }
             if meta.mask & FAN_Q_OVERFLOW as u64 != 0 {
                 warn!("fanotify queue overflow — events lost, rescan scheduled");
                 overflow.store(true, Ordering::Relaxed);
@@ -162,7 +194,9 @@ fn event_loop(
                             Some(EventType::Rename)
                         } else if meta.mask & FAN_CLOSE_WRITE as u64 != 0 {
                             Some(EventType::Modify)
-                        } else { None };
+                        } else {
+                            None
+                        };
 
                         if let Some(et) = et {
                             let is_dir = path.is_dir();

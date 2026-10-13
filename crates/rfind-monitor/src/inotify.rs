@@ -18,9 +18,8 @@
 
 use crate::sink::EventSink;
 use libc::{
-    close, inotify_add_watch, inotify_init1, inotify_rm_watch, read,
-    IN_CREATE, IN_DELETE, IN_DELETE_SELF, IN_IGNORED, IN_ISDIR, IN_MOVED_FROM,
-    IN_MOVED_TO, IN_NONBLOCK, IN_Q_OVERFLOW,
+    close, inotify_add_watch, inotify_init1, inotify_rm_watch, read, IN_CREATE, IN_DELETE,
+    IN_DELETE_SELF, IN_IGNORED, IN_ISDIR, IN_MOVED_FROM, IN_MOVED_TO, IN_NONBLOCK, IN_Q_OVERFLOW,
 };
 use rfind_core::db::EventType;
 use std::{
@@ -38,8 +37,7 @@ use std::{
 };
 use tracing::{error, warn};
 
-const WATCH_MASK: u32 =
-    IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MOVED_FROM | IN_MOVED_TO;
+const WATCH_MASK: u32 = IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MOVED_FROM | IN_MOVED_TO;
 
 /// How long a MOVED_FROM waits for its MOVED_TO before it is treated as
 /// a move out of the watched tree.
@@ -56,19 +54,19 @@ pub enum InotifyError {
 /// inotify event structure (kernel ABI).
 #[repr(C)]
 struct InotifyEvent {
-    wd:     i32,
-    mask:   u32,
+    wd: i32,
+    mask: u32,
     cookie: u32,
-    len:    u32,
+    len: u32,
     // name follows: variable length, null-padded to next 4-byte boundary
 }
 
 /// The inotify fd plus the wd → path map. Owns the fd, so it stays valid
 /// for as long as any [`DirWatcher`] or the event loop holds it.
 struct Watches {
-    fd:           RawFd,
-    map:          Mutex<HashMap<i32, PathBuf>>,
-    excludes:     Vec<PathBuf>,
+    fd: RawFd,
+    map: Mutex<HashMap<i32, PathBuf>>,
+    excludes: Vec<PathBuf>,
     limit_warned: AtomicBool,
 }
 
@@ -78,7 +76,9 @@ impl Watches {
     }
 
     fn add(&self, path: &Path) {
-        if self.is_excluded(path) { return; }
+        if self.is_excluded(path) {
+            return;
+        }
         let c = match CString::new(path.as_os_str().as_encoded_bytes()) {
             Ok(c) => c,
             Err(_) => return,
@@ -115,7 +115,11 @@ impl Watches {
         let mut m = self.map.lock().unwrap();
         for p in m.values_mut() {
             if let Ok(rest) = p.strip_prefix(old) {
-                *p = if rest.as_os_str().is_empty() { new.to_path_buf() } else { new.join(rest) };
+                *p = if rest.as_os_str().is_empty() {
+                    new.to_path_buf()
+                } else {
+                    new.join(rest)
+                };
             }
         }
     }
@@ -124,7 +128,8 @@ impl Watches {
     /// would otherwise keep reporting events for it under a stale path.
     fn remove_under(&self, path: &Path) {
         let mut m = self.map.lock().unwrap();
-        let wds: Vec<i32> = m.iter()
+        let wds: Vec<i32> = m
+            .iter()
             .filter(|(_, p)| p.starts_with(path))
             .map(|(wd, _)| *wd)
             .collect();
@@ -136,7 +141,9 @@ impl Watches {
 }
 
 impl Drop for Watches {
-    fn drop(&mut self) { unsafe { close(self.fd) }; }
+    fn drop(&mut self) {
+        unsafe { close(self.fd) };
+    }
 }
 
 /// Cloneable handle for registering directory watches from other threads
@@ -145,15 +152,17 @@ impl Drop for Watches {
 pub struct DirWatcher(Arc<Watches>);
 
 impl DirWatcher {
-    pub fn watch(&self, path: &Path) { self.0.add(path); }
+    pub fn watch(&self, path: &Path) {
+        self.0.add(path);
+    }
 }
 
 pub struct InotifyMonitor {
-    watches:  Arc<Watches>,
-    stop:     Arc<AtomicBool>,
+    watches: Arc<Watches>,
+    stop: Arc<AtomicBool>,
     overflow: Arc<AtomicBool>,
-    handle:   Option<thread::JoinHandle<()>>,
-    writer:   Option<thread::JoinHandle<()>>,
+    handle: Option<thread::JoinHandle<()>>,
+    writer: Option<thread::JoinHandle<()>>,
 }
 
 impl InotifyMonitor {
@@ -178,36 +187,56 @@ impl InotifyMonitor {
         }
 
         let (sink, writer) = sink;
-        let stop     = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
         let overflow = Arc::new(AtomicBool::new(false));
         let handle = {
-            let (w, s, o) = (Arc::clone(&watches), Arc::clone(&stop), Arc::clone(&overflow));
+            let (w, s, o) = (
+                Arc::clone(&watches),
+                Arc::clone(&stop),
+                Arc::clone(&overflow),
+            );
             thread::spawn(move || event_loop(w, sink, s, o))
         };
 
-        Ok(Self { watches, stop, overflow, handle: Some(handle), writer: Some(writer) })
+        Ok(Self {
+            watches,
+            stop,
+            overflow,
+            handle: Some(handle),
+            writer: Some(writer),
+        })
     }
 
-    pub fn watcher(&self) -> DirWatcher { DirWatcher(Arc::clone(&self.watches)) }
+    pub fn watcher(&self) -> DirWatcher {
+        DirWatcher(Arc::clone(&self.watches))
+    }
 
-    pub fn add_watch(&self, path: &Path) { self.watches.add(path); }
+    pub fn add_watch(&self, path: &Path) {
+        self.watches.add(path);
+    }
 
     /// True (once) if the kernel queue overflowed since the last call.
-    pub fn take_overflow(&self) -> bool { self.overflow.swap(false, Ordering::Relaxed) }
+    pub fn take_overflow(&self) -> bool {
+        self.overflow.swap(false, Ordering::Relaxed)
+    }
 
     pub fn stop(mut self) {
         self.stop.store(true, Ordering::Relaxed);
         // The event loop owns the only sink; once it exits the writer
         // drains the remaining events and exits too.
-        if let Some(h) = self.handle.take() { let _ = h.join(); }
-        if let Some(h) = self.writer.take() { let _ = h.join(); }
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.writer.take() {
+            let _ = h.join();
+        }
     }
 }
 
 struct PendingMove {
-    path:   PathBuf,
+    path: PathBuf,
     is_dir: bool,
-    at:     Instant,
+    at: Instant,
 }
 
 fn event_loop(
@@ -223,7 +252,9 @@ fn event_loop(
     let hdr = mem::size_of::<InotifyEvent>();
 
     loop {
-        if stop.load(Ordering::Relaxed) { break; }
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
 
         let len = unsafe { read(watches.fd, buf.as_mut_ptr() as *mut _, BUF) };
 
@@ -237,13 +268,15 @@ fn event_loop(
             error!("inotify read: {e}");
             break;
         }
-        if len == 0 { thread::sleep(Duration::from_millis(50)); continue; }
+        if len == 0 {
+            thread::sleep(Duration::from_millis(50));
+            continue;
+        }
 
         let mut off = 0usize;
         while off + hdr <= len as usize {
-            let ev: InotifyEvent = unsafe {
-                std::ptr::read_unaligned(buf.as_ptr().add(off) as *const InotifyEvent)
-            };
+            let ev: InotifyEvent =
+                unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off) as *const InotifyEvent) };
             let name = if ev.len > 0 {
                 let s = unsafe {
                     std::ffi::CStr::from_ptr(buf.as_ptr().add(off + hdr) as *const libc::c_char)
@@ -263,27 +296,53 @@ fn event_loop(
                 watches.forget(ev.wd);
                 continue;
             }
-            let Some(dir) = watches.get(ev.wd) else { continue };
+            let Some(dir) = watches.get(ev.wd) else {
+                continue;
+            };
 
             let is_dir = ev.mask & IN_ISDIR != 0;
-            let full_path = if name.is_empty() { dir } else { dir.join(&name) };
-            if watches.is_excluded(&full_path) { continue; }
+            let full_path = if name.is_empty() {
+                dir
+            } else {
+                dir.join(&name)
+            };
+            if watches.is_excluded(&full_path) {
+                continue;
+            }
 
             if ev.mask & IN_CREATE != 0 {
                 sink.send(EventType::Create, lossy(&full_path), None, is_dir);
-                if is_dir { watch_new_tree(&watches, &sink, &full_path); }
+                if is_dir {
+                    watch_new_tree(&watches, &sink, &full_path);
+                }
             } else if ev.mask & (IN_DELETE | IN_DELETE_SELF) != 0 {
                 sink.send(EventType::Delete, lossy(&full_path), None, is_dir);
             } else if ev.mask & IN_MOVED_FROM != 0 {
-                moves.insert(ev.cookie, PendingMove { path: full_path, is_dir, at: Instant::now() });
+                moves.insert(
+                    ev.cookie,
+                    PendingMove {
+                        path: full_path,
+                        is_dir,
+                        at: Instant::now(),
+                    },
+                );
             } else if ev.mask & IN_MOVED_TO != 0 {
                 if let Some(m) = moves.remove(&ev.cookie) {
-                    if is_dir { watches.rename_under(&m.path, &full_path); }
-                    sink.send(EventType::Rename, lossy(&m.path), Some(lossy(&full_path)), is_dir);
+                    if is_dir {
+                        watches.rename_under(&m.path, &full_path);
+                    }
+                    sink.send(
+                        EventType::Rename,
+                        lossy(&m.path),
+                        Some(lossy(&full_path)),
+                        is_dir,
+                    );
                 } else {
                     // Moved in from outside the watched tree.
                     sink.send(EventType::Create, lossy(&full_path), None, is_dir);
-                    if is_dir { watch_new_tree(&watches, &sink, &full_path); }
+                    if is_dir {
+                        watch_new_tree(&watches, &sink, &full_path);
+                    }
                 }
             }
         }
@@ -294,10 +353,16 @@ fn event_loop(
 
 /// MOVED_FROM with no MOVED_TO in time: the entry left the watched tree.
 fn expire_moves(watches: &Watches, sink: &EventSink, moves: &mut HashMap<u32, PendingMove>) {
-    if moves.is_empty() { return; }
+    if moves.is_empty() {
+        return;
+    }
     moves.retain(|_, m| {
-        if m.at.elapsed() < MOVE_PAIR_TIMEOUT { return true; }
-        if m.is_dir { watches.remove_under(&m.path); }
+        if m.at.elapsed() < MOVE_PAIR_TIMEOUT {
+            return true;
+        }
+        if m.is_dir {
+            watches.remove_under(&m.path);
+        }
         sink.send(EventType::Delete, lossy(&m.path), None, m.is_dir);
         false
     });
@@ -312,12 +377,18 @@ fn watch_new_tree(watches: &Watches, sink: &EventSink, root: &Path) {
         let Ok(rd) = fs::read_dir(&dir) else { continue };
         for entry in rd.flatten() {
             let path = entry.path();
-            if watches.is_excluded(&path) { continue; }
+            if watches.is_excluded(&path) {
+                continue;
+            }
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
             sink.send(EventType::Create, lossy(&path), None, is_dir);
-            if is_dir { stack.push(path); }
+            if is_dir {
+                stack.push(path);
+            }
         }
     }
 }
 
-fn lossy(p: &Path) -> String { p.to_string_lossy().to_string() }
+fn lossy(p: &Path) -> String {
+    p.to_string_lossy().to_string()
+}

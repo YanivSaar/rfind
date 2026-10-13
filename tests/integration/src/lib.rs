@@ -13,7 +13,10 @@ fn open() -> rusqlite::Connection {
 
 fn search_by_glob(conn: &rusqlite::Connection, pattern: &str) -> rusqlite::Result<Vec<String>> {
     let mut v = Vec::new();
-    db::search_by_glob_streaming(conn, pattern, None, None, |p| { v.push(p.to_string()); true })?;
+    db::search_by_glob_streaming(conn, pattern, None, None, |p| {
+        v.push(p.to_string());
+        true
+    })?;
     Ok(v)
 }
 
@@ -23,7 +26,10 @@ fn search_under(
     name: Option<&str>,
 ) -> rusqlite::Result<Vec<String>> {
     let mut v = Vec::new();
-    db::search_under_streaming(conn, prefix, name, None, None, |p| { v.push(p.to_string()); true })?;
+    db::search_under_streaming(conn, prefix, name, None, None, |p| {
+        v.push(p.to_string());
+        true
+    })?;
     Ok(v)
 }
 
@@ -64,8 +70,14 @@ fn case_sensitive_uppercase_returns_nothing() {
     let conn = open();
     let upper = search_by_glob(&conn, "PASSWD").unwrap();
     let mixed = search_by_glob(&conn, "Passwd").unwrap();
-    assert!(upper.is_empty(), "PASSWD should return 0 results on Linux, got: {upper:?}");
-    assert!(mixed.is_empty(), "Passwd should return 0 results on Linux, got: {mixed:?}");
+    assert!(
+        upper.is_empty(),
+        "PASSWD should return 0 results on Linux, got: {upper:?}"
+    );
+    assert!(
+        mixed.is_empty(),
+        "Passwd should return 0 results on Linux, got: {mixed:?}"
+    );
 }
 
 #[test]
@@ -112,7 +124,10 @@ fn glob_question_mark_matches_single_char() {
 fn glob_no_match_returns_empty() {
     let conn = open();
     let results = search_by_glob(&conn, "this_file_xyz_does_not_exist_abc123").unwrap();
-    assert!(results.is_empty(), "Expected no results for nonexistent name");
+    assert!(
+        results.is_empty(),
+        "Expected no results for nonexistent name"
+    );
 }
 
 // -------------------------------------------------------------------------
@@ -126,10 +141,7 @@ fn search_under_restricts_to_prefix() {
     let results = search_under(&conn, "/etc", Some("*.conf")).unwrap();
     assert!(!results.is_empty(), "Expected .conf files under /etc");
     for path in &results {
-        assert!(
-            path.starts_with("/etc/"),
-            "Result outside /etc: {path}"
-        );
+        assert!(path.starts_with("/etc/"), "Result outside /etc: {path}");
     }
 }
 
@@ -138,7 +150,10 @@ fn search_under_restricts_to_prefix() {
 fn search_under_nonexistent_dir_returns_empty() {
     let conn = open();
     let results = search_under(&conn, "/nonexistent_dir_xyz", None).unwrap();
-    assert!(results.is_empty(), "Expected no results under nonexistent dir");
+    assert!(
+        results.is_empty(),
+        "Expected no results under nonexistent dir"
+    );
 }
 
 #[test]
@@ -148,7 +163,10 @@ fn search_under_case_sensitive() {
     let lower = search_under(&conn, "/etc", Some("passwd")).unwrap();
     let upper = search_under(&conn, "/etc", Some("PASSWD")).unwrap();
     assert!(!lower.is_empty(), "/etc/passwd should exist");
-    assert!(upper.is_empty(), "PASSWD under /etc should not exist on Linux");
+    assert!(
+        upper.is_empty(),
+        "PASSWD under /etc should not exist on Linux"
+    );
 }
 
 // -------------------------------------------------------------------------
@@ -191,7 +209,9 @@ fn entry_count_is_nonzero() {
 fn all_entries_have_nonempty_name() {
     let conn = open();
     let bad: i64 = conn
-        .query_row("SELECT COUNT(*) FROM entries WHERE name = ''", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM entries WHERE name = ''", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(bad, 0, "{bad} entries have an empty name");
 }
@@ -207,7 +227,10 @@ fn every_entry_has_a_parent_directory_row() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(orphans, 0, "{orphans} entries point at a missing directory row");
+    assert_eq!(
+        orphans, 0,
+        "{orphans} entries point at a missing directory row"
+    );
 }
 
 #[test]
@@ -221,5 +244,8 @@ fn directory_paths_are_normalized() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(bad, 0, "{bad} directory paths have a trailing or missing leading '/'");
+    assert_eq!(
+        bad, 0,
+        "{bad} directory paths have a trailing or missing leading '/'"
+    );
 }
