@@ -11,16 +11,16 @@ use std::{
 };
 use tracing::{error, info, warn};
 
-/// Filesystem roots to skip entirely.
-/// These are pseudo-filesystems, remote mounts, or Windows interop layers
-/// that either have no useful file data or cause enumeration problems.
+/// Paths to skip entirely — not indexed, not recursed into.
+/// These are pseudo-filesystems, volatile kernel interfaces, and
+/// Windows/WSL interop mounts that have no useful Linux file data.
 const DEFAULT_EXCLUDES: &[&str] = &[
     "/proc",
     "/sys",
     "/dev",
     "/run",
-    "/mnt",        // WSL Windows mounts, network mounts
-    "/media",      // removable media
+    "/mnt",
+    "/media",
 ];
 
 fn is_excluded(path: &PathBuf) -> bool {
@@ -85,11 +85,10 @@ fn main() {
     let batch_for_entries = Arc::clone(&batch);
     let batch_for_flush = Arc::clone(&batch);
 
-    // Scan from root, excluding pseudo-filesystems.
     let roots: Vec<PathBuf> = vec![PathBuf::from("/")];
     info!("Scanning roots: {:?}", roots);
 
-    write_progress(&rfind_core::ScanProgress::new_scanning());
+    write_progress(&ScanProgress::new_scanning());
 
     let config = ScanConfig::new(
         roots,
@@ -98,7 +97,9 @@ fn main() {
             write_progress(&progress);
         },
         move |path, is_dir| {
-            // Skip excluded paths entirely — don't index or recurse.
+            // Skip excluded paths: don't index them and don't recurse.
+            // This catches both top-level excludes AND their subdirectories
+            // since we check every entry before inserting or re-queuing.
             if is_excluded(path) {
                 return;
             }
@@ -117,10 +118,12 @@ fn main() {
                 flush_batch(&conn, &mut buf);
             }
         },
-    );
-
-    let config = config.with_error_handler(|path, err| {
+    )
+    .with_error_handler(|path, err| {
         warn!("Cannot read dir {}: {}", path.display(), err);
+    })
+    .with_skip_dir(|path| {
+        DEFAULT_EXCLUDES.iter().any(|ex| path.starts_with(ex))
     });
 
     let total = run_scan(config);
@@ -135,7 +138,7 @@ fn main() {
         }
     }
 
-    // Checkpoint WAL into main database file so reads are fast.
+    // Checkpoint WAL into main db so reads are fast.
     info!("Checkpointing WAL...");
     {
         let conn = conn_for_checkpoint.lock().unwrap();
@@ -153,8 +156,8 @@ fn main() {
         }
     }
 
-    info!("Total entries discovered by scanner: {total}");
-    info!("Daemon holding (inotify event monitoring coming in next milestone)");
+    info!("Total entries discovered: {total}");
+    info!("Daemon holding — inotify event monitoring coming next");
 
     loop {
         std::thread::sleep(std::time::Duration::from_secs(60));

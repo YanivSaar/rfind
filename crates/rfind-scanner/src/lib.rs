@@ -1,4 +1,9 @@
 //! Parallel filesystem scanner using a shared Mutex<VecDeque> work queue.
+//!
+//! # Exclusion
+//! The `skip_dir` predicate is evaluated before a directory is pushed onto
+//! the work queue. This prevents both indexing and recursion into excluded
+//! paths — the exclusion is complete, not just cosmetic.
 
 use rfind_core::{DaemonPhase, ScanProgress};
 use std::{
@@ -20,10 +25,7 @@ struct WorkQueue {
 
 impl WorkQueue {
     fn new() -> Self {
-        Self {
-            queue: Mutex::new(VecDeque::new()),
-            condvar: Condvar::new(),
-        }
+        Self { queue: Mutex::new(VecDeque::new()), condvar: Condvar::new() }
     }
     fn push(&self, path: PathBuf) {
         self.queue.lock().unwrap().push_back(path);
@@ -54,8 +56,9 @@ pub struct ScanConfig {
     pub progress_interval: Duration,
     pub on_progress: Box<dyn Fn(ScanProgress) + Send + Sync + 'static>,
     pub on_entry: Box<dyn Fn(&PathBuf, bool) + Send + Sync + 'static>,
-    /// Called when a directory cannot be read, with path and error message.
     pub on_error: Box<dyn Fn(&PathBuf, &str) + Send + Sync + 'static>,
+    /// Return true to skip a directory entirely (no index, no recursion).
+    pub skip_dir: Box<dyn Fn(&PathBuf) -> bool + Send + Sync + 'static>,
 }
 
 impl ScanConfig {
@@ -73,15 +76,23 @@ impl ScanConfig {
             on_error: Box::new(|path, err| {
                 eprintln!("SCAN ERROR: {} — {}", path.display(), err);
             }),
+            skip_dir: Box::new(|_| false), // default: skip nothing
         }
     }
 
-    /// Override the error handler.
     pub fn with_error_handler(
         mut self,
         f: impl Fn(&PathBuf, &str) + Send + Sync + 'static,
     ) -> Self {
         self.on_error = Box::new(f);
+        self
+    }
+
+    pub fn with_skip_dir(
+        mut self,
+        f: impl Fn(&PathBuf) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.skip_dir = Box::new(f);
         self
     }
 }
@@ -91,6 +102,7 @@ pub fn run_scan(config: ScanConfig) -> u64 {
     let counters = Arc::new(Counters::default());
     let on_entry = Arc::new(config.on_entry);
     let on_error = Arc::new(config.on_error);
+    let skip_dir = Arc::new(config.skip_dir);
 
     for root in &config.roots {
         counters.in_flight.fetch_add(1, Ordering::SeqCst);
@@ -103,8 +115,9 @@ pub fn run_scan(config: ScanConfig) -> u64 {
         let counters = Arc::clone(&counters);
         let on_entry = Arc::clone(&on_entry);
         let on_error = Arc::clone(&on_error);
+        let skip_dir = Arc::clone(&skip_dir);
         handles.push(thread::spawn(move || {
-            worker_loop(wq, counters, on_entry, on_error);
+            worker_loop(wq, counters, on_entry, on_error, skip_dir);
         }));
     }
 
@@ -163,6 +176,7 @@ fn worker_loop(
     counters: Arc<Counters>,
     on_entry: Arc<Box<dyn Fn(&PathBuf, bool) + Send + Sync + 'static>>,
     on_error: Arc<Box<dyn Fn(&PathBuf, &str) + Send + Sync + 'static>>,
+    skip_dir: Arc<Box<dyn Fn(&PathBuf) -> bool + Send + Sync + 'static>>,
 ) {
     loop {
         let dir = match wq.pop_or_done(&counters.in_flight) {
@@ -175,9 +189,18 @@ fn worker_loop(
                 let mut local_count: u64 = 0;
                 for entry in read_dir.flatten() {
                     let path = entry.path();
-                    let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+                    let is_dir = entry.file_type()
+                        .map(|ft| ft.is_dir())
+                        .unwrap_or(false);
+
+                    if is_dir && skip_dir(&path) {
+                        // Skip: don't index, don't recurse.
+                        continue;
+                    }
+
                     on_entry(&path, is_dir);
                     local_count += 1;
+
                     if is_dir {
                         counters.in_flight.fetch_add(1, Ordering::SeqCst);
                         wq.push(path);
@@ -187,7 +210,6 @@ fn worker_loop(
                 counters.dirs_completed.fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => {
-                // Log path + OS error so we know exactly what failed.
                 on_error(&dir, &e.to_string());
                 counters.errors.fetch_add(1, Ordering::Relaxed);
             }
