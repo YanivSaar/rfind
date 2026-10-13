@@ -1,0 +1,27 @@
+[Unit]
+Description=rfind filesystem indexing daemon
+Documentation=https://github.com/yourname/rfind
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rfindd
+Restart=on-failure
+RestartSec=5s
+
+# Runtime directory for progress.json
+RuntimeDirectory=rfindd
+RuntimeDirectoryMode=0755
+
+# Logging: structured output goes to journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rfindd
+
+# Show progress in systemctl status (last journal line)
+# This is what appears under "Status:" in systemctl status output
+ExecStartPost=/bin/sh -c 'sleep 2 && systemd-notify --ready || true'
+
+[Install]
+WantedBy=multi-user.target

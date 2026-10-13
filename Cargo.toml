@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "crates/rfind-core",
+    "crates/rfind-scanner",
+    "crates/rfindd",
+    "crates/rfind-cli",
+]
+resolver = "2"
