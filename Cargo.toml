@@ -2,6 +2,7 @@
 members = [
     "crates/rfind-core",
     "crates/rfind-scanner",
+    "crates/rfind-monitor",
     "crates/rfindd",
     "crates/rfind-cli",
     "tests/integration",

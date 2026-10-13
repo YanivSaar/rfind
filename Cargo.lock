@@ -436,6 +436,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rfind-monitor"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rfind-core",
+ "rusqlite",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "rfind-scanner"
 version = "0.1.0"
 dependencies = [
@@ -451,6 +462,7 @@ name = "rfindd"
 version = "0.1.0"
 dependencies = [
  "rfind-core",
+ "rfind-monitor",
  "rfind-scanner",
  "rusqlite",
  "serde_json",

@@ -27,7 +27,6 @@ enum Command {
     #[command(name = "--name", alias = "name")]
     Name {
         pattern: String,
-        /// Restrict results to this directory tree.
         #[arg(long)]
         under: Option<String>,
     },
@@ -45,17 +44,20 @@ fn load_progress() -> Option<ScanProgress> {
 
 fn print_progress(p: &ScanProgress) {
     let phase = match &p.phase {
-        DaemonPhase::Scanning => "SCANNING",
-        DaemonPhase::Ready    => "READY   ",
-        DaemonPhase::Error(_) => "ERROR   ",
+        DaemonPhase::Scanning     => "SCANNING",
+        DaemonPhase::Reconciling  => "RECONCILING",
+        DaemonPhase::Ready        => "READY",
+        DaemonPhase::Error(_)     => "ERROR",
     };
-    println!("Phase       : {phase}");
-    println!("Entries     : {}", p.entries_found);
-    println!("Dirs done   : {}", p.dirs_completed);
-    println!("Pending     : {}", p.dirs_pending);
-    println!("Rate        : {:.0} entries/s", p.entries_per_sec);
-    println!("Errors      : {}", p.errors);
-    println!("Status      : {}", p.status_line);
+    println!("Phase          : {phase}");
+    println!("Entries        : {}", p.entries_found);
+    println!("Dirs done      : {}", p.dirs_completed);
+    println!("Dirs pending   : {}", p.dirs_pending);
+    println!("Rate           : {:.0} entries/s", p.entries_per_sec);
+    println!("Errors         : {}", p.errors);
+    println!("Events pending : {}", p.events_pending);
+    println!("Events applied : {}", p.events_applied);
+    println!("Status         : {}", p.status_line);
 }
 
 fn open_db() -> Option<rusqlite::Connection> {
@@ -63,16 +65,13 @@ fn open_db() -> Option<rusqlite::Connection> {
         Ok(c) => Some(c),
         Err(e) => {
             eprintln!("Cannot open index database: {e}");
-            eprintln!("Is rfindd running and has the initial scan completed?");
             None
         }
     }
 }
 
 fn print_result(path: &str) -> bool {
-    let stdout = io::stdout();
-    let mut handle = stdout.lock();
-    writeln!(handle, "{path}").is_ok()
+    writeln!(io::stdout().lock(), "{path}").is_ok()
 }
 
 fn print_results(paths: Vec<String>) {
@@ -86,16 +85,12 @@ fn print_results(paths: Vec<String>) {
 
 fn main() {
     let cli = Cli::parse();
-
     match cli.command {
         Command::Status { watch } => {
             if !watch {
                 match load_progress() {
                     Some(p) => print_progress(&p),
-                    None => eprintln!(
-                        "No progress data at {:?}\nIs rfindd running?",
-                        progress_file_path()
-                    ),
+                    None => eprintln!("No progress data. Is rfindd running?"),
                 }
             } else {
                 loop {
@@ -104,7 +99,7 @@ fn main() {
                         Some(ref p) => {
                             print_progress(p);
                             if p.phase == DaemonPhase::Ready {
-                                println!("\nScan complete.");
+                                println!("\nReady.");
                                 break;
                             }
                         }
@@ -114,7 +109,6 @@ fn main() {
                 }
             }
         }
-
         Command::Name { pattern, under } => {
             let conn = match open_db() { Some(c) => c, None => return };
             let results = if let Some(ref prefix) = under {
@@ -127,7 +121,6 @@ fn main() {
                 Err(e) => eprintln!("Search error: {e}"),
             }
         }
-
         Command::Path { pattern } => {
             let conn = match open_db() { Some(c) => c, None => return };
             match db::search_by_path_glob(&conn, &pattern) {

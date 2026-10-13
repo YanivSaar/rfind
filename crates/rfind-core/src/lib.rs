@@ -5,8 +5,13 @@ use std::time::SystemTime;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DaemonPhase {
+    /// Initial parallel filesystem scan in progress.
     Scanning,
+    /// Scan complete; applying queued events to bring index current.
+    Reconciling,
+    /// Index is current and being kept up to date by fanotify.
     Ready,
+    /// A problem occurred.
     Error(String),
 }
 
@@ -20,6 +25,10 @@ pub struct ScanProgress {
     pub errors: u64,
     pub timestamp_secs: u64,
     pub status_line: String,
+    /// Events queued during scan, waiting to be reconciled.
+    pub events_pending: u64,
+    /// Events applied during reconciliation.
+    pub events_applied: u64,
 }
 
 impl ScanProgress {
@@ -37,6 +46,8 @@ impl ScanProgress {
             errors: 0,
             timestamp_secs: now,
             status_line: "Initializing scanner...".to_string(),
+            events_pending: 0,
+            events_applied: 0,
         }
     }
 }

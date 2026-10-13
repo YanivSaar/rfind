@@ -161,6 +161,8 @@ pub fn run_scan(config: ScanConfig) -> u64 {
                 .unwrap_or_default()
                 .as_secs(),
             status_line: status,
+            events_pending: 0,
+            events_applied: 0,
         };
 
         (config.on_progress)(progress);
