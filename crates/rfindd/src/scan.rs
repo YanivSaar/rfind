@@ -1,6 +1,6 @@
 //! Scanning roots into the index, and the daemon context they share.
 
-use crate::{index, progress};
+use crate::{index, lock, progress};
 use rfind_config::Config;
 use rfind_core::{db, DaemonPhase};
 use rfind_monitor::DirWatcher;
@@ -54,7 +54,7 @@ fn nested_roots(cfg: &Config, root: &Path) -> Vec<PathBuf> {
 }
 
 fn next_scan_gen(conn: &Mutex<Connection>) -> i64 {
-    let c = conn.lock().unwrap();
+    let c = lock(conn);
     let g = db::get_metadata(&c, "scan_gen")
         .ok()
         .flatten()
@@ -134,7 +134,7 @@ pub fn scan_root(ctx: &Ctx, root: &Path, report: bool) -> ScanResult {
                     }
                     std::mem::replace(&mut *buf, Vec::with_capacity(batch_size))
                 };
-                index::flush_batch(&conn.lock().unwrap(), &mut full, scan_gen);
+                index::flush_batch(&lock(&conn), &mut full, scan_gen);
             }
         },
     )
@@ -147,7 +147,7 @@ pub fn scan_root(ctx: &Ctx, root: &Path, report: bool) -> ScanResult {
     let result = run_scan(scan_cfg);
 
     let mut rest = std::mem::take(&mut *batch.lock().unwrap());
-    let c = ctx.conn.lock().unwrap();
+    let c = lock(&ctx.conn);
     if !rest.is_empty() {
         index::flush_batch(&c, &mut rest, scan_gen);
     }
@@ -178,11 +178,20 @@ pub fn scan_root(ctx: &Ctx, root: &Path, report: bool) -> ScanResult {
             warn!("compacting the index: {e}");
         }
     }
+    // Persist the error count so `rfind status` / future reporting can
+    // show "last scan skipped N directories" instead of forcing the
+    // operator to grep journalctl. One line per scan, keyed per root.
+    let _ = db::set_metadata(
+        &c,
+        &format!("last_scan_errors:{}", root.display()),
+        &result.errors.to_string(),
+    );
     info!(
-        "Scanned {}: {} entries, {} dirs in {:.1}s{}",
+        "Scanned {}: {} entries, {} dirs, {} errors in {:.1}s{}",
         root.display(),
         result.entries,
         result.dirs,
+        result.errors,
         result.elapsed.as_secs_f64(),
         if result.io_uring { " (io_uring)" } else { "" }
     );
@@ -207,7 +216,7 @@ pub fn live_reindex(ctx: &Ctx) -> bool {
 /// frequent restarts would postpone the periodic full rescan forever.
 pub fn reconcile_and_mark_ready(ctx: &Ctx, scanned: bool) {
     let (total, ep) = {
-        let c = ctx.conn.lock().unwrap();
+        let c = lock(&ctx.conn);
         (
             db::entry_count(&c).unwrap_or(0) as u64,
             db::pending_event_count(&c).unwrap_or(0) as u64,
@@ -219,7 +228,7 @@ pub fn reconcile_and_mark_ready(ctx: &Ctx, scanned: bool) {
 
     let applied = index::reconcile(&ctx.conn, &ctx.cfg);
 
-    let c = ctx.conn.lock().unwrap();
+    let c = lock(&ctx.conn);
     if let Err(e) = db::compact(&c) {
         warn!("compacting the index: {e}");
     }
@@ -236,7 +245,7 @@ pub fn reconcile_and_mark_ready(ctx: &Ctx, scanned: bool) {
 
 /// Periodic roots whose interval has elapsed (or never scanned).
 pub fn due_periodic_roots(ctx: &Ctx) -> Vec<PathBuf> {
-    let c = ctx.conn.lock().unwrap();
+    let c = lock(&ctx.conn);
     let now = now_secs();
     ctx.cfg
         .scan

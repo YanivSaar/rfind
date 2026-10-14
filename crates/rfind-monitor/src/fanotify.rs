@@ -112,6 +112,16 @@ struct Scope {
     excludes: Vec<PathBuf>,
 }
 
+/// Flips `alive` to false in Drop so the thread's exit path (clean,
+/// `break`-on-error, or panic unwind) all end up marking the monitor
+/// dead. The daemon polls `is_dead` each tick.
+struct AliveGuard<'a>(&'a Arc<AtomicBool>);
+impl Drop for AliveGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
 impl Scope {
     fn contains(&self, p: &Path) -> bool {
         self.roots.iter().any(|r| p.starts_with(r))
@@ -123,6 +133,11 @@ pub struct FanotifyMonitor {
     state: Arc<FanState>,
     stop: Arc<AtomicBool>,
     overflow: Arc<AtomicBool>,
+    /// Kept so `take_overflow` can also report in-process sink drops
+    /// (writer thread fell behind, `sync_channel` full). Without this,
+    /// a sink-full event would be dropped silently and no rescan fires.
+    sink: EventSink,
+    alive: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
     writer: Option<thread::JoinHandle<()>>,
 }
@@ -175,16 +190,37 @@ impl FanotifyMonitor {
         let (sink, writer) = sink;
         let stop = Arc::new(AtomicBool::new(false));
         let overflow = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(true));
+        let sink_for_take = sink.clone();
         let handle = {
-            let (s, o, st) = (Arc::clone(&stop), Arc::clone(&overflow), Arc::clone(&state));
+            let (s, o, st, a) = (
+                Arc::clone(&stop),
+                Arc::clone(&overflow),
+                Arc::clone(&state),
+                Arc::clone(&alive),
+            );
             let scope = Arc::new(Scope { roots, excludes });
-            thread::spawn(move || event_loop(&st, scope, &sink, &s, &o))
+            thread::spawn(move || {
+                // The event loop can `break` on an unexpected read() error
+                // (lazy unmount, EIO) or panic. Either way the daemon must
+                // notice — `alive` goes false here and the daemon forces a
+                // full re-index + restart on the next tick.
+                let _guard = AliveGuard(&a);
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    event_loop(&st, scope, &sink, &s, &o)
+                }));
+                if r.is_err() {
+                    error!("fanotify event loop panicked; marking monitor dead");
+                }
+            })
         };
 
         Ok(Self {
             state,
             stop,
             overflow,
+            sink: sink_for_take,
+            alive,
             handle: Some(handle),
             writer: Some(writer),
         })
@@ -196,9 +232,20 @@ impl FanotifyMonitor {
         self.state.add(point)
     }
 
-    /// True (once) if the kernel queue overflowed since the last call.
+    /// True (once) if events were lost since the last call: kernel queue
+    /// (`FAN_Q_OVERFLOW`) or the in-process sink (writer thread fell
+    /// behind). Either way the daemon must trigger a full re-index.
     pub fn take_overflow(&self) -> bool {
-        self.overflow.swap(false, Ordering::Relaxed)
+        let kernel = self.overflow.swap(false, Ordering::Relaxed);
+        let sink = self.sink.take_overflow();
+        kernel || sink
+    }
+
+    /// True once the event-reading thread has exited (unexpected read()
+    /// error, panic, or stop requested). The daemon treats this as an
+    /// overflow and schedules a restart.
+    pub fn is_dead(&self) -> bool {
+        !self.alive.load(Ordering::Relaxed)
     }
 
     pub fn stop(mut self) {
@@ -381,6 +428,12 @@ fn event_loop(
     const BUF: usize = 65536;
     let mut buf = vec![0u8; BUF];
     let meta_len = mem::size_of::<fanotify_event_metadata>();
+    // Trade-off: a non-UTF-8 filename is rendered with U+FFFD. The index
+    // and the SQLite journal are TEXT columns, so a lossy render is what
+    // the DB can store; a subsequent rename of the real filename won't
+    // match the lossy one and will show up as delete+create. Acceptable
+    // for the real-world cost (near-zero on modern systems). To fix
+    // properly, the schema would need to carry raw bytes.
     let lossy = |p: &Path| p.to_string_lossy().to_string();
 
     // Background walker: moved_in otherwise blocks the event drain while

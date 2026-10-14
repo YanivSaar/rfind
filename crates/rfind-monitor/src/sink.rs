@@ -82,6 +82,14 @@ pub fn spawn_writer(db: Arc<Mutex<Connection>>) -> (EventSink, thread::JoinHandl
     )
 }
 
+/// Lock the shared connection, ignoring poisoning. The scanner's panic
+/// recovery can leave the mutex poisoned even though the DB itself is
+/// fine; crashing the writer thread on top of that would silently stop
+/// draining events.
+fn lock_db(db: &Mutex<Connection>) -> std::sync::MutexGuard<'_, Connection> {
+    db.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 fn writer_loop(db: Arc<Mutex<Connection>>, rx: Receiver<RawEvent>) {
     let mut batch = Vec::with_capacity(MAX_BATCH);
     while let Ok(first) = rx.recv() {
@@ -92,7 +100,7 @@ fn writer_loop(db: Arc<Mutex<Connection>>, rx: Receiver<RawEvent>) {
                 Err(_) => break,
             }
         }
-        let c = db.lock().unwrap();
+        let c = lock_db(&db);
         let tx = match c.unchecked_transaction() {
             Ok(t) => t,
             Err(e) => {

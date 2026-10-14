@@ -313,6 +313,9 @@ pub fn check_text(path: &Path, text: &str) -> Result<Vec<Problem>, EditError> {
 }
 
 /// Write via a temporary file in the same directory, then rename over.
+/// The parent directory is fsynced after the rename so the rename itself
+/// is durable: without it, a hard crash can leave the pre-edit file in
+/// place even though `rfind config set …` returned success.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), EditError> {
     use std::os::unix::fs::PermissionsExt;
     let err = |e| EditError::Write(path.to_path_buf(), e);
@@ -328,7 +331,13 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), EditError> {
     // lists excluded paths and roots which routinely include sensitive
     // directories, so world-readable (0o644) was wrong.
     fs::set_permissions(&tmp, fs::Permissions::from_mode(0o640)).map_err(err)?;
-    fs::rename(&tmp, path).map_err(err)
+    fs::rename(&tmp, path).map_err(err)?;
+    // Fsync the directory so the rename survives a crash. Opening the
+    // dir read-only and calling sync_all does fsync on Linux.
+    if let Ok(d) = fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
 }
 
 /// One path per line once a list grows past a couple of entries.

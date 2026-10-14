@@ -200,8 +200,31 @@ fn statx_batch(
             .mask(STATX_MASK)
             .build()
             .user_data((base + i) as u64);
-            // The ring has URING_ENTRIES slots and the chunk is no larger.
-            unsafe { r.submission().push(&sqe).expect("submission queue full") };
+            // The ring has URING_ENTRIES slots and the chunk is no larger,
+            // so this push should always succeed. If something ever changes
+            // that invariant, fall back to the per-call statx path instead
+            // of crashing the scanner.
+            if unsafe { r.submission().push(&sqe) }.is_err() {
+                warn!("io_uring submission queue full ({submitted}/{}); falling back to statx syscall", chunk.len());
+                URING_UNAVAILABLE.store(true, Ordering::Relaxed);
+                // Drain anything we did push so we don't leak the buffers.
+                if submitted > 0 {
+                    let _ = r.submit_and_wait(submitted);
+                    for cqe in r.completion() {
+                        let i = cqe.user_data() as usize;
+                        if cqe.result() >= 0 {
+                            out[i] = Some(Stat::from_statx(&bufs[i]));
+                        }
+                    }
+                }
+                // Fill the rest (and any later chunks) with plain statx.
+                for (i, name) in names.iter().enumerate() {
+                    if out[i].is_none() {
+                        out[i] = statx_one(dirfd, name);
+                    }
+                }
+                return out;
+            }
             submitted += 1;
         }
         let mut done = 0usize;

@@ -52,6 +52,11 @@ impl Monitor {
         prefer_fanotify: bool,
         inotify_fallback: bool,
     ) -> Result<(Self, String), MonitorError> {
+        // Each backend owns its own sink + writer. If fanotify fails and
+        // we fall back to inotify, the first writer has already exited
+        // (the sink's EventSink was dropped on the `Err` path, which
+        // ends the writer's `rx.recv()` loop), so this is not a double
+        // spawn in practice — the fallback starts fresh.
         if prefer_fanotify {
             let sink = sink::spawn_writer(Arc::clone(&db));
             match FanotifyMonitor::start(mark_points, roots.to_vec(), sink, excludes.clone()) {
@@ -103,12 +108,23 @@ impl Monitor {
         }
     }
 
-    /// True (once) if events were lost to a kernel queue overflow since
-    /// the last call; the index must be rescanned to recover.
+    /// True (once) if events were lost since the last call: kernel
+    /// queue overflow OR the in-process sink filling up (writer thread
+    /// fell behind). The index must be rescanned to recover.
     pub fn take_overflow(&self) -> bool {
         match self {
             Monitor::Fanotify(m) => m.take_overflow(),
             Monitor::Inotify(m) => m.take_overflow(),
+        }
+    }
+
+    /// True once the backend's event-reading thread has exited (e.g.
+    /// unexpected read() error on EIO/lazy unmount, or a panic). The
+    /// daemon treats this as needing a full re-index + restart.
+    pub fn is_dead(&self) -> bool {
+        match self {
+            Monitor::Fanotify(m) => m.is_dead(),
+            Monitor::Inotify(m) => m.is_dead(),
         }
     }
 

@@ -515,32 +515,61 @@ pub fn delete_entry_by_path(conn: &Connection, path: &str) -> Result<usize> {
     Ok(n)
 }
 
-/// Delete `path` itself and everything beneath it.
+/// Run `f` inside a SQLite SAVEPOINT so a mid-op failure rolls back the
+/// partial writes. Savepoints nest cleanly inside an outer transaction
+/// (reconcile wraps a tx around a batch) AND work on an auto-commit
+/// connection (startup config apply), so callers don't need to care.
+fn with_savepoint<F, T>(conn: &Connection, name: &str, f: F) -> Result<T>
+where
+    F: FnOnce(&Connection) -> Result<T>,
+{
+    conn.execute_batch(&format!("SAVEPOINT {name}"))?;
+    match f(conn) {
+        Ok(v) => {
+            conn.execute_batch(&format!("RELEASE {name}"))?;
+            Ok(v)
+        }
+        Err(e) => {
+            // Best-effort rollback: a release failure here would mask
+            // the real error, which is already being returned.
+            let _ = conn.execute_batch(&format!("ROLLBACK TO {name}; RELEASE {name}"));
+            Err(e)
+        }
+    }
+}
+
+/// Delete `path` itself and everything beneath it. The two subtree
+/// deletes (entries then dirs) run inside a SAVEPOINT so a failure
+/// midway cannot leave orphan `dirs` whose entries are gone.
 pub fn delete_entries_under(conn: &Connection, path: &str) -> Result<usize> {
     let Some((did, nid)) = locate(conn, path)? else {
         return Ok(0);
     };
-    let mut n = conn.execute(
-        "DELETE FROM entries WHERE dir_id = ?1 AND name_id = ?2",
-        params![did, nid],
-    )?;
-    if let Some(sub) = child_dir(conn, did, nid)? {
-        n += conn.execute(
-            &format!("{SUBTREE} DELETE FROM entries WHERE dir_id IN sub"),
-            params![sub],
+    let n = with_savepoint(conn, "del_sub", |c| {
+        let mut n = c.execute(
+            "DELETE FROM entries WHERE dir_id = ?1 AND name_id = ?2",
+            params![did, nid],
         )?;
-        conn.execute(
-            &format!("{SUBTREE} DELETE FROM dirs WHERE id IN sub"),
-            params![sub],
-        )?;
-    }
+        if let Some(sub) = child_dir(c, did, nid)? {
+            n += c.execute(
+                &format!("{SUBTREE} DELETE FROM entries WHERE dir_id IN sub"),
+                params![sub],
+            )?;
+            c.execute(
+                &format!("{SUBTREE} DELETE FROM dirs WHERE id IN sub"),
+                params![sub],
+            )?;
+        }
+        Ok(n)
+    })?;
     maybe_gc(conn, n)?;
     Ok(n)
 }
 
 /// Move `old` (and its subtree) to `new`. Anything already indexed at
 /// `new` is replaced, matching rename(2) semantics. Returns the number of
-/// entries moved (0 if `old` was not indexed).
+/// entries moved (0 if `old` was not indexed). The nested delete + updates
+/// run inside a SAVEPOINT so a mid-op failure cannot split the move.
 pub fn rename_entry(conn: &Connection, old: &str, new: &str) -> Result<usize> {
     let (old, new) = (old.trim_end_matches('/'), new.trim_end_matches('/'));
     if old == new {
@@ -555,28 +584,31 @@ pub fn rename_entry(conn: &Connection, old: &str, new: &str) -> Result<usize> {
     if !exists {
         return Ok(0);
     }
-    delete_entries_under(conn, new)?;
-    let (new_dir, new_name) = split_path(new);
-    let mut ins = Inserter::new(conn);
-    let new_did = ins.dir(new_dir)?;
-    let new_nid = ins.name(new_name)?;
-    conn.execute(
-        "UPDATE entries SET dir_id = ?1, name_id = ?2 WHERE dir_id = ?3 AND name_id = ?4",
-        params![new_did, new_nid, old_did, old_nid],
-    )?;
-    let mut moved = 1;
-    // A directory: re-parent its row; everything beneath follows by id.
-    if let Some(d) = child_dir(conn, old_did, old_nid)? {
-        conn.execute(
-            "UPDATE dirs SET parent = ?1, name_id = ?2 WHERE id = ?3",
-            params![new_did, new_nid, d],
+    let moved = with_savepoint(conn, "ren_sub", |c| {
+        delete_entries_under(c, new)?;
+        let (new_dir, new_name) = split_path(new);
+        let mut ins = Inserter::new(c);
+        let new_did = ins.dir(new_dir)?;
+        let new_nid = ins.name(new_name)?;
+        c.execute(
+            "UPDATE entries SET dir_id = ?1, name_id = ?2 WHERE dir_id = ?3 AND name_id = ?4",
+            params![new_did, new_nid, old_did, old_nid],
         )?;
-        moved += conn.query_row(
-            &format!("{SUBTREE} SELECT COUNT(*) FROM entries WHERE dir_id IN sub"),
-            params![d],
-            |r| r.get::<_, i64>(0),
-        )? as usize;
-    }
+        let mut moved = 1;
+        // A directory: re-parent its row; everything beneath follows by id.
+        if let Some(d) = child_dir(c, old_did, old_nid)? {
+            c.execute(
+                "UPDATE dirs SET parent = ?1, name_id = ?2 WHERE id = ?3",
+                params![new_did, new_nid, d],
+            )?;
+            moved += c.query_row(
+                &format!("{SUBTREE} SELECT COUNT(*) FROM entries WHERE dir_id IN sub"),
+                params![d],
+                |r| r.get::<_, i64>(0),
+            )? as usize;
+        }
+        Ok(moved)
+    })?;
     // A rename can orphan the old (dir, name) pair; count it toward GC.
     maybe_gc(conn, 1)?;
     Ok(moved)
@@ -652,19 +684,25 @@ pub fn sweep_stale(conn: &Connection, root: &str, keep: &[String], scan_gen: i64
             keep_entries.join(",")
         )
     };
-    let n = conn.execute(
-        &format!(
-            "WITH RECURSIVE sub(id) AS (SELECT ?1 UNION ALL SELECT d.id FROM dirs d
-                 JOIN sub ON d.parent = sub.id WHERE d.id NOT IN ({}))
-             DELETE FROM entries WHERE dir_id IN sub AND scan_gen < ?2{keep_entries}",
-            id_list(&keep_dirs)
-        ),
-        params![rid, scan_gen],
-    )?;
-    if n > 0 {
-        collect_garbage(conn)?;
-    }
-    Ok(n)
+    // SAVEPOINT so the delete + follow-up GC are atomic: without it a
+    // GC failure after a successful delete would leave orphan rows that
+    // the next GC still has to clean up, and a reader could race the
+    // intermediate state.
+    with_savepoint(conn, "sweep_stale", |c| {
+        let n = c.execute(
+            &format!(
+                "WITH RECURSIVE sub(id) AS (SELECT ?1 UNION ALL SELECT d.id FROM dirs d
+                     JOIN sub ON d.parent = sub.id WHERE d.id NOT IN ({}))
+                 DELETE FROM entries WHERE dir_id IN sub AND scan_gen < ?2{keep_entries}",
+                id_list(&keep_dirs)
+            ),
+            params![rid, scan_gen],
+        )?;
+        if n > 0 {
+            collect_garbage(c)?;
+        }
+        Ok(n)
+    })
 }
 
 /// Delete entries that are not under any of `roots` (after roots were
@@ -685,19 +723,21 @@ pub fn delete_outside_roots(conn: &Connection, roots: &[String]) -> Result<usize
     if ids.is_empty() {
         return Ok(0);
     }
-    let n = conn.execute(
-        &format!(
-            "WITH RECURSIVE sub(id) AS (SELECT id FROM dirs WHERE id IN ({})
-                 UNION ALL SELECT d.id FROM dirs d JOIN sub ON d.parent = sub.id)
-             DELETE FROM entries WHERE dir_id NOT IN sub",
-            id_list(&ids)
-        ),
-        [],
-    )?;
-    if n > 0 {
-        collect_garbage(conn)?;
-    }
-    Ok(n)
+    with_savepoint(conn, "del_outside", |c| {
+        let n = c.execute(
+            &format!(
+                "WITH RECURSIVE sub(id) AS (SELECT id FROM dirs WHERE id IN ({})
+                     UNION ALL SELECT d.id FROM dirs d JOIN sub ON d.parent = sub.id)
+                 DELETE FROM entries WHERE dir_id NOT IN sub",
+                id_list(&ids)
+            ),
+            [],
+        )?;
+        if n > 0 {
+            collect_garbage(c)?;
+        }
+        Ok(n)
+    })
 }
 
 pub fn entry_exists(conn: &Connection, path: &str) -> Result<bool> {
@@ -1962,6 +2002,35 @@ mod tests {
         }
         delete_entries_under(&c, "/a/b").unwrap();
         assert_eq!(paths(&c), vec!["/a/b.txt", "/a/bc"]);
+    }
+
+    #[test]
+    fn delete_under_runs_inside_outer_transaction() {
+        // The caller (reconcile) wraps a batch in a tx; delete_entries_under
+        // uses a SAVEPOINT internally so it nests cleanly inside that tx.
+        // Regression check: before the SAVEPOINT fix this still ran, but
+        // the two multi-statement deletes were not atomic across a mid-op
+        // failure. This test just confirms it still works inside a tx.
+        let c = mem();
+        for p in ["/a/b", "/a/b/c", "/a/b/c/d"] {
+            add(&c, p, false, None);
+        }
+        let tx = c.unchecked_transaction().unwrap();
+        delete_entries_under(&tx, "/a/b").unwrap();
+        tx.commit().unwrap();
+        assert_eq!(paths(&c), Vec::<String>::new());
+    }
+
+    #[test]
+    fn rename_runs_inside_outer_transaction() {
+        let c = mem();
+        for p in ["/a/d", "/a/d/f", "/b/d"] {
+            add(&c, p, false, None);
+        }
+        let tx = c.unchecked_transaction().unwrap();
+        assert_eq!(rename_entry(&tx, "/a/d", "/b/d").unwrap(), 2);
+        tx.commit().unwrap();
+        assert_eq!(paths(&c), vec!["/b/d", "/b/d/f"]);
     }
 
     #[test]

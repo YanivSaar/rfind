@@ -170,8 +170,22 @@ pub struct InotifyMonitor {
     watches: Arc<Watches>,
     stop: Arc<AtomicBool>,
     overflow: Arc<AtomicBool>,
+    /// Kept so `take_overflow` can also report in-process sink drops
+    /// (writer thread fell behind). Mirrors the fanotify backend.
+    sink: EventSink,
+    alive: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
     writer: Option<thread::JoinHandle<()>>,
+}
+
+/// Flips `alive` to false on Drop so the thread's exit path (clean,
+/// read()-error break, or panic unwind) all end up marking the monitor
+/// dead. The daemon polls `is_dead` each tick and restarts.
+struct AliveGuard<'a>(&'a Arc<AtomicBool>);
+impl Drop for AliveGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
 }
 
 impl InotifyMonitor {
@@ -198,19 +212,32 @@ impl InotifyMonitor {
         let (sink, writer) = sink;
         let stop = Arc::new(AtomicBool::new(false));
         let overflow = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(true));
+        let sink_for_take = sink.clone();
         let handle = {
-            let (w, s, o) = (
+            let (w, s, o, a) = (
                 Arc::clone(&watches),
                 Arc::clone(&stop),
                 Arc::clone(&overflow),
+                Arc::clone(&alive),
             );
-            thread::spawn(move || event_loop(w, sink, s, o))
+            thread::spawn(move || {
+                let _guard = AliveGuard(&a);
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    event_loop(w, sink, s, o)
+                }));
+                if r.is_err() {
+                    error!("inotify event loop panicked; marking monitor dead");
+                }
+            })
         };
 
         Ok(Self {
             watches,
             stop,
             overflow,
+            sink: sink_for_take,
+            alive,
             handle: Some(handle),
             writer: Some(writer),
         })
@@ -224,9 +251,19 @@ impl InotifyMonitor {
         self.watches.add(path);
     }
 
-    /// True (once) if the kernel queue overflowed since the last call.
+    /// True (once) if events were lost since the last call: kernel
+    /// queue (`IN_Q_OVERFLOW`) or the in-process sink (writer fell
+    /// behind). The daemon treats either as "trigger a full re-index".
     pub fn take_overflow(&self) -> bool {
-        self.overflow.swap(false, Ordering::Relaxed)
+        let kernel = self.overflow.swap(false, Ordering::Relaxed);
+        let sink = self.sink.take_overflow();
+        kernel || sink
+    }
+
+    /// True once the event-reading thread has exited (unexpected read()
+    /// error, panic, or stop requested).
+    pub fn is_dead(&self) -> bool {
+        !self.alive.load(Ordering::Relaxed)
     }
 
     pub fn stop(mut self) {
@@ -279,13 +316,17 @@ fn event_loop(
         if stop.load(Ordering::Relaxed) {
             break;
         }
+        // Run expiration every iteration, not only on WouldBlock: a busy
+        // filesystem keeps `read()` returning data and the WouldBlock
+        // branch never fires, so pending MOVED_FROM cookies would never
+        // be flushed to deletes while the churn continues.
+        expire_moves(&watches, &sink, &mut moves);
 
         let len = unsafe { read(watches.fd, buf.as_mut_ptr() as *mut _, BUF) };
 
         if len < 0 {
             let e = std::io::Error::last_os_error();
             if e.kind() == std::io::ErrorKind::WouldBlock {
-                expire_moves(&watches, &sink, &mut moves);
                 thread::sleep(Duration::from_millis(50));
                 continue;
             }

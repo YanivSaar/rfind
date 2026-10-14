@@ -249,6 +249,21 @@ impl Config {
                 ));
             }
         }
+        // With both live backends off and no periodic rescan, the index
+        // freezes forever: nothing ever updates it. This is a legitimate
+        // index-only+read-only setup, so it's a warning, not an error.
+        if !self.monitor.prefer_fanotify
+            && !self.monitor.inotify_fallback
+            && self.scan.reindex_interval_hours == 0
+            && !self.scan.roots.is_empty()
+        {
+            warn(
+                "live monitoring is disabled and scan.reindex_interval_hours = 0 — \
+                 the index will never update after startup. Set \
+                 reindex_interval_hours > 0 or enable a monitor backend."
+                    .into(),
+            );
+        }
         out
     }
 }

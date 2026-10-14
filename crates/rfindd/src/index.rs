@@ -1,5 +1,6 @@
 //! Writing to the index: scanner batches and journaled events.
 
+use crate::lock;
 use rfind_config::Config;
 use rfind_core::db::{self, EventType};
 use rfind_scanner::EntryInfo;
@@ -97,7 +98,7 @@ pub fn reconcile(conn: &Arc<Mutex<Connection>>, cfg: &Config) -> u64 {
     const RECONCILE_BATCH: usize = 1000;
     let mut applied = 0u64;
     loop {
-        let c = conn.lock().unwrap();
+        let c = lock(conn);
         let events = db::load_unapplied_events(&c, RECONCILE_BATCH).unwrap_or_default();
         if events.is_empty() {
             break;
@@ -120,7 +121,7 @@ pub fn reconcile(conn: &Arc<Mutex<Connection>>, cfg: &Config) -> u64 {
         applied += events.len() as u64;
     }
     if applied > 0 {
-        let c = conn.lock().unwrap();
+        let c = lock(conn);
         let _ = db::prune_applied_events(&c);
         info!("Applied {applied} live events");
     }

@@ -69,6 +69,15 @@ use std::{
 };
 use tracing::{error, info, warn};
 
+/// Lock a `Mutex`, ignoring poisoning. The daemon has one writer and
+/// panic recovery in the scanner can leave the shared connection
+/// mutex poisoned even though the DB is still fine; using `.unwrap()`
+/// would then crash every subsequent main-loop tick, so we treat
+/// poison as "proceed with the inner value" instead.
+fn lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// Config path: `RFIND_CONFIG` overrides the default (rfind honors it too).
 fn config_path() -> PathBuf {
     std::env::var_os("RFIND_CONFIG")
@@ -273,7 +282,7 @@ fn on_mount_change(
 /// the user that a periodic/mount scan is in flight.
 fn publish_bg_scan(conn: &Mutex<rusqlite::Connection>, mode: &str, bg: Option<BackgroundScan>) {
     let (entries, pending) = {
-        let c = conn.lock().unwrap();
+        let c = lock(conn);
         (
             db::entry_count(&c).unwrap_or(0) as u64,
             db::pending_event_count(&c).unwrap_or(0) as u64,
@@ -345,10 +354,24 @@ fn main() {
     warn_drvfs_under_live_roots(&cfg, &mount_table);
 
     let db_file = cfg.index.db_path.clone();
-    fs::create_dir_all(db_file.parent().unwrap()).expect("Failed to create db directory");
-    let conn = Arc::new(Mutex::new(
-        db::open_with(&db_file, cfg.index.compress).expect("Failed to open database"),
-    ));
+    let Some(db_parent) = db_file.parent() else {
+        error!(
+            "index.db_path = {} has no parent directory; set it to an absolute path",
+            db_file.display()
+        );
+        std::process::exit(1);
+    };
+    if let Err(e) = fs::create_dir_all(db_parent) {
+        error!("cannot create {}: {e}", db_parent.display());
+        std::process::exit(1);
+    }
+    let conn = match db::open_with(&db_file, cfg.index.compress) {
+        Ok(c) => Arc::new(Mutex::new(c)),
+        Err(e) => {
+            error!("cannot open index at {}: {e}", db_file.display());
+            std::process::exit(1);
+        }
+    };
     restrict_index_permissions(&db_file);
 
     // ── Signal handling ──────────────────────────────────────────────────────
@@ -363,8 +386,13 @@ fn main() {
             Arc::clone(&reload),
             Arc::clone(&cancel),
         );
-        let mut signals =
-            Signals::new([SIGUSR1, SIGTERM, SIGINT, SIGHUP]).expect("Failed to register signals");
+        let mut signals = match Signals::new([SIGUSR1, SIGTERM, SIGINT, SIGHUP]) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("cannot install signal handlers: {e}");
+                std::process::exit(1);
+            }
+        };
         thread::spawn(move || {
             for sig in signals.forever() {
                 match sig {
@@ -388,8 +416,8 @@ fn main() {
     }
 
     // ── Decide: full scan or journal-only restart ────────────────────────────
-    let config_changes = config_state::apply(&conn.lock().unwrap(), &cfg);
-    let last_scan = db::get_metadata(&conn.lock().unwrap(), "last_scan_completed")
+    let config_changes = config_state::apply(&lock(&conn), &cfg);
+    let last_scan = db::get_metadata(&lock(&conn), "last_scan_completed")
         .ok()
         .flatten()
         .and_then(|v| v.parse::<i64>().ok());
@@ -417,7 +445,7 @@ fn main() {
     // A full scan registers watches as it discovers directories, and
     // fanotify needs none.
     let dirs_for_inotify: Vec<String> = if !needs_full_scan && !cfg.monitor.prefer_fanotify {
-        db::get_all_dirs(&conn.lock().unwrap())
+        db::get_all_dirs(&lock(&conn))
             .unwrap_or_default()
             .into_iter()
             .filter(|d| {
@@ -460,7 +488,7 @@ fn main() {
         // watch list; if fanotify failed and inotify took over, load it now.
         if let Ok((Monitor::Inotify(m), _)) = &r {
             if !needs_full_scan && cfg.monitor.prefer_fanotify {
-                let dirs = db::get_all_dirs(&conn.lock().unwrap()).unwrap_or_default();
+                let dirs = db::get_all_dirs(&lock(&conn)).unwrap_or_default();
                 for d in &dirs {
                     if !monitor_excludes
                         .iter()
@@ -558,12 +586,22 @@ fn main() {
         last_tick = Instant::now();
         tick += 1;
 
+        // Monitor liveness: the event-reading thread can exit on an
+        // unexpected read() error (lazy unmount, EIO) or panic. If so,
+        // no further events arrive and the index silently freezes.
+        // Treat it the same as an overflow (force a re-index) and
+        // re-exec so a fresh monitor comes up; systemd keeps the pid.
+        if monitor.as_ref().is_some_and(|m| m.is_dead()) {
+            error!("Monitor event thread exited; re-executing to restart it");
+            reexec();
+        }
+
         let overflowed = monitor.as_ref().is_some_and(|m| m.take_overflow());
         let forced = force_reindex.swap(false, Ordering::Relaxed);
         if forced {
             // Mark every periodic root due; the background queue picks
             // them up after the live re-index.
-            let c = conn.lock().unwrap();
+            let c = lock(&conn);
             for r in &ctx.cfg.scan.periodic_roots {
                 let _ = db::set_metadata(&c, &scan::root_scan_key(&r.path), "0");
             }
@@ -580,7 +618,7 @@ fn main() {
         }
 
         // Apply pending events.
-        let pending = db::pending_event_count(&conn.lock().unwrap()).unwrap_or(0);
+        let pending = db::pending_event_count(&lock(&conn)).unwrap_or(0);
         if pending > 0 {
             index::reconcile(&conn, &ctx.cfg);
         }
@@ -640,7 +678,7 @@ fn main() {
 
         // Heartbeat every 5 minutes.
         if tick.is_multiple_of(60) {
-            let cnt = db::entry_count(&conn.lock().unwrap()).unwrap_or(0);
+            let cnt = db::entry_count(&lock(&conn)).unwrap_or(0);
             info!("Heartbeat | {cnt} entries | monitoring: {}", ctx.mode);
         }
     }
