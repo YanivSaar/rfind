@@ -290,7 +290,7 @@ impl WorkQueue {
             if let Some(item) = q.pop_front() {
                 return Some(item);
             }
-            if in_flight.load(Ordering::SeqCst) == 0 {
+            if in_flight.load(Ordering::Acquire) == 0 {
                 return None;
             }
             q = self.condvar.wait(q).unwrap();
@@ -423,7 +423,7 @@ pub fn run_scan(config: ScanConfig) -> ScanResult {
             warn!("Cannot open root {:?}", root);
             continue;
         }
-        counters.in_flight.fetch_add(1, Ordering::SeqCst);
+        counters.in_flight.fetch_add(1, Ordering::Release);
         wq.push(WorkItem { path: root.clone() });
     }
 
@@ -705,7 +705,7 @@ fn worker_loop(
                 local_count += 1;
 
                 if is_dir {
-                    counters.in_flight.fetch_add(1, Ordering::SeqCst);
+                    counters.in_flight.fetch_add(1, Ordering::Release);
                     wq.push(WorkItem { path: child_path });
                 }
             }

@@ -324,7 +324,10 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), EditError> {
     ));
     let mut f = fs::File::create(&tmp).map_err(err)?;
     f.write_all(bytes).and_then(|_| f.sync_all()).map_err(err)?;
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).map_err(err)?;
+    // 0o640: owner (root) read/write, group read, world none. The config
+    // lists excluded paths and roots which routinely include sensitive
+    // directories, so world-readable (0o644) was wrong.
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o640)).map_err(err)?;
     fs::rename(&tmp, path).map_err(err)
 }
 

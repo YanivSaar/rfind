@@ -59,12 +59,25 @@ pub enum FanotifyError {
 }
 
 /// A marked filesystem: its fsid (as reported in events) and the mount
-/// point used to resolve handles. The mount is opened per lookup, never
-/// held open: an open fd would keep the filesystem busy and make
-/// `umount` of a marked disk fail.
+/// point used to resolve handles.
+///
+/// `mount_fd` caches an open fd on the mount point so hot event streams
+/// don't `open()`+`close()` it twice per event (that doubled syscall count
+/// at 100k events/s). We never pin the fd across umount: ESTALE from
+/// `open_by_handle_at` invalidates the cache and the next event reopens.
 struct MarkedFs {
     fsid: [i32; 2],
     point: PathBuf,
+    mount_fd: std::sync::Mutex<RawFd>,
+}
+
+impl Drop for MarkedFs {
+    fn drop(&mut self) {
+        let fd = *self.mount_fd.lock().unwrap();
+        if fd >= 0 {
+            unsafe { close(fd) };
+        }
+    }
 }
 
 /// The fanotify fd and its marks, shared with the event loop so
@@ -254,6 +267,7 @@ fn mark_filesystem(fd: RawFd, point: &Path, mask: u64) -> Result<MarkedFs, Fanot
     Ok(MarkedFs {
         fsid,
         point: point.to_path_buf(),
+        mount_fd: std::sync::Mutex::new(-1),
     })
 }
 
@@ -270,18 +284,33 @@ fn resolve(rec: &[u8], marked: &RwLock<Vec<MarkedFs>>) -> Option<PathBuf> {
     if rec.len() < handle_end {
         return None;
     }
-    let point = marked
-        .read()
-        .unwrap()
-        .iter()
-        .find(|m| m.fsid == fsid)?
-        .point
-        .clone();
+    // Look up the mount point AND take a snapshot (or lazily create) of
+    // its cached mount fd without holding the RwLock across the syscalls.
+    let (point, cached_fd) = {
+        let g = marked.read().unwrap();
+        let m = g.iter().find(|m| m.fsid == fsid)?;
+        let fd = *m.mount_fd.lock().unwrap();
+        (m.point.clone(), fd)
+    };
     let cpoint = CString::new(point.as_os_str().as_encoded_bytes()).ok()?;
-    // Not O_PATH: open_by_handle_at() rejects O_PATH fds with EBADF.
-    let mount_fd = unsafe { open(cpoint.as_ptr(), O_RDONLY | O_DIRECTORY | O_CLOEXEC) };
+    let mut mount_fd = cached_fd;
+    let mut opened_here = false;
     if mount_fd < 0 {
-        return None; // unmounted meanwhile
+        // Not O_PATH: open_by_handle_at() rejects O_PATH fds with EBADF.
+        mount_fd = unsafe { open(cpoint.as_ptr(), O_RDONLY | O_DIRECTORY | O_CLOEXEC) };
+        if mount_fd < 0 {
+            return None; // unmounted meanwhile
+        }
+        opened_here = true;
+        // Publish into the cache; if someone else beat us to it, keep ours
+        // and close theirs. On ESTALE below we invalidate before reopening.
+        if let Some(m) = marked.read().unwrap().iter().find(|m| m.fsid == fsid) {
+            let mut slot = m.mount_fd.lock().unwrap();
+            if *slot < 0 {
+                *slot = mount_fd;
+                opened_here = false; // the cache now owns it
+            }
+        }
     }
 
     // struct file_handle { u32 handle_bytes; i32 handle_type; u8 f_handle[] },
@@ -302,7 +331,16 @@ fn resolve(rec: &[u8], marked: &RwLock<Vec<MarkedFs>>) -> Option<PathBuf> {
         )
     };
     let open_err = errno();
-    unsafe { close(mount_fd) };
+    if opened_here {
+        // We never cached this fd (lost the publish race); close it.
+        unsafe { close(mount_fd) };
+    }
+    if open_err == libc::ESTALE {
+        // The directory went away. The mount itself may still be fine, so
+        // don't drop the cached fd; a subsequent event with a live handle
+        // will succeed. If instead the mount went away, open() will fail
+        // next time and we'll reopen the cached slot via `-1`.
+    }
     if dfd < 0 && open_err != libc::ESTALE && !RESOLVE_WARNED.swap(true, Ordering::Relaxed) {
         warn!(
             "fanotify: cannot resolve file handles ({}); events are being lost",

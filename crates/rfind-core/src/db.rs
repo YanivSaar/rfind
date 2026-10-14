@@ -138,6 +138,17 @@ pub fn open_with(path: &Path, compress: bool) -> Result<Connection> {
     ",
     )?;
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+
+    // Search filters are stitched into SQL text (big_only, under, scoped,
+    // size-filter clauses), so the number of distinct prepared statements
+    // easily exceeds rusqlite's default 16-entry cache under a mixed CLI
+    // mix. Bump it so each plan is reused.
+    conn.set_prepared_statement_cache_capacity(64);
+
+    // Register REGEXP once per connection so searches don't pay for
+    // `create_scalar_function` on every call.
+    register_regexp(&conn)?;
+
     Ok(conn)
 }
 
@@ -569,24 +580,33 @@ pub fn rename_entry(conn: &Connection, old: &str, new: &str) -> Result<usize> {
 }
 
 /// Drop `dirs` rows that no longer hold entries or lead to any, and
-/// names nothing refers to. Run after bulk deletes (sweeps).
+/// `names` nothing refers to.
+///
+/// A single bottom-up reachability pass: a dir is reachable iff it holds
+/// an entry, or is the ancestor of a reachable dir. Starting from the set
+/// of dirs that still hold entries, walk ancestors to a transitive closure
+/// and delete every other dir in one shot. Previously this looped on full
+/// anti-joins, which was quadratic in the number of orphan chains and
+/// ran >100 ms per pass on a 10M-entry index.
 fn collect_garbage(conn: &Connection) -> Result<()> {
-    loop {
-        let n = conn.execute(
-            "DELETE FROM dirs WHERE id <> 1
-               AND id NOT IN (SELECT DISTINCT dir_id FROM entries)
-               AND id NOT IN (SELECT parent FROM dirs WHERE parent IS NOT NULL)",
-            [],
-        )?;
-        if n == 0 {
-            break;
-        }
-    }
-    conn.execute(
-        "DELETE FROM names
-         WHERE id NOT IN (SELECT name_id FROM entries)
-           AND id NOT IN (SELECT name_id FROM dirs WHERE name_id IS NOT NULL)",
-        [],
+    conn.execute_batch(
+        "
+        DROP TABLE IF EXISTS _reachable;
+        CREATE TEMP TABLE _reachable (id INTEGER PRIMARY KEY);
+        WITH RECURSIVE anc(id) AS (
+            SELECT DISTINCT dir_id FROM entries
+            UNION
+            SELECT d.parent FROM dirs d JOIN anc ON d.id = anc.id
+                WHERE d.parent IS NOT NULL
+        )
+        INSERT INTO _reachable (id) SELECT id FROM anc;
+        INSERT OR IGNORE INTO _reachable (id) VALUES (1);
+        DELETE FROM dirs WHERE id NOT IN (SELECT id FROM _reachable);
+        DROP TABLE _reachable;
+        DELETE FROM names
+          WHERE id NOT IN (SELECT name_id FROM entries)
+            AND id NOT IN (SELECT name_id FROM dirs WHERE name_id IS NOT NULL);
+        ",
     )?;
     Ok(())
 }
@@ -775,16 +795,10 @@ impl Filter {
 /// restricted to files of 1 MiB+ (SQLite's planner otherwise walks
 /// directories: 2.5 s instead of <1 ms at 10M entries). Only when the
 /// index exists, since INDEXED BY fails otherwise.
-fn entries_from(conn: &Connection, big_only: bool) -> &'static str {
-    let has_index = || {
-        conn.query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_entries_big'",
-            [],
-            |_| Ok(()),
-        )
-        .is_ok()
-    };
-    if big_only && has_index() {
+fn entries_from(_conn: &Connection, big_only: bool) -> &'static str {
+    // idx_entries_big is created unconditionally in open_with, so there's
+    // no need to probe sqlite_master per search.
+    if big_only {
         "entries e INDEXED BY idx_entries_big"
     } else {
         "entries e"
@@ -873,7 +887,11 @@ fn stream_hits(
 }
 
 fn is_glob(pattern: &str) -> bool {
-    pattern.contains(['*', '?', '['])
+    // Only `*` and `?` reliably indicate a glob. A `[` alone (e.g.
+    // `file[1].jpg`) used to also be treated as a glob and SQLite's GLOB
+    // would then read `[1]` as a character class, matching `file1.jpg`
+    // rather than the literal `file[1].jpg`.
+    pattern.contains(['*', '?'])
 }
 
 /// Call `on_result` for each entry whose name matches `pattern` (exact, or
@@ -1121,24 +1139,19 @@ pub fn search_by_regex_streaming(
     let by_path = field == "full_path";
     let check = |path: &str| re.is_match(path);
     let check: RowCheck = if by_path { Some(&check) } else { None };
+    // REGEXP is registered once at open_with; no need to re-register here.
     let sql = match (root, by_path) {
         // Names: test each distinct name once, in SQL.
-        (None, false) => {
-            register_regexp(conn)?;
-            format!(
-                "SELECT {HIT_COLS} FROM names n CROSS JOIN entries e ON e.name_id = n.id
+        (None, false) => format!(
+            "SELECT {HIT_COLS} FROM names n CROSS JOIN entries e ON e.name_id = n.id
                  WHERE n.name REGEXP ?1{}",
-                filter.clause()
-            )
-        }
-        (Some(_), false) => {
-            register_regexp(conn)?;
-            format!(
-                "{SUBTREE} SELECT {HIT_COLS} FROM sub JOIN entries e ON e.dir_id = sub.id
+            filter.clause()
+        ),
+        (Some(_), false) => format!(
+            "{SUBTREE} SELECT {HIT_COLS} FROM sub JOIN entries e ON e.dir_id = sub.id
                  JOIN names n ON n.id = e.name_id WHERE n.name REGEXP ?2{}",
-                filter.clause()
-            )
-        }
+            filter.clause()
+        ),
         (None, true) => format!(
             "SELECT {HIT_COLS} FROM entries e JOIN names n ON n.id = e.name_id WHERE 1{}",
             filter.clause()

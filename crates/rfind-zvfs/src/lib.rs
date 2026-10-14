@@ -15,7 +15,7 @@ pub mod store;
 mod vfs;
 
 use rusqlite::{Connection, OpenFlags};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub use store::{exists as is_compressed, store_files};
 pub use vfs::{register, VFS_NAME};
@@ -55,11 +55,11 @@ pub fn compact(conn: &Connection) -> rusqlite::Result<()> {
 /// Bytes the database occupies on disk: compressed store plus WAL.
 pub fn disk_bytes(path: &Path) -> u64 {
     let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-    store_files(path).iter().map(|p| size(p)).sum::<u64>()
-        + size(&path.with_extension(format!(
-            "{}-wal",
-            path.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default()
-        )))
+    // SQLite appends `-wal` to the full path, not after a split on extension:
+    // `/foo/bar.db` → `/foo/bar.db-wal`, `/foo/bar` → `/foo/bar-wal`. The
+    // old `with_extension` form produced `bar.-wal` for extension-less paths.
+    let wal = PathBuf::from(format!("{}-wal", path.display()));
+    store_files(path).iter().map(|p| size(p)).sum::<u64>() + size(&wal)
 }
 
 #[cfg(test)]

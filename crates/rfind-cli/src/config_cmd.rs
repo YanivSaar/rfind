@@ -508,8 +508,7 @@ fn edit_cmd(out: &mut Out, path: &Path, reload: ReloadOpt) -> CmdResult {
     let base = std::env::temp_dir();
     let dir = base.join(format!("rfind-edit-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup of a stale leftover we own
-    std::fs::create_dir(&dir)
-        .map_err(|e| fail(format!("cannot create {}: {e}", dir.display())))?;
+    std::fs::create_dir(&dir).map_err(|e| fail(format!("cannot create {}: {e}", dir.display())))?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
         .map_err(|e| fail(format!("cannot chmod {}: {e}", dir.display())))?;
     let tmp = dir.join("config.toml");

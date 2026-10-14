@@ -71,6 +71,10 @@ pub struct Store {
     /// Reused for every page read: record bytes and a zstd context.
     scratch: Vec<u8>,
     dctx: Option<zstd::bulk::Decompressor<'static>>,
+    /// Reused for every page write: a single zstd compressor + scratch
+    /// buffer instead of a fresh context per page (hot during bulk scans).
+    cctx: Option<zstd::bulk::Compressor<'static>>,
+    comp_scratch: Vec<u8>,
     /// Pages were dropped since the last snapshot: replaying the log would
     /// bring them back, so the next sync must publish a snapshot.
     truncated: bool,
@@ -140,6 +144,8 @@ impl Store {
             dirty: false,
             scratch: Vec::new(),
             dctx: None,
+            cctx: None,
+            comp_scratch: Vec::new(),
             truncated: false,
         };
         s.load()?;
@@ -349,13 +355,26 @@ impl Store {
         if self.data.is_none() {
             self.data = self.open_data(self.gen)?;
         }
-        let payload = zstd::bulk::compress(page, ZSTD_LEVEL)?;
+        // Reuse one zstd context + scratch buffer across every page write.
+        if self.cctx.is_none() {
+            self.cctx = Some(zstd::bulk::Compressor::new(ZSTD_LEVEL)?);
+        }
+        let cap = zstd::zstd_safe::compress_bound(page.len());
+        if self.comp_scratch.capacity() < cap {
+            self.comp_scratch
+                .reserve(cap - self.comp_scratch.capacity());
+        }
+        self.comp_scratch.clear();
+        self.comp_scratch.resize(cap, 0);
+        let cctx = self.cctx.as_mut().unwrap();
+        let n = cctx.compress_to_buffer(page, &mut self.comp_scratch)?;
+        let payload = &self.comp_scratch[..n];
         let mut rec = Vec::with_capacity(REC_HDR + payload.len());
         for v in [REC_MAGIC, pgno, payload.len() as u32, page.len() as u32] {
             rec.extend_from_slice(&v.to_le_bytes());
         }
-        rec.extend_from_slice(&crc(pgno, page.len() as u32, &payload).to_le_bytes());
-        rec.extend_from_slice(&payload);
+        rec.extend_from_slice(&crc(pgno, page.len() as u32, payload).to_le_bytes());
+        rec.extend_from_slice(payload);
         let f = self.data.as_ref().unwrap();
         f.write_all_at(&rec, self.data_len)?;
         let old = self.map.get(pgno as usize - 1).copied().unwrap_or_default();

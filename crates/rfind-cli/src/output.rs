@@ -46,25 +46,32 @@ pub fn format_duration(secs: i64) -> String {
 
 /// Compact human size: 512, 4.0K, 1.5M, 2.1G.
 pub fn human(b: u64) -> String {
-    const UNITS: [&str; 5] = ["K", "M", "G", "T", "P"];
+    // UNITS[u] is the label after `u` divisions by 1024, so UNITS[0] is K.
+    const UNITS: [&str; 6] = ["K", "M", "G", "T", "P", "E"];
     if b < 1024 {
         return b.to_string();
     }
-    let mut v = b as f64;
-    let mut u = 0;
-    while v >= 1024.0 && u < UNITS.len() {
+    let mut v = b as f64 / 1024.0;
+    let mut u = 0; // "K"
+                   // Keep scaling into the next label while there is one.
+    while v >= 1024.0 && u + 1 < UNITS.len() {
         v /= 1024.0;
         u += 1;
     }
-    format!("{v:.1}{}", UNITS[u - 1])
+    format!("{v:.1}{}", UNITS[u])
 }
 
 pub fn format_bytes(b: u64) -> String {
+    const PB: u64 = 1 << 50;
+    const EB: u64 = 1 << 60;
     match b {
         b if b < 1024 => format!("{b} B"),
         b if b < 1 << 20 => format!("{:.1} KB", b as f64 / 1024.0),
         b if b < 1 << 30 => format!("{:.1} MB", b as f64 / (1 << 20) as f64),
-        b => format!("{:.2} GB", b as f64 / (1 << 30) as f64),
+        b if b < 1u64 << 40 => format!("{:.2} GB", b as f64 / (1 << 30) as f64),
+        b if b < 1u64 << 50 => format!("{:.2} TB", b as f64 / (1u64 << 40) as f64),
+        b if b < EB => format!("{:.2} PB", b as f64 / PB as f64),
+        b => format!("{:.2} EB", b as f64 / EB as f64),
     }
 }
 
@@ -78,8 +85,12 @@ impl Out {
     }
 
     /// Write one line; false once stdout is closed (e.g. piped into head).
+    ///
+    /// Flushes immediately so a `BufWriter`-buffered broken-pipe error
+    /// surfaces as soon as the reader goes away — otherwise `rfind … | head`
+    /// would keep running SQL for every row until the buffer finally flushed.
     fn line(&mut self, s: &str) -> bool {
-        writeln!(self.stdout, "{s}").is_ok()
+        writeln!(self.stdout, "{s}").is_ok() && self.stdout.flush().is_ok()
     }
 
     fn object(&mut self, v: &Value) {

@@ -586,10 +586,20 @@ Normalized parent-ID schema avoids storing full paths redundantly.
 - The index is **root-only** (`/var/lib/rfindd` is `0700`, the database `0600`): it lists every
   file name on the system, including other users' files, so `rfind` searches need `sudo`
 - Index at `/var/lib/rfindd/index.db` — root-owned
+- Config at `/etc/rfindd/config.toml` — `0640` (root-owned; group-readable so a `wheel`-style
+  group can audit the exclude list without needing read on the index itself)
 - Progress file at `/run/rfindd/progress.json` — world-readable (filenames only, no content)
 - Search queries read the index directly — no daemon IPC required
 - Symlinks are **not followed** during scan (prevents cycles)
 - Excluded paths (default `/proc`, `/sys`, `/dev`, `/run`, `/media`) are never indexed
+- `rfind config edit` uses a private `0700` tmp subdir with `O_CREAT|O_EXCL|O_NOFOLLOW`
+  so a local user cannot win a `/tmp` symlink race against a `sudo rfind config edit`
+- `$EDITOR` is executed as a program path (via `sh -c 'exec "$0" "$@"'`), never as a shell
+  fragment — a hostile `EDITOR=…` cannot inject commands under `sudo -E`
+- `rfind uninstall --purge` only removes dirs whose basename is `rfindd` or `rfind`; a
+  misconfigured `index.db_path = /var/foo.db` can no longer take out `/var`
+- The daemon takes `flock(LOCK_EX|LOCK_NB)` on `/run/rfindd/rfindd.pid` at startup, so a
+  second instance refuses to run
 
 ---
 
@@ -652,7 +662,12 @@ All tests pass in ~0.2s.
 - [x] Man pages: `rfind(1)`, `rfindd(8)`, `rfind.conf(5)`
 - [x] Static x86_64 / aarch64 release binaries; one-line install and uninstall
 - [x] Scale validation at 10M entries; benchmarks vs find, locate, plocate
-- [ ] Cache resolved directory handles (fanotify CPU under event floods)
+- [x] Cache resolved directory handles (per-fsid mount-fd cache in fanotify)
+- [x] Hardened `rfind config edit` (symlink race, empty-file guard, EDITOR injection)
+- [x] Whitelisted `rfind uninstall --purge`; daemon pidfile + flock
+- [x] Searches pin a read snapshot; live-event GC runs in bulk; stats use the right dot
+- [x] Scanner work-queue uses mutex-protected notify (no lost-wakeup hang); worker panics
+      are caught; io_uring buffer lifetime is sound on error paths
 - [ ] Extension index for `*.ext` globs
 - [ ] Per-directory size totals for instant whole-disk `rfind size`
 - [ ] Debian / RPM packages

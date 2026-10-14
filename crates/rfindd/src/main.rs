@@ -159,6 +159,37 @@ fn reexec() -> ! {
     std::process::exit(1);
 }
 
+/// Open and `flock(LOCK_EX|LOCK_NB)` the pidfile at `path`, creating the
+/// parent dir if needed. On success the returned `File` must stay open
+/// for the daemon's lifetime (dropping it releases the lock).
+fn acquire_pidfile(path: &Path) -> Result<std::fs::File, String> {
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|e| format!("cannot open pidfile {}: {e}", path.display()))?;
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(format!(
+            "another rfindd is already running (pidfile {} is locked: {e})",
+            path.display()
+        ));
+    }
+    // Overwrite with our pid.
+    if let Err(e) = f.set_len(0) {
+        return Err(format!("cannot truncate pidfile {}: {e}", path.display()));
+    }
+    let _ = (&f).write_all(format!("{}\n", std::process::id()).as_bytes());
+    Ok(f)
+}
+
 /// Decide what to do with a filesystem that was mounted or unmounted.
 fn on_mount_change(
     ctx: &Ctx,
@@ -245,6 +276,21 @@ fn main() {
 
     // Everything rfindd creates (index, WAL, progress file) is root-only.
     unsafe { libc::umask(0o077) };
+
+    // Pidfile + exclusive flock on /run/rfindd/rfindd.pid: a second rfindd
+    // started by hand next to the systemd service would otherwise race on
+    // the SQLite WAL and the event journal. We leak the lockfile so the
+    // flock is held for the lifetime of the process (dropping would close
+    // the fd and release the lock).
+    let _lockfile: &'static std::fs::File = Box::leak(Box::new(
+        match acquire_pidfile(std::path::Path::new("/run/rfindd/rfindd.pid")) {
+            Ok(f) => f,
+            Err(e) => {
+                error!("{e}");
+                std::process::exit(1);
+            }
+        },
+    ));
 
     let mut mount_table = mounts::read_mountinfo();
     let cfg = match load_effective_config(&mount_table) {

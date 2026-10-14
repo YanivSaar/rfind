@@ -1,7 +1,18 @@
 //! Finding and signalling the running rfindd.
 
-/// PID of the running rfindd, from /proc/*/comm.
+/// PID of the running rfindd. Prefers the daemon's own pidfile at
+/// /run/rfindd/rfindd.pid (written while holding an exclusive flock), and
+/// falls back to a /proc scan when the pidfile isn't there (older daemon,
+/// or /run/rfindd not available).
 pub fn rfindd_pid() -> Option<libc::pid_t> {
+    if let Ok(s) = std::fs::read_to_string("/run/rfindd/rfindd.pid") {
+        if let Ok(pid) = s.trim().parse::<libc::pid_t>() {
+            // Verify the process is actually alive.
+            if unsafe { libc::kill(pid, 0) } == 0 {
+                return Some(pid);
+            }
+        }
+    }
     for entry in std::fs::read_dir("/proc").ok()?.flatten() {
         let name = entry.file_name();
         let Ok(pid) = name.to_string_lossy().parse::<libc::pid_t>() else {

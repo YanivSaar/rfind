@@ -102,7 +102,11 @@ fn parse_size(s: &str) -> Result<u64, String> {
     if n < 0.0 {
         return Err(format!("invalid size '{s}'"));
     }
-    Ok((n * mult as f64) as u64)
+    let bytes = n * mult as f64;
+    if !bytes.is_finite() || bytes > u64::MAX as f64 {
+        return Err(format!("size '{s}' is too large"));
+    }
+    Ok(bytes as u64)
 }
 
 #[derive(ValueEnum, Clone, Debug)]
@@ -304,6 +308,22 @@ fn parse_date(s: &str) -> Option<i64> {
     )
 }
 
+/// End-of-day for `--to`, DST-correct. Previously the caller added 86399 s
+/// to local midnight; on a "spring forward" day the real end-of-day sits
+/// at 86399 - 3600 seconds past midnight and the +86399 fudge rolls into
+/// the next day.
+fn parse_date_end(s: &str) -> Option<i64> {
+    use chrono::TimeZone;
+    let day = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()?;
+    let eod = day.and_hms_opt(23, 59, 59)?;
+    Some(
+        chrono::Local
+            .from_local_datetime(&eod)
+            .latest()?
+            .timestamp(),
+    )
+}
+
 fn found(n: u64) -> CmdResult {
     Ok(if n > 0 {
         ExitCode::SUCCESS
@@ -363,8 +383,8 @@ fn cmd_recent(
     let conn = open_db()?;
     let now = now();
     let (from_sec, to_sec) = if let (Some(f), Some(t)) = (from, to) {
-        match (parse_date(&f), parse_date(&t)) {
-            (Some(fs), Some(ts)) => (fs, ts + 86399),
+        match (parse_date(&f), parse_date_end(&t)) {
+            (Some(fs), Some(ts)) => (fs, ts),
             _ => return Err(fail("invalid date; use YYYY-MM-DD")),
         }
     } else if let Some(m) = minutes {

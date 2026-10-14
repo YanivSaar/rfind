@@ -82,6 +82,12 @@ impl Watches {
         if self.is_excluded(path) {
             return;
         }
+        // N2: short-circuit once we've hit ENOSPC. Every subsequent
+        // inotify_add_watch would fail anyway, and the daemon is already
+        // scheduled for a rescan via the warning path below.
+        if self.limit_warned.load(Ordering::Relaxed) {
+            return;
+        }
         let c = match CString::new(path.as_os_str().as_encoded_bytes()) {
             Ok(c) => c,
             Err(_) => return,

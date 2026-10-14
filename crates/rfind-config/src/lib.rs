@@ -204,6 +204,29 @@ impl Config {
         if self.scan.roots.is_empty() && self.scan.periodic_roots.is_empty() {
             err("nothing to index: add a root or a periodic root".into());
         }
+        // Root/exclude conflicts: a path that is both a root and an
+        // exclude would be swept away by its own scan, and nested roots
+        // confuse the sweep (one scan's sweep could delete the other
+        // scan's entries). The scan loop handles "ancestor root scans
+        // skip nested roots" correctly, but the user usually wants one
+        // or the other.
+        for r in &self.scan.roots {
+            if self.scan.exclude.contains(r) {
+                err(format!(
+                    "{} is both a root and in scan.exclude — drop one",
+                    r.display()
+                ));
+            }
+            for other in &self.scan.roots {
+                if other != r && r.starts_with(other) {
+                    err(format!(
+                        "root {} is nested inside root {} — drop the inner one",
+                        r.display(),
+                        other.display()
+                    ));
+                }
+            }
+        }
         let mut warn = |m: String| {
             out.push(Problem {
                 error: false,
