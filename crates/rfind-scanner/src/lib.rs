@@ -35,7 +35,7 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime},
 };
-use tracing::warn;
+use tracing::{error, warn};
 
 // ---------------------------------------------------------------------------
 // Linux kernel structs for getdents64
@@ -123,29 +123,38 @@ impl Stat {
 /// statx(dirfd, name, AT_SYMLINK_NOFOLLOW, TYPE|MTIME|SIZE) as a plain syscall.
 fn statx_one(dirfd: RawFd, name: &CStr) -> Option<Stat> {
     let mut stx = Statx::default();
-    let ret = unsafe {
-        syscall(
-            libc::SYS_statx, // per-architecture number (332 on x86_64, 291 on aarch64)
-            dirfd as libc::c_long,
-            name.as_ptr() as libc::c_long,
-            AT_SYMLINK_NOFOLLOW as libc::c_long,
-            STATX_MASK as libc::c_long,
-            &mut stx as *mut Statx as libc::c_long,
-        )
-    };
-    (ret == 0).then(|| Stat::from_statx(&stx))
+    loop {
+        let ret = unsafe {
+            syscall(
+                libc::SYS_statx, // per-architecture number (332 on x86_64, 291 on aarch64)
+                dirfd as libc::c_long,
+                name.as_ptr() as libc::c_long,
+                AT_SYMLINK_NOFOLLOW as libc::c_long,
+                STATX_MASK as libc::c_long,
+                &mut stx as *mut Statx as libc::c_long,
+            )
+        };
+        if ret == 0 {
+            return Some(Stat::from_statx(&stx));
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return None;
+    }
 }
 
 /// Ring size for batched statx; one batch per getdents64 buffer chunk.
 const URING_ENTRIES: u32 = 256;
 
-/// Set once io_uring turned out to be unusable, so it's reported once.
+/// Latches when io_uring turned out to be unusable at least once; only used
+/// to suppress repeated warnings and to report the result honestly. Each
+/// scan still tries to open a ring so a transient hiccup doesn't disable
+/// io_uring for the whole life of a long-running daemon.
 static URING_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
 
 fn new_ring() -> Option<io_uring::IoUring> {
-    if URING_UNAVAILABLE.load(Ordering::Relaxed) {
-        return None;
-    }
     match io_uring::IoUring::new(URING_ENTRIES) {
         Ok(r) => Some(r),
         Err(e) => {
@@ -161,6 +170,13 @@ fn new_ring() -> Option<io_uring::IoUring> {
 /// calls are submitted in batches: one syscall per batch instead of one
 /// per entry, and on slow filesystems (network, WSL2 drvfs) the kernel
 /// runs them concurrently.
+///
+/// Safety: `bufs` is handed to the kernel by raw pointer. We must not drop
+/// `bufs` (or the ring) until every submitted SQE has completed — closing
+/// the uring fd does not synchronously cancel in-flight ops, so a late
+/// kernel write would otherwise be a use-after-free. On any error path we
+/// first drain the completion queue; if we cannot drain cleanly we leak
+/// both the ring and the buffer rather than risk UAF.
 fn statx_batch(
     ring: &mut Option<io_uring::IoUring>,
     dirfd: RawFd,
@@ -173,6 +189,7 @@ fn statx_batch(
     let mut bufs: Vec<Statx> = (0..names.len()).map(|_| Statx::default()).collect();
     for (chunk_start, chunk) in names.chunks(URING_ENTRIES as usize).enumerate() {
         let base = chunk_start * URING_ENTRIES as usize;
+        let mut submitted = 0usize;
         for (i, name) in chunk.iter().enumerate() {
             let sqe = io_uring::opcode::Statx::new(
                 io_uring::types::Fd(dirfd),
@@ -185,24 +202,51 @@ fn statx_batch(
             .user_data((base + i) as u64);
             // The ring has URING_ENTRIES slots and the chunk is no larger.
             unsafe { r.submission().push(&sqe).expect("submission queue full") };
+            submitted += 1;
         }
-        if let Err(e) = r.submit_and_wait(chunk.len()) {
-            warn!("io_uring submit failed ({e}); falling back to statx syscalls");
-            URING_UNAVAILABLE.store(true, Ordering::Relaxed);
-            *ring = None;
-            return names.iter().map(|n| statx_one(dirfd, n)).collect();
-        }
-        let mut done = 0;
-        while done < chunk.len() {
+        let mut done = 0usize;
+        while done < submitted {
+            match r.submit_and_wait(submitted - done) {
+                Ok(_) => {}
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => {
+                    // Drain whatever came back and retry.
+                }
+                Err(e) => {
+                    warn!("io_uring submit_and_wait failed ({e}); draining and giving up");
+                    // Non-blocking drain of whatever's ready.
+                    for cqe in r.completion() {
+                        let i = cqe.user_data() as usize;
+                        if cqe.result() >= 0 {
+                            out[i] = Some(Stat::from_statx(&bufs[i]));
+                        }
+                        done += 1;
+                    }
+                    if done < submitted {
+                        // Still outstanding SQEs. The kernel can write to
+                        // `bufs` after this returns, so neither the ring
+                        // nor the buffer may be dropped. Leak them.
+                        warn!(
+                            "io_uring: {} ops still outstanding; leaking ring+buffers",
+                            submitted - done
+                        );
+                        if let Some(old) = ring.take() {
+                            std::mem::forget(old);
+                        }
+                        std::mem::forget(bufs);
+                        URING_UNAVAILABLE.store(true, Ordering::Relaxed);
+                        return names.iter().map(|n| statx_one(dirfd, n)).collect();
+                    }
+                    URING_UNAVAILABLE.store(true, Ordering::Relaxed);
+                    *ring = None;
+                    return names.iter().map(|n| statx_one(dirfd, n)).collect();
+                }
+            }
             for cqe in r.completion() {
                 let i = cqe.user_data() as usize;
                 if cqe.result() >= 0 {
                     out[i] = Some(Stat::from_statx(&bufs[i]));
                 }
                 done += 1;
-            }
-            if done < chunk.len() && r.submit_and_wait(chunk.len() - done).is_err() {
-                break;
             }
         }
     }
@@ -395,16 +439,31 @@ pub fn run_scan(config: ScanConfig) -> ScanResult {
 
         handles.push(thread::spawn(move || {
             let ring = if io_uring { new_ring() } else { None };
-            worker_loop(
-                wq,
-                counters,
-                on_entry,
-                on_error,
-                skip_dir,
-                &cancel,
-                collect_mtime,
-                ring,
-            );
+            // Catch panics from any of the user callbacks: without this,
+            // one panic would leave `in_flight > 0` and every other worker
+            // would hang in `pop_or_done` forever.
+            let cleanup_wq = Arc::clone(&wq);
+            let cleanup_counters = Arc::clone(&counters);
+            let cleanup_cancel = Arc::clone(&cancel);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker_loop(
+                    wq,
+                    counters,
+                    on_entry,
+                    on_error,
+                    skip_dir,
+                    &cancel,
+                    collect_mtime,
+                    ring,
+                );
+            }));
+            if result.is_err() {
+                error!("scanner worker panicked; cancelling the scan");
+                cleanup_cancel.store(true, Ordering::Relaxed);
+                let _g = cleanup_wq.queue.lock().unwrap();
+                cleanup_counters.in_flight.store(0, Ordering::Release);
+                cleanup_wq.condvar.notify_all();
+            }
         }));
     }
 
@@ -506,10 +565,15 @@ fn open_dir_fd(path: &std::path::Path) -> RawFd {
 
 /// Finish one queued directory: drop it from the in-flight count and wake
 /// the others if it was the last.
+///
+/// The decrement runs under the queue mutex, so a waiter that just observed
+/// `in_flight > 0` under the same mutex cannot slip into `condvar.wait`
+/// after this fires — i.e. no lost wakeups and no scanner hang.
 fn finish_item(wq: &WorkQueue, counters: &Counters) {
-    let remaining = counters.in_flight.fetch_sub(1, Ordering::SeqCst) - 1;
+    let _q = wq.queue.lock().unwrap();
+    let remaining = counters.in_flight.fetch_sub(1, Ordering::AcqRel) - 1;
     if remaining == 0 {
-        wq.wake_all();
+        wq.condvar.notify_all();
     }
 }
 
@@ -557,13 +621,23 @@ fn worker_loop(
 
         // Read directory entries via getdents64.
         loop {
-            let n = unsafe {
-                syscall(
-                    SYS_getdents64 as libc::c_long,
-                    dir_fd as libc::c_long,
-                    buf.as_mut_ptr() as libc::c_long,
-                    BUF_SIZE as libc::c_long,
-                )
+            let n = loop {
+                let r = unsafe {
+                    syscall(
+                        SYS_getdents64 as libc::c_long,
+                        dir_fd as libc::c_long,
+                        buf.as_mut_ptr() as libc::c_long,
+                        BUF_SIZE as libc::c_long,
+                    )
+                };
+                if r >= 0 {
+                    break r;
+                }
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break r;
             };
             if n < 0 {
                 let err = std::io::Error::last_os_error();

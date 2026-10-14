@@ -39,14 +39,37 @@ fn installed_files(prefix: &Path) -> Vec<PathBuf> {
     ]
 }
 
+/// Only directories whose basename is `rfindd` or `rfind` are eligible for
+/// purge: a misconfigured `index.db_path = /var/foo.db` or
+/// `RFIND_CONFIG=/etc/myrfind.toml` must not let `--purge` take out `/var`
+/// or `/etc`.
 fn purge_paths() -> Vec<PathBuf> {
+    let is_rfind_dir = |p: &Path| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n == "rfindd" || n == "rfind")
+    };
     let cfg = rfind_config::load(&config_path()).unwrap_or_default();
     let mut v = vec![];
     if let Some(dir) = cfg.index.db_path.parent() {
-        v.push(dir.to_path_buf());
+        if is_rfind_dir(dir) {
+            v.push(dir.to_path_buf());
+        } else {
+            eprintln!(
+                "rfind: refusing to purge {} (not an rfind directory); keeping it",
+                dir.display()
+            );
+        }
     }
     if let Some(dir) = config_path().parent() {
-        v.push(dir.to_path_buf());
+        if is_rfind_dir(dir) {
+            v.push(dir.to_path_buf());
+        } else {
+            eprintln!(
+                "rfind: refusing to purge {} (not an rfind directory); keeping it",
+                dir.display()
+            );
+        }
     }
     v.push(PathBuf::from("/run/rfindd"));
     v

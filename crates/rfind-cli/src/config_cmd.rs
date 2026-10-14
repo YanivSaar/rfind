@@ -15,6 +15,7 @@ use rfind_config::{
 use serde_json::{json, Value};
 use std::{
     io::{self, BufRead, Write},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -260,8 +261,17 @@ pub fn run(out: &mut Out, cmd: ConfigCmd) -> CmdResult {
         }
 
         ConfigCmd::Check => {
-            let text =
-                std::fs::read_to_string(&path).unwrap_or_else(|_| rfind_config::default_toml());
+            // Distinguish "no file yet" (fall back to defaults) from
+            // "can't read it" (ENOENT vs EACCES): otherwise a non-root user
+            // whose config file is 0o600 would always see the defaults
+            // reported as valid even if the real file is broken.
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => rfind_config::default_toml(),
+                Err(e) => {
+                    return Err(fail(format!("cannot read {}: {e}", path.display())));
+                }
+            };
             match edit::check_text(&path, &text) {
                 Ok(warnings) => {
                     print_problems(&warnings);
@@ -490,17 +500,42 @@ fn periodic_cmd(out: &mut Out, cmd: PeriodicCmd) -> CmdResult {
 
 fn edit_cmd(out: &mut Out, path: &Path, reload: ReloadOpt) -> CmdResult {
     let original = std::fs::read_to_string(path).unwrap_or_else(|_| rfind_config::default_toml());
-    let tmp = std::env::temp_dir().join(format!("rfind-config-{}.toml", std::process::id()));
-    std::fs::write(&tmp, &original)
+
+    // Private 0700 subdir in TMPDIR, so an attacker can't win a symlink race
+    // on the editor's working file. The dir name includes the pid; we remove
+    // it on exit. create_dir fails if it exists, so we also try a fresh name
+    // if a stale one is in the way.
+    let base = std::env::temp_dir();
+    let dir = base.join(format!("rfind-edit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup of a stale leftover we own
+    std::fs::create_dir(&dir)
+        .map_err(|e| fail(format!("cannot create {}: {e}", dir.display())))?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| fail(format!("cannot chmod {}: {e}", dir.display())))?;
+    let tmp = dir.join("config.toml");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp)
         .map_err(|e| fail(format!("cannot create {}: {e}", tmp.display())))?;
+    f.write_all(original.as_bytes())
+        .map_err(|e| fail(format!("cannot write {}: {e}", tmp.display())))?;
+    drop(f);
+
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| "vi".into());
     let result = loop {
+        // Invoke the editor without shell re-parsing: `sh -c 'exec "$0" "$@"'`
+        // runs $0 as a plain program argument, so a hostile EDITOR
+        // (`sh -c "…" #`) cannot be smuggled through `sudo -E rfind config
+        // edit` to run arbitrary shell as root.
         let status = std::process::Command::new("sh")
             .arg("-c")
-            .arg(format!("{editor} \"$1\""))
-            .arg("sh")
+            .arg(r#"exec "$0" "$@""#)
+            .arg(&editor)
             .arg(&tmp)
             .status();
         if !status.is_ok_and(|s| s.success()) {
@@ -510,6 +545,15 @@ fn edit_cmd(out: &mut Out, path: &Path, reload: ReloadOpt) -> CmdResult {
         if text == original {
             out.message("No changes.", json!({ "changed": false }));
             break Ok(ExitCode::SUCCESS);
+        }
+        // Every Config field has #[serde(default)], so an empty TOML parses
+        // as a valid default — an editor crash / `> file` typo / out-of-space
+        // would silently wipe the admin's roots and excludes. Refuse.
+        if text.trim().is_empty() && !original.trim().is_empty() {
+            break Err(fail(format!(
+                "editor returned an empty file; refusing to replace {} with defaults",
+                path.display()
+            )));
         }
         match edit::check_text(path, &text) {
             Ok(warnings) => {
@@ -531,6 +575,6 @@ fn edit_cmd(out: &mut Out, path: &Path, reload: ReloadOpt) -> CmdResult {
             }
         }
     };
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_dir_all(&dir);
     result
 }

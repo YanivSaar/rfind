@@ -164,8 +164,8 @@ impl FanotifyMonitor {
         let overflow = Arc::new(AtomicBool::new(false));
         let handle = {
             let (s, o, st) = (Arc::clone(&stop), Arc::clone(&overflow), Arc::clone(&state));
-            let scope = Scope { roots, excludes };
-            thread::spawn(move || event_loop(&st, &scope, &sink, &s, &o))
+            let scope = Arc::new(Scope { roots, excludes });
+            thread::spawn(move || event_loop(&st, scope, &sink, &s, &o))
         };
 
         Ok(Self {
@@ -323,13 +323,19 @@ fn resolve(rec: &[u8], marked: &RwLock<Vec<MarkedFs>>) -> Option<PathBuf> {
     let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
     match name {
         b"" | b"." => Some(dir),
-        _ => Some(dir.join(std::ffi::OsStr::new(std::str::from_utf8(name).ok()?))),
+        // Linux allows arbitrary bytes (except NUL and /) in filenames, so
+        // we must NOT drop events with non-UTF-8 names. Build the Path from
+        // raw bytes via OsStrExt instead of str::from_utf8.
+        _ => {
+            use std::os::unix::ffi::OsStrExt;
+            Some(dir.join(std::ffi::OsStr::from_bytes(name)))
+        }
     }
 }
 
 fn event_loop(
     state: &FanState,
-    scope: &Scope,
+    scope: Arc<Scope>,
     sink: &EventSink,
     stop: &AtomicBool,
     overflow: &AtomicBool,
@@ -338,6 +344,20 @@ fn event_loop(
     let mut buf = vec![0u8; BUF];
     let meta_len = mem::size_of::<fanotify_event_metadata>();
     let lossy = |p: &Path| p.to_string_lossy().to_string();
+
+    // Background walker: moved_in otherwise blocks the event drain while
+    // read_dir()-ing a potentially huge new subtree, long enough for
+    // FAN_Q_OVERFLOW to fire. Offload the walk here.
+    let (walk_tx, walk_rx) = std::sync::mpsc::channel::<(PathBuf, bool)>();
+    let walker = {
+        let sc = Arc::clone(&scope);
+        let sk = sink.clone();
+        thread::spawn(move || {
+            while let Ok((path, is_dir)) = walk_rx.recv() {
+                moved_in(&sk, &sc, &path, is_dir);
+            }
+        })
+    };
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -407,7 +427,9 @@ fn event_loop(
                         Some(lossy(new.as_ref().unwrap())),
                         is_dir,
                     ),
-                    (false, true) => moved_in(sink, scope, new.as_ref().unwrap(), is_dir),
+                    (false, true) => {
+                        let _ = walk_tx.send((new.unwrap(), is_dir));
+                    }
                     (true, false) => sink.send(
                         EventType::Delete,
                         lossy(old.as_ref().unwrap()),
@@ -423,7 +445,7 @@ fn event_loop(
             }
             let path = path.unwrap();
             if meta.mask & FAN_MOVED_TO != 0 {
-                moved_in(sink, scope, &path, is_dir);
+                let _ = walk_tx.send((path, is_dir));
             } else if meta.mask & (FAN_DELETE | FAN_MOVED_FROM) != 0 {
                 sink.send(EventType::Delete, lossy(&path), None, is_dir);
             } else if meta.mask & FAN_CREATE != 0 {
@@ -433,6 +455,8 @@ fn event_loop(
             }
         }
     }
+    drop(walk_tx);
+    let _ = walker.join();
 }
 
 /// An entry appeared by moving: journal it and, for a directory, its

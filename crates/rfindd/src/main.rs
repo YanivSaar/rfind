@@ -165,7 +165,9 @@ fn on_mount_change(
     monitor: Option<&Monitor>,
     changes: &mountwatch::MountChanges,
     queue: &mut VecDeque<PathBuf>,
+    in_flight: Option<&PathBuf>,
 ) {
+    let in_flight_match = |p: &PathBuf| in_flight == Some(p);
     let aliases: Vec<PathBuf> = mounts::alias_mounts(&changes.table)
         .into_iter()
         .map(|(a, _)| a)
@@ -208,10 +210,11 @@ fn on_mount_change(
                 ),
             }
         }
-        if !queue.contains(&m.point) {
+        if !queue.contains(&m.point) && !in_flight_match(&m.point) {
             queue.push_back(m.point.clone());
         }
     }
+    let periodic = periodic_paths(&ctx.cfg);
     for m in changes
         .removed
         .iter()
@@ -219,6 +222,7 @@ fn on_mount_change(
     {
         if !ctx.cfg.scan.roots.iter().any(|r| m.point.starts_with(r))
             || index::is_excluded(&ctx.cfg, &m.point)
+            || periodic.iter().any(|p| m.point.starts_with(p))
         {
             continue;
         }
@@ -226,7 +230,7 @@ fn on_mount_change(
             "Unmounted {}: rescanning the mount point",
             m.point.display()
         );
-        if !queue.contains(&m.point) {
+        if !queue.contains(&m.point) && !in_flight_match(&m.point) {
             queue.push_back(m.point.clone());
         }
     }
@@ -431,9 +435,13 @@ fn main() {
     };
 
     // ── Scan or fast-restart, then reconcile ─────────────────────────────────
+    // Clear the force-reindex flag AFTER the scan, mirroring the steady-state
+    // loop below: a SIGUSR1 arriving during this initial scan is coalesced
+    // into it instead of triggering an immediate second full scan.
     let ready = if needs_full_scan {
+        let ok = scan::live_reindex(&ctx);
         force_reindex.store(false, Ordering::Relaxed);
-        scan::live_reindex(&ctx)
+        ok
     } else {
         scan::reconcile_and_mark_ready(&ctx, false);
         true
@@ -445,7 +453,8 @@ fn main() {
     // ── Steady state loop ────────────────────────────────────────────────────
     // Background jobs: periodic roots and new/removed mounts, one at a time.
     let mut queue: VecDeque<PathBuf> = VecDeque::new();
-    let mut bg: Option<thread::JoinHandle<()>> = None;
+    // (path currently being scanned in the background, join handle)
+    let mut bg: Option<(PathBuf, thread::JoinHandle<()>)> = None;
     let mut mount_watch = mountwatch::MountWatch::new(&mount_table);
     let mut last_tick = Instant::now();
     let mut tick = 0u64;
@@ -464,7 +473,7 @@ fn main() {
                     continue;
                 }
             }
-            if let Some(h) = bg.take() {
+            if let Some((_, h)) = bg.take() {
                 let _ = h.join(); // cancelled: returns promptly
             }
             if let Some(m) = monitor {
@@ -529,14 +538,15 @@ fn main() {
         // Filesystems mounted / unmounted under live roots.
         if ctx.cfg.monitor.watch_new_mounts {
             if let Some(changes) = mount_watch.poll(&mount_table) {
-                on_mount_change(&ctx, monitor.as_ref(), &changes, &mut queue);
+                let in_flight = bg.as_ref().map(|(p, _)| p);
+                on_mount_change(&ctx, monitor.as_ref(), &changes, &mut queue, in_flight);
                 mount_table = changes.table;
             }
         }
 
         // Background jobs, one at a time, so live events keep being applied
         // while a slow drive is walked.
-        if bg.as_ref().is_some_and(|h| h.is_finished()) {
+        if bg.as_ref().is_some_and(|(_, h)| h.is_finished()) {
             bg = None;
         }
         if bg.is_none() {
@@ -545,10 +555,12 @@ fn main() {
             }
             if let Some(root) = queue.pop_front() {
                 let ctx = ctx.clone();
-                bg = Some(thread::spawn(move || {
-                    info!("Background scan of {}", root.display());
-                    scan::scan_root(&ctx, &root, false);
-                }));
+                let root_clone = root.clone();
+                let handle = thread::spawn(move || {
+                    info!("Background scan of {}", root_clone.display());
+                    scan::scan_root(&ctx, &root_clone, false);
+                });
+                bg = Some((root, handle));
             }
         }
 

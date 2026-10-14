@@ -614,6 +614,7 @@ dependencies = [
  "libc",
  "rusqlite",
  "tempfile",
+ "tracing",
  "zstd",
 ]
 

@@ -20,7 +20,11 @@
 //! rebuilt by a full scan rather than migrated.
 
 use rusqlite::{params, Connection, OptionalExtension, Result};
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 const SCHEMA_VERSION: i64 = 6;
 
@@ -465,14 +469,36 @@ fn locate(conn: &Connection, path: &str) -> Result<Option<(i64, i64)>> {
     Ok(find_name(conn, name)?.map(|nid| (did, nid)))
 }
 
+/// Count of live-event deletions since the last incremental GC. Garbage
+/// collection is deferred until this crosses GC_THRESHOLD so inotify /
+/// fanotify event floods don't pay for a full-table anti-join per event,
+/// but a long-running daemon still eventually reclaims orphan `names` and
+/// `dirs` rows.
+static DELETES_SINCE_GC: AtomicU64 = AtomicU64::new(0);
+const GC_THRESHOLD: u64 = 1000;
+
+fn maybe_gc(conn: &Connection, deletes: usize) -> Result<()> {
+    if deletes == 0 {
+        return Ok(());
+    }
+    let prev = DELETES_SINCE_GC.fetch_add(deletes as u64, Ordering::Relaxed);
+    if prev + deletes as u64 >= GC_THRESHOLD {
+        DELETES_SINCE_GC.store(0, Ordering::Relaxed);
+        collect_garbage(conn)?;
+    }
+    Ok(())
+}
+
 pub fn delete_entry_by_path(conn: &Connection, path: &str) -> Result<usize> {
-    match locate(conn, path)? {
+    let n = match locate(conn, path)? {
         Some((did, nid)) => conn.execute(
             "DELETE FROM entries WHERE dir_id = ?1 AND name_id = ?2",
             params![did, nid],
-        ),
-        None => Ok(0),
-    }
+        )?,
+        None => 0,
+    };
+    maybe_gc(conn, n)?;
+    Ok(n)
 }
 
 /// Delete `path` itself and everything beneath it.
@@ -494,6 +520,7 @@ pub fn delete_entries_under(conn: &Connection, path: &str) -> Result<usize> {
             params![sub],
         )?;
     }
+    maybe_gc(conn, n)?;
     Ok(n)
 }
 
@@ -536,6 +563,8 @@ pub fn rename_entry(conn: &Connection, old: &str, new: &str) -> Result<usize> {
             |r| r.get::<_, i64>(0),
         )? as usize;
     }
+    // A rename can orphan the old (dir, name) pair; count it toward GC.
+    maybe_gc(conn, 1)?;
     Ok(moved)
 }
 
@@ -618,11 +647,20 @@ pub fn sweep_stale(conn: &Connection, root: &str, keep: &[String], scan_gen: i64
 /// Delete entries that are not under any of `roots` (after roots were
 /// removed from the config), then drop rows left unused.
 pub fn delete_outside_roots(conn: &Connection, roots: &[String]) -> Result<usize> {
+    // Safety: an empty root list would make the recursive CTE produce an
+    // empty `sub`, so `DELETE ... WHERE dir_id NOT IN sub` would wipe the
+    // entire index. Refuse rather than silently truncate.
+    if roots.is_empty() {
+        return Ok(0);
+    }
     let mut ids = Vec::new();
     for r in roots {
         if let Some(d) = find_dir(conn, r)? {
             ids.push(d);
         }
+    }
+    if ids.is_empty() {
+        return Ok(0);
     }
     let n = conn.execute(
         &format!(
@@ -775,6 +813,13 @@ fn stream_hits(
     check: RowCheck,
     on_result: &mut dyn FnMut(&Hit) -> bool,
 ) -> Result<u64> {
+    // Pin a read snapshot for the whole call: without this, every inner
+    // `paths.full` auto-commits and reads from a fresh snapshot, so a
+    // concurrent rename/delete of a dir in the parent chain can turn into
+    // a `QueryReturnedNoRows` error or stitch two snapshots into a bogus
+    // path. The transaction is read-only; it rolls back on drop.
+    let tx = conn.unchecked_transaction()?;
+    let conn: &Connection = &tx;
     let limit_val = limit.unwrap_or(usize::MAX);
     let mut paths = PathCache::default();
     let mut stmt = conn.prepare_cached(sql)?;
@@ -1489,21 +1534,32 @@ pub fn get_stats(conn: &Connection, db_path: &Path) -> Result<IndexStats> {
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
 
-    // Top 10 extensions by count.
-    let mut ext_stmt = conn.prepare(
-        "SELECT LOWER(SUBSTR(n.name, INSTR(n.name, '.') + 1)) AS ext, COUNT(*) AS cnt
-         FROM entries e JOIN names n ON n.id = e.name_id
-         WHERE e.is_dir = 0 AND INSTR(n.name, '.') > 0
-         GROUP BY ext ORDER BY cnt DESC LIMIT 10",
+    // Top 10 extensions by count. Compute the extension in Rust so we can
+    // use the LAST dot: SQLite has no REVERSE, and `INSTR` finds the FIRST
+    // dot, which would wrongly bucket `foo.tar.gz` under `tar.gz`. Leading
+    // dots (`.bashrc`) and trailing dots give no extension.
+    let mut name_stmt = conn.prepare(
+        "SELECT n.name, COUNT(*) FROM entries e JOIN names n ON n.id = e.name_id
+         WHERE e.is_dir = 0 GROUP BY n.name",
     )?;
-    let top_extensions: Vec<ExtStat> = ext_stmt
-        .query_map([], |r| {
-            Ok(ExtStat {
-                ext: r.get(0)?,
-                count: r.get(1)?,
-            })
-        })?
-        .flatten()
+    let mut ext_counts: HashMap<String, i64> = HashMap::new();
+    let mut name_rows = name_stmt.query([])?;
+    while let Some(r) = name_rows.next()? {
+        let name: String = r.get(0)?;
+        let count: i64 = r.get(1)?;
+        if let Some(dot) = name.rfind('.') {
+            if dot > 0 && dot + 1 < name.len() {
+                let ext = name[dot + 1..].to_ascii_lowercase();
+                *ext_counts.entry(ext).or_insert(0) += count;
+            }
+        }
+    }
+    let mut top: Vec<(String, i64)> = ext_counts.into_iter().collect();
+    top.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    top.truncate(10);
+    let top_extensions: Vec<ExtStat> = top
+        .into_iter()
+        .map(|(ext, count)| ExtStat { ext, count })
         .collect();
 
     // Top 10 largest directories by direct child count.

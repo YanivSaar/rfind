@@ -170,8 +170,10 @@ pub fn scan_root(ctx: &Ctx, root: &Path, report: bool) -> ScanResult {
         Err(e) => error!("sweep {}: {e}", root.display()),
     }
     let _ = db::set_metadata(&c, &root_scan_key(root), &now_secs().to_string());
-    if !report {
-        // Background scans end without reconcile_and_mark_ready.
+    if !report && !ctx.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        // Background scans end without reconcile_and_mark_ready. Skip
+        // compact on cancel: it holds the DB mutex and would otherwise
+        // make `systemctl reload`/`stop` block for seconds on a big DB.
         if let Err(e) = db::compact(&c) {
             warn!("compacting the index: {e}");
         }

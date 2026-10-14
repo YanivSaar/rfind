@@ -251,8 +251,13 @@ unsafe extern "C" fn z_write(
 }
 
 unsafe extern "C" fn z_truncate(file: *mut ffi::sqlite3_file, size: i64) -> c_int {
-    store(file).truncate(size as u64);
-    ffi::SQLITE_OK
+    match store(file).truncate(size as u64) {
+        Ok(()) => ffi::SQLITE_OK,
+        Err(e) => {
+            tracing::error!("zvfs: truncate failed: {e}");
+            ffi::SQLITE_IOERR_TRUNCATE
+        }
+    }
 }
 
 unsafe extern "C" fn z_sync(file: *mut ffi::sqlite3_file, _flags: c_int) -> c_int {
@@ -296,7 +301,14 @@ unsafe extern "C" fn z_shm_lock(
         && flags & ffi::SQLITE_SHM_LOCK != 0
         && flags & ffi::SQLITE_SHM_SHARED != 0
     {
-        let _ = store(file).refresh();
+        // A failed refresh means our in-memory page map is stale; serving
+        // reads from it would produce zero / short pages and SQLite would
+        // report "database disk image is malformed." Surface the I/O
+        // error instead so the client sees an honest failure.
+        if let Err(e) = store(file).refresh() {
+            tracing::error!("zvfs: shm refresh failed: {e}");
+            return ffi::SQLITE_IOERR;
+        }
     }
     rc
 }

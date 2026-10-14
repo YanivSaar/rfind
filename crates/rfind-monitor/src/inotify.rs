@@ -254,6 +254,21 @@ fn event_loop(
     let mut moves: HashMap<u32, PendingMove> = HashMap::new();
     let hdr = mem::size_of::<InotifyEvent>();
 
+    // Background walker: when a directory is created or moved into the
+    // watched tree, draining the subtree inline would hold the kernel
+    // event drain long enough that a large `mv` can overflow IN_Q.
+    // Offload the walk here instead.
+    let (walk_tx, walk_rx) = std::sync::mpsc::channel::<PathBuf>();
+    let walker = {
+        let w = Arc::clone(&watches);
+        let s = sink.clone();
+        thread::spawn(move || {
+            while let Ok(root) = walk_rx.recv() {
+                watch_new_tree(&w, &s, &root);
+            }
+        })
+    };
+
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -316,9 +331,14 @@ fn event_loop(
             if ev.mask & IN_CREATE != 0 {
                 sink.send(EventType::Create, lossy(&full_path), None, is_dir);
                 if is_dir {
-                    watch_new_tree(&watches, &sink, &full_path);
+                    let _ = walk_tx.send(full_path.clone());
                 }
-            } else if ev.mask & (IN_DELETE | IN_DELETE_SELF) != 0 {
+            } else if ev.mask & IN_DELETE_SELF != 0 {
+                // IN_DELETE on the parent is authoritative for this entry;
+                // IN_DELETE_SELF is just a cue to drop our watch. Forget
+                // the wd now so stray post-delete events are ignored.
+                watches.forget(ev.wd);
+            } else if ev.mask & IN_DELETE != 0 {
                 sink.send(EventType::Delete, lossy(&full_path), None, is_dir);
             } else if ev.mask & IN_MOVED_FROM != 0 {
                 moves.insert(
@@ -344,7 +364,7 @@ fn event_loop(
                     // Moved in from outside the watched tree.
                     sink.send(EventType::Create, lossy(&full_path), None, is_dir);
                     if is_dir {
-                        watch_new_tree(&watches, &sink, &full_path);
+                        let _ = walk_tx.send(full_path.clone());
                     }
                 }
             } else if ev.mask & IN_CLOSE_WRITE != 0 {
@@ -354,6 +374,10 @@ fn event_loop(
 
         expire_moves(&watches, &sink, &mut moves);
     }
+    // Dropping walk_tx closes the channel; the walker drains any
+    // outstanding roots and then exits.
+    drop(walk_tx);
+    let _ = walker.join();
 }
 
 /// MOVED_FROM with no MOVED_TO in time: the entry left the watched tree.

@@ -376,9 +376,15 @@ impl Store {
     }
 
     /// Drop pages beyond `size` bytes.
-    pub fn truncate(&mut self, size: u64) {
+    ///
+    /// This must publish a durable snapshot immediately: without one, a
+    /// crash between the in-memory shrink and the next `sync()` would let
+    /// `replay_tail` resurrect the pages we just dropped from the appended
+    /// records. Writing the snapshot now (and fsyncing) commits the
+    /// truncation to disk.
+    pub fn truncate(&mut self, size: u64) -> io::Result<()> {
         if self.page_size == 0 {
-            return;
+            return Ok(());
         }
         let pages = size.div_ceil(self.page_size as u64) as usize;
         if pages < self.map.len() {
@@ -386,7 +392,15 @@ impl Store {
             self.recount_live();
             self.dirty = true;
             self.truncated = true;
+            if !self.readonly {
+                self.write_snapshot()?;
+                if let Some(f) = &self.data {
+                    f.sync_data()?;
+                }
+                self.truncated = false;
+            }
         }
+        Ok(())
     }
 
     /// Make appended records durable; publish a snapshot or compact when
@@ -613,7 +627,7 @@ mod tests {
         for p in 1..=10 {
             w.write_page(p, &page(p as u8, 1024)).unwrap();
         }
-        w.truncate(4 * 1024);
+        w.truncate(4 * 1024).unwrap();
         w.sync().unwrap(); // publishes a snapshot: replay must not resurrect pages
         assert_eq!(Store::open(&base, true).unwrap().size(), 4 * 1024);
     }

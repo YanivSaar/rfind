@@ -8,7 +8,7 @@
 //!   indexes paths whose exclude was removed);
 //! - a periodic root is rescanned if an exclude inside it was removed.
 
-use crate::scan::{periodic_paths, root_scan_key};
+use crate::scan::root_scan_key;
 use rfind_config::Config;
 use rfind_core::db;
 use rusqlite::Connection;
@@ -19,23 +19,41 @@ use tracing::info;
 const KEY: &str = "config_state";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct PeriodicState {
+    path: PathBuf,
+    interval_hours: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct State {
     roots: Vec<PathBuf>,
-    periodic: Vec<PathBuf>,
+    // Full (path, interval_hours) so changing an interval alone is also
+    // recorded; new intervals take effect from the next scheduling pass.
+    #[serde(default)]
+    periodic: Vec<PeriodicState>,
     exclude: Vec<PathBuf>,
     collect_mtime: bool,
 }
 
 impl State {
     fn of(cfg: &Config) -> Self {
+        let mut periodic: Vec<PeriodicState> = cfg
+            .scan
+            .periodic_roots
+            .iter()
+            .map(|r| PeriodicState {
+                path: r.path.clone(),
+                interval_hours: r.interval_hours,
+            })
+            .collect();
+        periodic.sort_by(|a, b| a.path.cmp(&b.path));
         let mut s = Self {
             roots: cfg.scan.roots.clone(),
-            periodic: periodic_paths(cfg),
+            periodic,
             exclude: cfg.scan.exclude.clone(),
             collect_mtime: cfg.scan.collect_mtime,
         };
         s.roots.sort();
-        s.periodic.sort();
         s.exclude.sort();
         s
     }
@@ -70,7 +88,7 @@ pub fn apply(conn: &Connection, cfg: &Config) -> Changes {
     let all_roots: Vec<String> = now
         .roots
         .iter()
-        .chain(&now.periodic)
+        .chain(now.periodic.iter().map(|p| &p.path))
         .map(|p| p.to_string_lossy().to_string())
         .collect();
     let mut purged = db::delete_outside_roots(conn, &all_roots).unwrap_or(0);
@@ -83,16 +101,22 @@ pub fn apply(conn: &Connection, cfg: &Config) -> Changes {
         .iter()
         .filter(|e| !now.exclude.contains(e))
         .collect();
-    let rescan_live = prev.roots != now.roots
+    // Compare roots+excludes+collect_mtime, but ignore interval changes:
+    // a new interval doesn't need an immediate rescan, just reschedules.
+    let roots_or_exclude_changed = prev.roots != now.roots
         || prev.exclude != now.exclude
         || prev.collect_mtime != now.collect_mtime;
+    let rescan_live = roots_or_exclude_changed;
     // Periodic roots: rescan if collection settings changed or something
     // inside them is no longer excluded. New periodic roots are scanned
     // anyway (they have no last-scan time).
-    for p in &now.periodic {
+    let prev_periodic_paths: std::collections::HashSet<&PathBuf> =
+        prev.periodic.iter().map(|p| &p.path).collect();
+    for pp in &now.periodic {
+        let p = &pp.path;
         let changed = prev.collect_mtime != now.collect_mtime
             || removed_excludes.iter().any(|e| e.starts_with(p));
-        if changed && prev.periodic.contains(p) {
+        if changed && prev_periodic_paths.contains(p) {
             let _ = db::set_metadata(conn, &root_scan_key(p), "0");
             info!(
                 "Config change: periodic root {} will be rescanned",
