@@ -544,12 +544,47 @@ fn search_largest(
     filter: &db::Filter,
 ) -> CmdResult {
     let want = a.top.unwrap_or(20);
+    // --type d switches to directory ranking: subtree size (du-style),
+    // not the always-zero size field on dir rows.
+    if filter.is_dir == Some(true) {
+        return search_largest_dirs(out, conn, a, kind, filter, want);
+    }
     let matches_everything = matches!(kind, PatternKind::None);
     // With no pattern we can let SQL do the LIMIT. With a pattern we
     // stream unbounded and stop after `want` matches.
     let sql_limit = if matches_everything { Some(want) } else { None };
     let mut matched = 0u64;
     db::largest_files_streaming(conn, a.under.as_deref(), filter, sql_limit, |h| {
+        if !kind.matches(h.path) {
+            return true;
+        }
+        matched += 1;
+        let keep = out.hit(h);
+        keep && (matched as usize) < want
+    })
+    .map_err(|e| fail(format!("search error: {e}")))?;
+    out.count(matched);
+    found(matched)
+}
+
+fn search_largest_dirs(
+    out: &mut Out,
+    conn: &rusqlite::Connection,
+    a: &SearchArgs,
+    kind: &PatternKind,
+    filter: &db::Filter,
+    want: usize,
+) -> CmdResult {
+    // When a pattern is given we rank first (cheap), then take the top
+    // `want` matches by walking the ranked list.
+    let matches_everything = matches!(kind, PatternKind::None);
+    let sql_limit = if matches_everything {
+        Some(want)
+    } else {
+        None
+    };
+    let mut matched = 0u64;
+    db::largest_dirs_streaming(conn, a.under.as_deref(), filter, sql_limit, |h| {
         if !kind.matches(h.path) {
             return true;
         }

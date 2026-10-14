@@ -21,7 +21,7 @@
 
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -1379,6 +1379,140 @@ pub fn dir_usage(conn: &Connection, path: &str) -> Result<Usage> {
 /// The `limit` largest direct children of `path`; see [`usage`].
 pub fn usage_breakdown(conn: &Connection, path: &str, limit: usize) -> Result<Vec<Usage>> {
     usage(conn, path, limit).map(|(_, c)| c)
+}
+
+/// Directories ranked by the total size of their subtree (sum of every
+/// file beneath them, recursive — like `du`), biggest first.
+///
+/// One pass over `entries` to get the direct file bytes per directory,
+/// then an in-memory bottom-up rollup on the dir tree. For ~300K
+/// directories this is well under 100 ms. Only `filter.min_size` /
+/// `filter.max_size` apply (they filter on the directory's rolled-up
+/// bytes); `filter.is_dir` is implied by the function.
+pub fn largest_dirs_streaming(
+    conn: &Connection,
+    under: Option<&str>,
+    filter: &Filter,
+    limit: Option<usize>,
+    mut on_result: impl FnMut(&Hit) -> bool,
+) -> Result<u64> {
+    let scope_root = match under {
+        Some(u) => match find_dir(conn, u)? {
+            Some(d) => d,
+            None => return Ok(0),
+        },
+        None => ROOT,
+    };
+
+    // Dirs in the subtree plus their parent id. The SUBTREE CTE emits
+    // every dir reachable from `scope_root`; `scope_root` itself is in
+    // the result so a subtree total is also representable.
+    let mut parent_of: HashMap<i64, i64> = HashMap::new();
+    let mut in_scope: HashSet<i64> = HashSet::new();
+    {
+        let (sql, params): (String, Vec<&dyn rusqlite::ToSql>) = if scope_root == ROOT {
+            ("SELECT id, parent FROM dirs".to_string(), vec![])
+        } else {
+            (
+                format!("{SUBTREE} SELECT d.id, d.parent FROM dirs d WHERE d.id IN sub"),
+                vec![&scope_root],
+            )
+        };
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
+        while let Some(r) = rows.next()? {
+            let id: i64 = r.get(0)?;
+            let parent: Option<i64> = r.get(1)?;
+            in_scope.insert(id);
+            if let Some(p) = parent {
+                parent_of.insert(id, p);
+            }
+        }
+    }
+
+    // Direct file bytes per directory in scope.
+    let mut direct: HashMap<i64, u64> = HashMap::new();
+    {
+        let (sql, params): (String, Vec<&dyn rusqlite::ToSql>) = if scope_root == ROOT {
+            (
+                "SELECT dir_id, SUM(size) FROM entries WHERE is_dir = 0 GROUP BY dir_id"
+                    .to_string(),
+                vec![],
+            )
+        } else {
+            (
+                format!(
+                    "{SUBTREE} SELECT dir_id, SUM(size) FROM entries
+                     WHERE is_dir = 0 AND dir_id IN sub GROUP BY dir_id"
+                ),
+                vec![&scope_root],
+            )
+        };
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
+        while let Some(r) = rows.next()? {
+            let did: i64 = r.get(0)?;
+            let sum: i64 = r.get(1)?;
+            direct.insert(did, sum as u64);
+        }
+    }
+
+    // Bottom-up rollup: for each dir with direct bytes, propagate those
+    // bytes up through every in-scope ancestor. Order-independent, so
+    // the parent map doesn't need a topological pre-sort.
+    let mut cumul: HashMap<i64, u64> =
+        in_scope.iter().map(|&id| (id, 0u64)).collect();
+    for (&id, &bytes) in &direct {
+        if !in_scope.contains(&id) {
+            continue;
+        }
+        let mut cur = id;
+        loop {
+            if let Some(v) = cumul.get_mut(&cur) {
+                *v += bytes;
+            }
+            match parent_of.get(&cur) {
+                Some(&p) if in_scope.contains(&p) => cur = p,
+                _ => break,
+            }
+        }
+    }
+
+    // Rank, size-filter, limit.
+    let mut ranked: Vec<(i64, u64)> = cumul.into_iter().collect();
+    if let Some(min) = filter.min_size {
+        ranked.retain(|(_, s)| *s >= min);
+    }
+    if let Some(max) = filter.max_size {
+        ranked.retain(|(_, s)| *s <= max);
+    }
+    ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let want = limit.unwrap_or(usize::MAX);
+    if ranked.len() > want {
+        ranked.truncate(want);
+    }
+
+    // Resolve and emit.
+    let mut paths = PathCache::default();
+    let mut count = 0u64;
+    for (id, bytes) in ranked {
+        let path = if id == ROOT {
+            "/".to_string()
+        } else {
+            paths.dir(conn, id)?
+        };
+        let hit = Hit {
+            path: &path,
+            is_dir: true,
+            mtime_sec: 0,
+            size: bytes,
+        };
+        if !on_result(&hit) {
+            break;
+        }
+        count += 1;
+    }
+    Ok(count)
 }
 
 /// Largest files (optionally under `under`), biggest first.

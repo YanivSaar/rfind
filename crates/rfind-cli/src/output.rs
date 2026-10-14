@@ -127,16 +127,23 @@ impl Out {
             let v = json!({ "path": h.path, "type": kind(h.is_dir), "size": h.size, "mtime": h.mtime_sec });
             self.line(&v.to_string())
         } else if self.long {
-            let size = if h.is_dir {
+            // Directories don't carry their own size in the index — show
+            // "-" except when a sort fills it in (e.g. --largest --type d
+            // ranks dirs by their subtree size).
+            let size = if h.is_dir && h.size == 0 {
                 "-".to_string()
             } else {
                 human(h.size)
             };
-            self.line(&format!(
-                "{size:>9}  {}  {}",
-                local_time(h.mtime_sec),
-                h.path
-            ))
+            // mtime 0 means "not meaningful here" (e.g. the computed
+            // subtree total has no natural time); print a dash instead
+            // of 1970-01-01.
+            let when = if h.mtime_sec == 0 {
+                "-".to_string()
+            } else {
+                local_time(h.mtime_sec)
+            };
+            self.line(&format!("{size:>9}  {when:<19}  {}", h.path))
         } else {
             self.line(h.path)
         }

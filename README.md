@@ -208,7 +208,7 @@ periodic roots.
 |------|-----------|
 | Install / update | `curl -fsSL https://raw.githubusercontent.com/YanivSaar/rfind/main/scripts/install.sh \| sudo bash` |
 | From a clone | `git clone https://github.com/YanivSaar/rfind.git && cd rfind && sudo ./scripts/install.sh` |
-| Specific release | `curl -fsSL …/install.sh \| sudo RFIND_VERSION=v1.0.0 bash` |
+| Specific release | `curl -fsSL …/install.sh \| sudo RFIND_VERSION=v1.0.1 bash` |
 | Build from source | `curl -fsSL …/install.sh \| sudo RFIND_FROM_SOURCE=1 bash` |
 | Uninstall (keep index) | `sudo rfind uninstall` |
 | Uninstall + purge | `sudo rfind uninstall --purge` |
