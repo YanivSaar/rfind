@@ -1,27 +1,23 @@
-.TH RFIND 1 "2026-10-14" "rfind 0.7.0" "User Commands"
+.TH RFIND 1 "2026-10-14" "rfind 1.0.0" "User Commands"
 .SH NAME
 rfind \- search the filesystem instantly using the rfindd index
 .SH SYNOPSIS
 .B rfind
 .RB [ \-\-json ]
-.B name
-.I PATTERN
+.RI [ PATTERN ]
+.RB [ \-\-regex | \-\-path ]
 .RB [ \-\-under
 .IR DIR ]
-.RB [ \-\-regex ]
-.RI [ FILTERS ]
-.br
-.B rfind
-.RB [ \-\-json ]
-.B path
-.I GLOB
-.RI [ FILTERS ]
-.br
-.B rfind
-.RB [ \-\-json ]
-.B recent
+.RB [ \-\-largest | \-\-recent ]
+.RB [ \-\-top
+.IR N ]
 .RB [ \-\-minutes | \-\-hours | \-\-days
-.IR N " | " \fB\-\-from\fR " " DATE " " \fB\-\-to\fR " " DATE ]
+.IR N
+|
+.B \-\-from
+.I DATE
+.B \-\-to
+.IR DATE ]
 .RI [ FILTERS ]
 .br
 .B rfind
@@ -32,16 +28,7 @@ rfind \- search the filesystem instantly using the rfindd index
 .IR N ]
 .br
 .B rfind
-.RB [ \-\-json ]
-.B largest
-.RB [ \-\-under
-.IR DIR ]
-.RB [ \-\-limit
-.IR N ]
-.RI [ FILTERS ]
-.br
-.B rfind
-.BR status " [" \-\-watch "] | " health " | " stats " | " update " | " reload
+.BR status " [" \-\-watch "] | " stats " | " update " | " reload
 .br
 .B rfind config
 .I SUBCOMMAND
@@ -69,70 +56,70 @@ The index lists every file name on the system, so it is readable by root only:
 searches must be run with
 .BR sudo (8).
 Searching never modifies the index.
-.SH SEARCH COMMANDS
+.SH SEARCH
+.B rfind
+takes an optional pattern plus any mix of selection, scope, sort and
+filter flags. Flag order never matters.
 .TP
-.BI "name " PATTERN
-Match entry names (the last path component).
 .I PATTERN
-is an exact name, a glob where
-.B *
-matches any characters and
+Default: a case-sensitive glob matched against the basename
+.RB ( *
+matches any characters,
 .B ?
-one character, or with
+one character). With
 .B \-\-regex
-a regular expression matched against the name.
-Matching is case-sensitive.
-.RS
-.TP
-.BI \-\-under " DIR"
-Only search inside the tree rooted at
-.IR DIR .
-.TP
-.B \-\-regex
-Treat
-.I PATTERN
-as a regular expression (Rust
+the pattern is a regular expression (Rust
 .B regex
-syntax; anchor with
-.B ^
-and
-.BR $ ).
-.TP
-.BI \-\-limit " N"
-Stop after
-.I N
-results.
-.RE
-.TP
-.BI "path " GLOB
-Match full paths against
-.IR GLOB ;
-here
+syntax); with
+.B \-\-path
+it is a full-path glob (where
 .B *
 also matches
-.BR / .
-A literal leading directory (as in
-.BR /etc/*.conf )
-restricts the search to that tree, which makes it fast.
+.BR / );
+.B \-\-regex \-\-path
+is a regex over the full path. The pattern may be omitted when selecting
+with
+.BR \-\-largest ,
+.BR \-\-recent
+or a time filter alone.
 .TP
-.B recent
-Entries modified in a time window, newest first: the last
-.B \-\-minutes
-.IR N ,
-.B \-\-hours
-.IR N ,
-.B \-\-days
-.IR N ,
-or the local-time date range
+.BI \-\-under " DIR"
+Only match entries inside the tree rooted at
+.IR DIR .
+.TP
+.B \-\-largest
+Sort results by size, biggest first. Combined with a pattern, returns the
+biggest matches.
+.TP
+.B \-\-recent
+Sort by modification time, newest first. Implied by any time filter below.
+.TP
+.BI \-\-top " N"
+Keep the N best (or first) results.
+.B \-\-limit
+.I N
+is a synonym.
+.TP
+.BR \-\-minutes " | " \-\-hours " | " \-\-days " " N
+Only entries modified in the last
+.I N
+minutes/hours/days.
+.TP
 .B \-\-from
 .I YYYY-MM-DD
 .B \-\-to
 .I YYYY-MM-DD
-(inclusive).
-Default: the last 24 hours, at most 50 results
-.RB ( \-\-limit ).
+Date range in local time, inclusive.
+.PP
+Legacy subcommands
+.RB ( "rfind name" " PATTERN,"
+.B rfind path
+.IR GLOB ,
+.BR "rfind recent" ,
+.BR "rfind largest" )
+remain as aliases over the same logic for scripts and muscle memory.
 .TP
-.BI "size " "\fR[\fPDIR\fR]\fP"
+.BI "rfind size " "\fR[\fPDIR\fR]\fP"
 Disk usage of a directory tree (default
 .BR / ),
 computed from the indexed file sizes without touching the disk: the total
@@ -144,21 +131,7 @@ bytes, files and directories, and the
 .B du
 is an alias.
 Sizes are apparent sizes (file length), not allocated blocks.
-.TP
-.B largest
-The biggest files, largest first, optionally
-.B \-\-under
-.IR DIR ;
-.B \-\-limit
-.I N
-(default 20).
 .SS Filters
-Accepted by
-.BR name ,
-.BR path ,
-.B recent
-and
-.BR largest :
 .TP
 .BR \-\-type " " f | d
 Only files or only directories.
@@ -192,16 +165,18 @@ is accepted.
 .SH DAEMON COMMANDS
 .TP
 .B status
-Scan phase and progress of
-.BR rfindd ;
-.B \-\-watch
-refreshes every second until it is ready.
-.TP
-.B health
-Whether the index is current
+Unified daemon and index state: whether rfindd is running, the current
+phase, index freshness
 .RB ( LIVE
-when monitored), when the last full scan ran, entry counts, total indexed
-bytes, monitoring mode, and database size.
+when monitored, otherwise
+.BR FRESH / RECENT / STALE
+by last-scan age), entry counts, total indexed bytes, monitoring mode,
+pending events, database size, and any periodic or new-mount scan in
+flight on the background thread.
+.B \-\-watch
+refreshes every second until the daemon reports Ready.
+.B health
+is a backward-compatible alias.
 .TP
 .B stats
 Entry counts, the most common file extensions, and the directories with the
@@ -378,32 +353,38 @@ Daemon status read by
 .BR "rfind status" .
 .SH EXAMPLES
 .TP
-.B sudo rfind name passwd
+.B sudo rfind passwd
 Every entry named exactly
 .BR passwd .
 .TP
-.B sudo rfind name '*.conf' \-\-under /etc
+.B sudo rfind '*.conf' \-\-under /etc
 Config files under /etc.
 .TP
-.B sudo rfind name '^lib.*\e.so\e.[0-9]+$' \-\-regex
+.B sudo rfind '^lib.*\e.so\e.[0-9]+$' \-\-regex
 Versioned shared libraries.
 .TP
-.B sudo rfind path '/home/*/.ssh/*'
+.B sudo rfind '/home/*/.ssh/*' \-\-path
 Everything in users' .ssh directories.
 .TP
-.B sudo rfind recent \-\-hours 2 \-\-type f \-l
+.B sudo rfind \-\-recent \-\-hours 2 \-\-type f \-l
 Files changed in the last two hours, with size and time.
 .TP
-.B sudo rfind name '*.iso' \-\-larger\-than 1G
+.B sudo rfind '*.py' \-\-largest \-\-top 20
+Twenty biggest Python files on the system.
+.TP
+.B sudo rfind '*.iso' \-\-larger\-than 1G
 Disk images of 1 GiB or more.
+.TP
+.B sudo rfind '*.log' \-\-recent \-\-hours 6 \-\-under /var \-\-top 10 \-l
+Composition: ten most-recent /var logs from the last six hours, long form.
 .TP
 .B sudo rfind size /home \-\-top 10
 Which home directories use the most space.
 .TP
-.B sudo rfind largest \-\-under /var \-\-limit 10
+.B sudo rfind \-\-largest \-\-under /var \-\-top 10
 The ten biggest files under /var.
 .TP
-.B sudo rfind name '*.log' \-\-json | jq \-r 'select(.size > 1e8) | .path'
+.B sudo rfind '*.log' \-\-json | jq \-r 'select(.size > 1e8) | .path'
 Logs over 100 MB, via jq.
 .TP
 .B sudo rfind config exclude add /home/moshe

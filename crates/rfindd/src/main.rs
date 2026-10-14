@@ -48,7 +48,7 @@ mod progress;
 mod scan;
 
 use rfind_config::{load as load_config, write_default, Config, DEFAULT_CONFIG_PATH};
-use rfind_core::{db, mounts, ScanProgress};
+use rfind_core::{db, mounts, BackgroundScan, ScanProgress};
 use rfind_monitor::Monitor;
 use scan::{now_secs, periodic_paths, Ctx};
 use signal_hook::{
@@ -265,6 +265,23 @@ fn on_mount_change(
             queue.push_back(m.point.clone());
         }
     }
+}
+
+/// Overlay the current background-scan state onto a Ready-phase progress
+/// write. The daemon's status file is otherwise only touched during live
+/// scans and reconcile; keeping it current here lets `rfind status` tell
+/// the user that a periodic/mount scan is in flight.
+fn publish_bg_scan(conn: &Mutex<rusqlite::Connection>, mode: &str, bg: Option<BackgroundScan>) {
+    let (entries, pending) = {
+        let c = conn.lock().unwrap();
+        (
+            db::entry_count(&c).unwrap_or(0) as u64,
+            db::pending_event_count(&c).unwrap_or(0) as u64,
+        )
+    };
+    let mut p = progress::status(rfind_core::DaemonPhase::Ready, entries, pending, 0, mode);
+    p.background_scan = bg;
+    progress::write(&p);
 }
 
 fn main() {
@@ -591,9 +608,11 @@ fn main() {
         }
 
         // Background jobs, one at a time, so live events keep being applied
-        // while a slow drive is walked.
+        // while a slow drive is walked. Each start/finish updates the
+        // progress file so `rfind status` can show the running scan.
         if bg.as_ref().is_some_and(|(_, h)| h.is_finished()) {
             bg = None;
+            publish_bg_scan(&conn, &ctx.mode, None);
         }
         if bg.is_none() {
             if queue.is_empty() {
@@ -602,6 +621,15 @@ fn main() {
             if let Some(root) = queue.pop_front() {
                 let ctx = ctx.clone();
                 let root_clone = root.clone();
+                publish_bg_scan(
+                    &conn,
+                    &ctx.mode,
+                    Some(BackgroundScan {
+                        path: root_clone.display().to_string(),
+                        entries: 0,
+                        started_at: now_secs() as u64,
+                    }),
+                );
                 let handle = thread::spawn(move || {
                     info!("Background scan of {}", root_clone.display());
                     scan::scan_root(&ctx, &root_clone, false);

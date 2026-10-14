@@ -15,7 +15,7 @@
 # format changed, rfindd rebuilds the index automatically.
 #
 # Environment:
-#   RFIND_VERSION      release to install, e.g. v0.7.0 (default: latest)
+#   RFIND_VERSION      release to install, e.g. v1.0.0 (default: latest)
 #   RFIND_FROM_SOURCE  1 = always build from source
 #   RFIND_REPO         git URL to clone for source builds
 #   RFIND_REF          branch or tag to build from source (default: main)
@@ -72,7 +72,7 @@ if [ $UNINSTALL -eq 1 ]; then
     fi
     rm -f "$BIN_DIR/rfindd" "$SHARE"/man/man1/rfind.1 "$SHARE"/man/man5/rfind.conf.5 "$SHARE"/man/man8/rfindd.8 \
           "$SHARE"/bash-completion/completions/rfind "$SHARE"/zsh/site-functions/_rfind \
-          "$SHARE"/fish/vendor_completions.d/rfind.fish
+          "$SHARE"/fish/vendor_completions.d/rfind.fish /etc/bash_completion.d/rfind
     [ $PURGE -eq 1 ] && rm -rf /var/lib/rfindd /etc/rfindd /run/rfindd
     ok "removed"
     exit 0
@@ -176,7 +176,21 @@ install -d "$SHARE/bash-completion/completions" "$SHARE/zsh/site-functions" "$SH
 "$BIN_DIR/rfind" completions bash > "$SHARE/bash-completion/completions/rfind"
 "$BIN_DIR/rfind" completions zsh  > "$SHARE/zsh/site-functions/_rfind"
 "$BIN_DIR/rfind" completions fish > "$SHARE/fish/vendor_completions.d/rfind.fish"
+# bash-completion's dynamic loader looks under XDG_DATA_DIRS, which on
+# most distros includes $PREFIX/share. On minimal setups (containers,
+# plain Debian without the bash-completion package initialised in the
+# shell rc) it may not — so drop a second copy at /etc/bash_completion.d,
+# which plain `. /etc/bash_completion` setups read directly.
+if [ -d /etc/bash_completion.d ]; then
+    install -m 644 "$SHARE/bash-completion/completions/rfind" /etc/bash_completion.d/rfind
+fi
 ok "shell completions: bash, zsh, fish"
+if ! [ -r /usr/share/bash-completion/bash_completion ] \
+   && ! [ -r /etc/bash_completion ]; then
+    warn "bash-completion package not detected; for tab-complete, install it:"
+    warn "    apt install bash-completion    # or dnf/zypper/pacman"
+    warn "then start a new shell."
+fi
 
 # First install on WSL2: Windows drives get periodic rescans, not live
 # monitoring (the kernel sees no events for changes made from Windows).

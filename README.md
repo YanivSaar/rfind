@@ -208,7 +208,7 @@ periodic roots.
 |------|-----------|
 | Install / update | `curl -fsSL https://raw.githubusercontent.com/YanivSaar/rfind/main/scripts/install.sh \| sudo bash` |
 | From a clone | `git clone https://github.com/YanivSaar/rfind.git && cd rfind && sudo ./scripts/install.sh` |
-| Specific release | `curl -fsSL …/install.sh \| sudo RFIND_VERSION=v0.7.0 bash` |
+| Specific release | `curl -fsSL …/install.sh \| sudo RFIND_VERSION=v1.0.0 bash` |
 | Build from source | `curl -fsSL …/install.sh \| sudo RFIND_FROM_SOURCE=1 bash` |
 | Uninstall (keep index) | `sudo rfind uninstall` |
 | Uninstall + purge | `sudo rfind uninstall --purge` |
@@ -222,23 +222,14 @@ changed, rfindd rebuilds the index on its own.
 ### Search immediately after install
 
 ```bash
-# Find a file by exact name
-rfind name passwd
-
-# Find all config files
-rfind name "*.conf"
-
-# Find configs under /etc only
-rfind name "*.conf" --under /etc
-
-# Find only directories named "cache"
-rfind name cache --type d
-
-# Find recently modified files (last hour)
-rfind recent --hours 1
-
-# Full path glob
-rfind path "/usr/lib/python*/*.py"
+# Everything is one composable command — pattern + where + sort + top:
+rfind passwd                                  # exact or glob name
+rfind "*.conf" --under /etc                   # glob, restricted to a tree
+rfind "*.py" --larger-than 10M --largest --top 20   # top 20 biggest .py
+rfind "*.log" --recent --hours 1 -l           # recent .log files, long
+rfind "/home/*/.ssh/*" --path                 # full-path glob
+rfind "^lib.*\.so\.[0-9]+$" --regex           # regex (basename)
+rfind --largest --under /var --top 10         # pure sort, no pattern
 ```
 
 ---
@@ -282,30 +273,39 @@ Every command has `--help`, and `man rfind` documents all of them.
 
 ### Search commands
 
+A single composable form: `rfind [PATTERN] [--regex|--path] [--under DIR]
+[--largest|--recent] [--top N] [--since-flags] [--type f|d] [--larger-than
+SIZE] [--smaller-than SIZE] [-l]`. Any combination is valid, and flag
+order never matters. The legacy subcommands (`rfind name`, `path`,
+`recent`, `largest`) still work — they're thin aliases over the same
+logic — so existing scripts don't break.
+
 ```bash
-# By filename
-rfind name passwd                    # exact match (case-sensitive)
-rfind name "*.log"                   # glob: all .log files
-rfind name "app.???.js"              # glob: ? matches one character
-rfind name "*.py" --under /home      # scoped to directory tree
-rfind name "*.conf" --type f         # files only
-rfind name logs --type d             # directories only
-rfind name "*.log" --limit 10        # stop after 10 results
-rfind name "^app\." --regex          # regular expression
+# By pattern (default: glob on basename)
+rfind passwd                         # exact match
+rfind "*.log"                        # glob: all .log files
+rfind "app.???.js"                   # glob: ? matches one character
+rfind "*.py" --under /home           # scoped to a subtree
+rfind "*.conf" --type f              # files only
+rfind logs --type d                  # directories only
+rfind "*.log" --top 10               # stop after 10 (synonym: --limit)
+rfind "^app\." --regex               # regex, matched against basename
+rfind "/etc/nginx*" --path           # full-path glob (`*` matches `/`)
+rfind "^/home/.*/\.ssh/.*" --regex --path   # regex over full path
 
-# By path
-rfind path "/etc/nginx*"             # full path glob
-rfind path "/home/*/.*"              # dotfiles in home dirs
+# By time (any time flag implies --recent order, newest first)
+rfind --recent                       # last 24 hours (default window)
+rfind --minutes 30                   # last 30 minutes
+rfind --from 2026-10-01 --to 2026-10-13   # date range (local time)
+rfind "*.log" --hours 2 -l           # combine: time + pattern + long
 
-# By modification time
-rfind recent                         # last 24 hours (default)
-rfind recent --minutes 30            # last 30 minutes
-rfind recent --from 2026-10-01 --to 2026-10-13   # date range (local time)
+# By size (combine with --largest for sorted top-N)
+rfind "*.iso" --larger-than 1G
+rfind "*.py" --larger-than 10M --largest --top 20
+rfind --largest --under /var --top 10   # biggest files in a tree
 
-# By size (any search; K/M/G/T are powers of 1024)
-rfind name "*.iso" --larger-than 1G
-rfind name "*.log" --under /var --smaller-than 1K
-rfind recent --hours 2 -l            # -l / --long: size and time per result
+# All of the above compose freely:
+rfind "*.log" --under /var --recent --hours 6 --larger-than 100K --top 5
 ```
 
 ### Disk usage — from the index, no disk walk
@@ -313,7 +313,7 @@ rfind recent --hours 2 -l            # -l / --long: size and time per result
 ```bash
 rfind size /home                     # total + 20 largest children (like du -d1)
 rfind size / --top 5
-rfind largest --under /var --limit 10
+rfind --largest --under /var --top 10   # biggest individual files
 ```
 
 Directory sizes are summed from the indexed file sizes at query time;
@@ -322,10 +322,10 @@ nothing extra is stored per directory.
 ### Scripting
 
 ```bash
-rfind name "*.log" --json            # one JSON object per result (JSON Lines)
+rfind "*.log" --json                 # one JSON object per result (JSON Lines)
 # {"path":"/var/log/syslog","type":"file","size":81234,"mtime":1791900000}
-rfind --json health                  # single objects for status/health/stats/config
-rfind name "*.log" --json | jq -r 'select(.size > 1e8) | .path'
+rfind --json status                  # single object for status/stats/config
+rfind "*.log" --json | jq -r 'select(.size > 1e8) | .path'
 ```
 
 Exit status: `0` results found, `1` no results, `2` error.
@@ -355,9 +355,13 @@ Add `--no-reload` to only write the file; `rfind reload` applies it later.
 ### Daemon commands
 
 ```bash
-rfind status                         # current state snapshot
+rfind status                         # unified daemon + index state:
+                                     #   phase, freshness (LIVE/FRESH/STALE),
+                                     #   entries, monitoring mode, pending
+                                     #   events, DB size, and any background
+                                     #   periodic/mount scan in flight
 rfind status --watch                 # live refresh until Ready
-rfind health                         # LIVE/FRESH/STALE, entries, bytes, DB size
+rfind health                         # alias of `status` (kept for scripts)
 rfind stats                          # top file types, largest directories
 rfind update                         # rescan now (SIGUSR1)
 rfind reload                         # re-read the config (SIGHUP)

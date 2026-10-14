@@ -61,6 +61,30 @@ pub fn human(b: u64) -> String {
     format!("{v:.1}{}", UNITS[u])
 }
 
+/// Live-monitored means fanotify or inotify is watching for changes;
+/// the index is current no matter how long ago the last full scan was.
+fn is_live(h: &HealthInfo) -> bool {
+    matches!(h.monitoring_mode.as_str(), "fanotify" | "inotify")
+}
+
+/// Human label for the index freshness (shared by text + JSON output).
+fn index_status(h: &HealthInfo, pid: Option<i32>, live: bool) -> String {
+    if pid.is_none() {
+        return "DAEMON STOPPED".into();
+    }
+    if h.pending_events > 0 {
+        return format!("UPDATING ({} events pending)", h.pending_events);
+    }
+    let now = chrono::Utc::now().timestamp();
+    match h.last_scan_completed {
+        None => "NO INDEX".into(),
+        Some(_) if live => "LIVE".into(),
+        Some(t) if now - t < 3600 => "FRESH".into(),
+        Some(t) if now - t < 86400 => "RECENT".into(),
+        _ => "STALE".into(),
+    }
+}
+
 pub fn format_bytes(b: u64) -> String {
     const PB: u64 = 1 << 50;
     const EB: u64 = 1 << 60;
@@ -200,86 +224,119 @@ impl Out {
         }
     }
 
-    pub fn progress(&mut self, p: &ScanProgress) {
+    /// Unified status: daemon state (from the progress file) plus index
+    /// health (from the DB) plus any background scan in flight.
+    ///
+    /// Any of the inputs may be missing — the daemon may be down, the DB
+    /// may be unreadable, no pidfile. Each section is rendered when its
+    /// data is there, so a partial view still tells the user what the
+    /// daemon is actually doing right now.
+    pub fn status(
+        &mut self,
+        progress: Option<&ScanProgress>,
+        health: Option<&HealthInfo>,
+        pid: Option<i32>,
+        now: i64,
+    ) {
         if self.json {
-            self.object(&serde_json::to_value(p).unwrap_or_default());
+            let v = serde_json::json!({
+                "daemon_pid": pid,
+                "scan": progress.map(|p| serde_json::to_value(p).unwrap_or_default()),
+                "index": health.map(|h| {
+                    let age = h.last_scan_completed.map(|t| now - t);
+                    serde_json::json!({
+                        "status": index_status(h, pid, is_live(h)),
+                        "entries": h.entry_count,
+                        "directories": h.dir_count,
+                        "files": h.file_count,
+                        "monitoring": h.monitoring_mode,
+                        "events_pending": h.pending_events,
+                        "db_size_bytes": h.db_size_bytes,
+                        "indexed_bytes": h.total_bytes,
+                        "last_full_scan": h.last_scan_completed,
+                        "last_scan_age_secs": age,
+                    })
+                }),
+                "background_scan": progress.and_then(|p| p.background_scan.as_ref().map(|b| {
+                    serde_json::json!({
+                        "path": b.path,
+                        "entries": b.entries,
+                        "started_at": b.started_at,
+                        "elapsed_secs": now.saturating_sub(b.started_at as i64),
+                    })
+                })),
+            });
+            self.object(&v);
             return;
         }
-        let phase = match &p.phase {
-            DaemonPhase::Scanning => "SCANNING",
-            DaemonPhase::Reconciling => "RECONCILING",
-            DaemonPhase::Ready => "READY",
-            DaemonPhase::Error(_) => "ERROR",
-        };
-        let text = format!(
-            "Phase          : {phase}\n\
-             Entries        : {}\n\
-             Dirs done      : {}\n\
-             Dirs pending   : {}\n\
-             Rate           : {:.0} entries/s\n\
-             Errors         : {}\n\
-             Events pending : {}\n\
-             Events applied : {}\n\
-             Monitoring     : {}\n\
-             Status         : {}\n",
-            p.entries_found,
-            p.dirs_completed,
-            p.dirs_pending,
-            p.entries_per_sec,
-            p.errors,
-            p.events_pending,
-            p.events_applied,
-            p.monitoring_mode,
-            p.status_line,
-        );
-        self.text_or_json(&text, &Value::Null);
-    }
 
-    pub fn health(&mut self, h: &HealthInfo, now: i64, pid: Option<i32>) {
-        let live = matches!(h.monitoring_mode.as_str(), "fanotify" | "inotify");
-        let status = if pid.is_none() {
-            "DAEMON STOPPED".to_string()
-        } else if h.pending_events > 0 {
-            format!("UPDATING ({} events pending)", h.pending_events)
-        } else {
-            match h.last_scan_completed {
-                None => "NO INDEX".into(),
-                // Monitored: current regardless of scan age.
-                Some(_) if live => "LIVE".into(),
-                Some(t) if now - t < 3600 => "FRESH".into(),
-                Some(t) if now - t < 86400 => "RECENT".into(),
-                _ => "STALE".into(),
-            }
-        };
-        let data = json!({
-            "status": status, "daemon_pid": pid,
-            "last_full_scan": h.last_scan_completed,
-            "entries": h.entry_count, "directories": h.dir_count, "files": h.file_count,
-            "monitoring": h.monitoring_mode, "events_pending": h.pending_events,
-            "db_size_bytes": h.db_size_bytes, "indexed_bytes": h.total_bytes,
-        });
-        let age = h
-            .last_scan_completed
-            .map(|t| format!("{} ago", format_duration(now - t)))
-            .unwrap_or_else(|| "never".into());
-        let text = format!(
-            "Status         : {status}\n\
-             Last full scan : {age}\n\
-             Entries        : {}\n\
-             Directories    : {}\n\
-             Files          : {} ({})\n\
-             Monitoring     : {}\n\
-             Events pending : {}\n\
-             DB size        : {}\n",
-            h.entry_count,
-            h.dir_count,
-            h.file_count,
-            format_bytes(h.total_bytes),
-            h.monitoring_mode,
-            h.pending_events,
-            format_bytes(h.db_size_bytes),
+        let mut text = String::new();
+        // Daemon pid line is always first — it's the "is anyone home" line.
+        text += &format!(
+            "Daemon         : {}\n",
+            pid.map(|p| format!("running (pid {p})"))
+                .unwrap_or_else(|| "STOPPED".into())
         );
-        self.text_or_json(&text, &data);
+        if let Some(p) = progress {
+            let phase = match &p.phase {
+                DaemonPhase::Scanning => "SCANNING",
+                DaemonPhase::Reconciling => "RECONCILING",
+                DaemonPhase::Ready => "READY",
+                DaemonPhase::Error(_) => "ERROR",
+            };
+            text += &format!("Phase          : {phase}\n");
+            if p.phase != DaemonPhase::Ready {
+                text += &format!(
+                    "Dirs done      : {}\n\
+                     Dirs pending   : {}\n\
+                     Rate           : {:.0} entries/s\n\
+                     Errors         : {}\n",
+                    p.dirs_completed, p.dirs_pending, p.entries_per_sec, p.errors
+                );
+            }
+        }
+        if let Some(h) = health {
+            let live = is_live(h);
+            let status = index_status(h, pid, live);
+            let age = h
+                .last_scan_completed
+                .map(|t| format!("{} ago", format_duration(now - t)))
+                .unwrap_or_else(|| "never".into());
+            text += &format!(
+                "Status         : {status}\n\
+                 Last full scan : {age}\n\
+                 Entries        : {}\n\
+                 Directories    : {}\n\
+                 Files          : {} ({})\n\
+                 Monitoring     : {}\n\
+                 Events pending : {}\n\
+                 DB size        : {}\n",
+                h.entry_count,
+                h.dir_count,
+                h.file_count,
+                format_bytes(h.total_bytes),
+                h.monitoring_mode,
+                h.pending_events,
+                format_bytes(h.db_size_bytes),
+            );
+        } else if let Some(p) = progress {
+            // No DB readable yet, but the progress file is: show what we have.
+            text += &format!(
+                "Monitoring     : {}\n\
+                 Status         : {}\n",
+                p.monitoring_mode, p.status_line
+            );
+        }
+        if let Some(bg) = progress.and_then(|p| p.background_scan.as_ref()) {
+            let elapsed = now.saturating_sub(bg.started_at as i64).max(0);
+            text += &format!(
+                "Background scan: {} (running {}, {} entries)\n",
+                bg.path,
+                format_duration(elapsed),
+                bg.entries,
+            );
+        }
+        self.text_or_json(&text, &Value::Null);
     }
 
     pub fn stats(&mut self, s: &IndexStats) {

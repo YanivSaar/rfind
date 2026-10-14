@@ -531,6 +531,7 @@ pub fn run_scan(config: ScanConfig) -> ScanResult {
             events_pending: 0,
             events_applied: 0,
             monitoring_mode: String::new(),
+            background_scan: None,
         });
 
         if done {

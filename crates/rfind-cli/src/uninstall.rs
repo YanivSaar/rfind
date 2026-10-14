@@ -36,6 +36,7 @@ fn installed_files(prefix: &Path) -> Vec<PathBuf> {
         share.join("bash-completion/completions/rfind"),
         share.join("zsh/site-functions/_rfind"),
         share.join("fish/vendor_completions.d/rfind.fish"),
+        PathBuf::from("/etc/bash_completion.d/rfind"),
     ]
 }
 

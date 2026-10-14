@@ -539,12 +539,13 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rfind-cli"
-version = "0.7.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "clap",
  "clap_complete",
  "libc",
+ "regex-lite",
  "rfind-config",
  "rfind-core",
  "rusqlite",
@@ -554,7 +555,7 @@ dependencies = [
 
 [[package]]
 name = "rfind-config"
-version = "0.7.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "thiserror",
@@ -564,7 +565,7 @@ dependencies = [
 
 [[package]]
 name = "rfind-core"
-version = "0.7.0"
+version = "1.0.0"
 dependencies = [
  "regex-lite",
  "rfind-zvfs",
@@ -576,7 +577,7 @@ dependencies = [
 
 [[package]]
 name = "rfind-integration-tests"
-version = "0.7.0"
+version = "1.0.0"
 dependencies = [
  "rfind-config",
  "rfind-core",
@@ -585,7 +586,7 @@ dependencies = [
 
 [[package]]
 name = "rfind-monitor"
-version = "0.7.0"
+version = "1.0.0"
 dependencies = [
  "libc",
  "rfind-core",
@@ -596,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "rfind-scanner"
-version = "0.7.0"
+version = "1.0.0"
 dependencies = [
  "io-uring",
  "libc",
@@ -608,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "rfind-zvfs"
-version = "0.7.0"
+version = "1.0.0"
 dependencies = [
  "crc32fast",
  "libc",
@@ -620,7 +621,7 @@ dependencies = [
 
 [[package]]
 name = "rfindd"
-version = "0.7.0"
+version = "1.0.0"
 dependencies = [
  "libc",
  "num_cpus",

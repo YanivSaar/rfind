@@ -51,5 +51,6 @@ pub fn status(
         events_pending: pending,
         events_applied: applied,
         monitoring_mode: mode.to_string(),
+        background_scan: None,
     }
 }

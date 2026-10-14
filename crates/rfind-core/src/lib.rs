@@ -25,6 +25,20 @@ pub struct ScanProgress {
     pub events_pending: u64,
     pub events_applied: u64,
     pub monitoring_mode: String,
+    /// A periodic or new-mount scan running on a background thread while
+    /// the daemon is otherwise Ready. None when nothing is in flight.
+    /// `#[serde(default)]` keeps older progress files readable after an
+    /// in-place upgrade — the daemon may still be running an old binary
+    /// that wrote the file without this field.
+    #[serde(default)]
+    pub background_scan: Option<BackgroundScan>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackgroundScan {
+    pub path: String,
+    pub entries: u64,
+    pub started_at: u64,
 }
 
 impl ScanProgress {
@@ -45,6 +59,7 @@ impl ScanProgress {
             events_pending: 0,
             events_applied: 0,
             monitoring_mode: "unknown".to_string(),
+            background_scan: None,
         }
     }
 }

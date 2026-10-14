@@ -1,6 +1,6 @@
 [package]
 name = "rfind-cli"
-version = "0.7.0"
+version = "1.0.0"
 edition = "2021"
 
 [[bin]]
@@ -17,3 +17,4 @@ rusqlite     = { version = "0.32", features = ["bundled"] }
 chrono       = { version = "0.4", default-features = false, features = ["std", "clock"] }
 clap_complete = "4"
 serde = { version = "1.0.229", features = ["derive"] }
+regex-lite = "0.1"

@@ -207,6 +207,9 @@ pub fn open_readonly(path: &Path) -> std::result::Result<Connection, String> {
              rfindd rebuilds it on its next start (sudo systemctl restart rfindd)"
         ));
     }
+    // search_by_regex_streaming uses REGEXP; open_with registers it on the
+    // daemon's connection, read-only openers need it too.
+    register_regexp(&conn).map_err(|e| format!("registering REGEXP: {e}"))?;
     Ok(conn)
 }
 
