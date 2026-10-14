@@ -109,25 +109,25 @@ and kept current via kernel filesystem notifications. No more waiting for
 │  │  scanner     │              └─────────────────────┘  │
 │  └──────────────┘                                       │
 │                                                         │
-│    Scanning ──▶ Reconciling ──▶ Ready                   │
+│    Scanning ──▶ Reconciling ──▶ Ready                  │
 └─────────────────────────────────────────────────────────┘
 ```
 
 ### State Machine
 
 ```
-  ┌─────────────┐     scan      ┌──────────────┐    apply     ┌───────────┐
+  ┌─────────────┐     scan      ┌──────────────┐    apply     ┌────────────┐
   │ INITIALIZING│──────────────▶│   SCANNING   │─────────────▶│RECONCILING│
-  └─────────────┘               │              │   queued     └─────┬─────┘
+  └─────────────┘               │              │   queued     └─────┬──────┘
                                 │ fanotify/    │   events           │
                                 │ inotify      │                    ▼
                                 │ queuing      │              ┌───────────┐
                                 │ events       │              │   READY   │
                                 └──────────────┘              └─────┬─────┘
-                                                                     │
-                                                       live events   │
-                                                       applied every │
-                                                       5 seconds  ◀──┘
+                                                                    │
+                                                      live events   │
+                                                      applied every │
+                                                      5 seconds  ◀──┘
 ```
 
 ---
