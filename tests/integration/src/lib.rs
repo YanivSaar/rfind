@@ -208,14 +208,16 @@ fn entry_count_is_nonzero() {
 
 #[test]
 #[ignore]
-fn all_entries_have_nonempty_name() {
+fn names_are_nonempty_single_components() {
     let conn = open();
     let bad: i64 = conn
-        .query_row("SELECT COUNT(*) FROM entries WHERE name = ''", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT COUNT(*) FROM names WHERE name = '' OR INSTR(name, '/') > 0",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
-    assert_eq!(bad, 0, "{bad} entries have an empty name");
+    assert_eq!(bad, 0, "{bad} names are empty or contain '/'");
 }
 
 #[test]
@@ -237,17 +239,18 @@ fn every_entry_has_a_parent_directory_row() {
 
 #[test]
 #[ignore]
-fn directory_paths_are_normalized() {
+fn every_directory_has_its_parent() {
     let conn = open();
-    let bad: i64 = conn
+    let orphans: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM dirs WHERE path LIKE '%/' OR (path <> '' AND path NOT LIKE '/%')",
+            "SELECT COUNT(*) FROM dirs d LEFT JOIN dirs p ON p.id = d.parent
+             WHERE d.id <> 1 AND p.id IS NULL",
             [],
             |row| row.get(0),
         )
         .unwrap();
     assert_eq!(
-        bad, 0,
-        "{bad} directory paths have a trailing or missing leading '/'"
+        orphans, 0,
+        "{orphans} directories point at a missing parent"
     );
 }

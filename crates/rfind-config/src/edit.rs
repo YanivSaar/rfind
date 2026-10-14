@@ -75,6 +75,11 @@ pub const KEYS: &[(&str, Kind, &str)] = &[
         "entries per scanner write transaction",
     ),
     (
+        "index.compress",
+        Kind::Bool,
+        "store the index zstd-compressed (changing it rebuilds the index)",
+    ),
+    (
         "monitor.prefer_fanotify",
         Kind::Bool,
         "use fanotify (one mark per filesystem) when possible",

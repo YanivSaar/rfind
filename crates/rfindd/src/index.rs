@@ -22,6 +22,9 @@ pub fn flush_batch(conn: &Connection, batch: &mut Vec<EntryInfo>, scan_gen: i64)
             return;
         }
     };
+    // Group entries by directory: scanner threads interleave directories,
+    // and the inserter resolves each directory's names once per run.
+    batch.sort_unstable_by(|a, b| a.path.cmp(&b.path));
     {
         let mut ins = db::Inserter::new(&tx);
         for entry in batch.drain(..) {

@@ -1,42 +1,65 @@
 //! SQLite index: schema, insertion, search, streaming, health, stats,
 //! and event journal.
 //!
-//! # Schema version 4 (normalized)
-//! Each directory path is stored once, in `dirs`; each entry stores only
-//! its name and its parent's `dirs.id`. A file's full path is
-//! `dirs.path || '/' || entries.name`, with the root directory stored as
-//! the empty string so the concatenation needs no special case.
-//! Storing the full path per entry (v3) kept every path twice — in the
-//! table and in its unique index — and cost ~2.5× the space.
+//! # Schema version 6 (compact)
+//! Nothing is stored twice:
+//! - `names`: every distinct file or directory name, once. Looked up by
+//!   an 8-byte hash of the name (indexing the text would store it again).
+//! - `dirs`: the directory tree as (parent, name) pairs. The root is id 1.
+//!   A row exists only for directories that contain indexed entries (or
+//!   lead to them), so paths can be built from it.
+//! - `entries`: (dir_id, name_id) plus metadata, clustered on that key
+//!   (WITHOUT ROWID), so the table is its own unique index.
 //!
-//! `(dir_id, name)` is UNIQUE, so inserts are idempotent upserts. Renaming
-//! a directory rewrites only `dirs` rows; entries beneath it don't move.
+//! A full path is built in Rust from the `dirs` chain ([`PathCache`]).
+//! Renaming a directory updates one `dirs` row; nothing beneath it moves.
+//! Subtrees are found by walking `dirs` children (a recursive CTE), so
+//! paths containing `*?[]` are literal and `/a/b` never matches `/a/bc`.
 //!
 //! The index is a cache of the filesystem: an older schema is dropped and
 //! rebuilt by a full scan rather than migrated.
-//!
-//! # Subtree queries
-//! Subtrees are selected with a half-open range on `dirs.path`
-//! (`p/` <= path < `p0`, since '0' follows '/' in ASCII) rather than GLOB,
-//! so paths containing `*?[]` match literally and `/a/b` never matches
-//! `/a/bc`.
 
 use rusqlite::{params, Connection, OptionalExtension, Result};
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
-/// Full path of an entry `e` joined with its directory `d`.
-const PATH_EXPR: &str = "(d.path || '/' || e.name)";
+/// `dirs.id` of the root directory `/`.
+const ROOT: i64 = 1;
+
+/// Threshold of the partial index `idx_entries_big` (1 MiB).
+const BIG_FILE: u64 = 1 << 20;
 
 // ---------------------------------------------------------------------------
 // Open / schema
 // ---------------------------------------------------------------------------
 
+/// Open (creating if needed) the index for the daemon, compressed with
+/// [`rfind_zvfs`].
 pub fn open(path: &Path) -> Result<Connection> {
-    let conn = Connection::open(path)?;
+    open_with(path, true)
+}
+
+/// Open the index for the daemon. `compress`: store pages zstd-compressed
+/// (about 3× smaller). An index in the other storage format is deleted
+/// first; the daemon then rebuilds it with a full scan.
+pub fn open_with(path: &Path, compress: bool) -> Result<Connection> {
+    let compressed_now = rfind_zvfs::is_compressed(path);
+    let plain_now = std::fs::metadata(path).is_ok_and(|m| m.len() > 0);
+    if (compress && plain_now) || (!compress && compressed_now) {
+        remove_index_files(path);
+    }
+    let conn = if compress {
+        rfind_zvfs::open(path, rusqlite::OpenFlags::default())?
+    } else {
+        Connection::open(path)?
+    };
     conn.execute_batch("PRAGMA journal_mode=WAL;")?;
     conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
+    // Checkpoint every ~40 MB of WAL instead of 4 MB: index pages that bulk
+    // scans rewrite many times are written to the database (and compressed)
+    // once per checkpoint rather than once per small batch.
+    conn.execute_batch("PRAGMA wal_autocheckpoint=10000;")?;
     conn.execute_batch("PRAGMA cache_size=-65536;")?;
     conn.execute_batch("PRAGMA temp_store=MEMORY;")?;
 
@@ -49,39 +72,46 @@ pub fn open(path: &Path) -> Result<Connection> {
             BEGIN;
             DROP TABLE IF EXISTS entries;
             DROP TABLE IF EXISTS dirs;
+            DROP TABLE IF EXISTS names;
             DROP TABLE IF EXISTS pending_events;
             DROP TABLE IF EXISTS scan_metadata;
             COMMIT;
+            VACUUM;
         ",
         )?;
     }
 
     conn.execute_batch(
         "
-        CREATE TABLE IF NOT EXISTS dirs (
+        CREATE TABLE IF NOT EXISTS names (
             id   INTEGER PRIMARY KEY,
-            path TEXT    NOT NULL UNIQUE   -- no trailing '/'; root is ''
+            name TEXT    NOT NULL,
+            hash INTEGER NOT NULL          -- name_hash(name)
         );
+        CREATE INDEX IF NOT EXISTS idx_names_hash ON names (hash);
+
+        CREATE TABLE IF NOT EXISTS dirs (
+            id      INTEGER PRIMARY KEY,
+            parent  INTEGER,               -- NULL only for the root (id 1)
+            name_id INTEGER
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_dirs_parent_name ON dirs (parent, name_id);
+        INSERT OR IGNORE INTO dirs (id, parent, name_id) VALUES (1, NULL, NULL);
 
         CREATE TABLE IF NOT EXISTS entries (
-            id         INTEGER PRIMARY KEY,
             dir_id     INTEGER NOT NULL,   -- dirs.id of the parent directory
-            name       TEXT    NOT NULL,
+            name_id    INTEGER NOT NULL,
             is_dir     INTEGER NOT NULL DEFAULT 0,
             mtime_sec  INTEGER NOT NULL DEFAULT 0,
             mtime_nsec INTEGER NOT NULL DEFAULT 0,
             size       INTEGER NOT NULL DEFAULT 0,  -- bytes; 0 for directories
-            scan_gen   INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_dir_name
-            ON entries (dir_id, name);
-        CREATE INDEX IF NOT EXISTS idx_entries_name
-            ON entries (name);
-        CREATE INDEX IF NOT EXISTS idx_entries_mtime
-            ON entries (mtime_sec);
-        -- Partial: only files of BIG_FILE bytes or more (a few percent of
-        -- entries), so `largest` and large --larger-than filters are index
-        -- walks instead of full scans, at little cost in size.
+            scan_gen   INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (dir_id, name_id)
+        ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS idx_entries_name  ON entries (name_id);
+        CREATE INDEX IF NOT EXISTS idx_entries_mtime ON entries (mtime_sec);
+        -- Partial: only files of 1 MiB+ (a few percent of entries), so
+        -- `largest` and large --larger-than filters are index walks.
         CREATE INDEX IF NOT EXISTS idx_entries_big
             ON entries (size) WHERE size >= 1048576;
 
@@ -107,6 +137,30 @@ pub fn open(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// After bulk writes: checkpoint the WAL and let a compressed store drop
+/// old page versions.
+pub fn compact(conn: &Connection) -> Result<()> {
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    rfind_zvfs::compact(conn)
+}
+
+/// Delete an index in either storage format (database, WAL, shared
+/// memory, compressed store).
+pub fn remove_index_files(path: &Path) {
+    let with = |suffix: &str| std::path::PathBuf::from(format!("{}{suffix}", path.display()));
+    for p in [
+        path.to_path_buf(),
+        with("-wal"),
+        with("-shm"),
+        with("-journal"),
+    ]
+    .into_iter()
+    .chain(rfind_zvfs::store_files(path))
+    {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
 /// Open the index for reading only (rfind). Never creates, migrates or
 /// drops anything: only rfindd owns the schema. An index in another
 /// format (e.g. right after an upgrade, before rfindd has rebuilt it) is
@@ -119,11 +173,16 @@ pub fn open_readonly(path: &Path) -> std::result::Result<Connection, String> {
             path.display()
         ));
     }
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = if rfind_zvfs::is_compressed(path) {
+        rfind_zvfs::open(path, flags)
+    } else {
+        Connection::open_with_flags(path, flags)
+    }
     .map_err(|e| format!("cannot open index {}: {e}", path.display()))?;
+    // Room for the pages one search touches: with a compressed index each
+    // page is then decompressed once per search, not once per visit.
+    let _ = conn.execute_batch("PRAGMA cache_size=-65536;");
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(|e| format!("cannot read index {}: {e}", path.display()))?;
@@ -136,57 +195,190 @@ pub fn open_readonly(path: &Path) -> std::result::Result<Connection, String> {
     Ok(conn)
 }
 
-/// Normalize a directory path to its `dirs.path` form: no trailing '/',
-/// root as ''.
-fn norm_dir(path: &str) -> &str {
-    path.trim_end_matches('/')
+// ---------------------------------------------------------------------------
+// Names, directories and paths
+// ---------------------------------------------------------------------------
+
+/// FNV-1a 64-bit hash of a name, as stored in `names.hash`. Collisions are
+/// harmless: lookups also compare the name.
+fn name_hash(name: &str) -> i64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h as i64
 }
 
-/// Split a full path into (`dirs.path` of its parent, name).
+fn find_name(conn: &Connection, name: &str) -> Result<Option<i64>> {
+    conn.prepare_cached("SELECT id FROM names WHERE hash = ?1 AND name = ?2")?
+        .query_row(params![name_hash(name), name], |r| r.get(0))
+        .optional()
+}
+
+fn name_or_create(conn: &Connection, name: &str) -> Result<i64> {
+    if let Some(id) = find_name(conn, name)? {
+        return Ok(id);
+    }
+    conn.prepare_cached("INSERT INTO names (name, hash) VALUES (?1, ?2)")?
+        .execute(params![name, name_hash(name)])?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn child_dir(conn: &Connection, parent: i64, name_id: i64) -> Result<Option<i64>> {
+    conn.prepare_cached("SELECT id FROM dirs WHERE parent = ?1 AND name_id = ?2")?
+        .query_row(params![parent, name_id], |r| r.get(0))
+        .optional()
+}
+
+/// Path components of a directory path ("/a/b/" → ["a", "b"]).
+fn components(path: &str) -> impl Iterator<Item = &str> {
+    path.split('/').filter(|c| !c.is_empty())
+}
+
+/// `dirs.id` of the directory at `path`, if it has a row.
+fn find_dir(conn: &Connection, path: &str) -> Result<Option<i64>> {
+    let mut id = ROOT;
+    for comp in components(path) {
+        let Some(nid) = find_name(conn, comp)? else {
+            return Ok(None);
+        };
+        match child_dir(conn, id, nid)? {
+            Some(c) => id = c,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(id))
+}
+
+/// Split a full path into (parent directory, name).
 fn split_path(path: &str) -> (&str, &str) {
-    let p = norm_dir(path);
+    let p = path.trim_end_matches('/');
     match p.rfind('/') {
         Some(i) => (&p[..i], &p[i + 1..]),
         None => ("", p),
     }
 }
 
-/// Half-open range [lo, hi) of `dirs.path` values strictly under `dir`.
-fn subtree_range(dir: &str) -> (String, String) {
-    let base = norm_dir(dir);
-    (format!("{base}/"), format!("{base}0"))
+/// Builds full paths from `dirs` ids, remembering every directory it has
+/// resolved. The root is "", so `dir + "/" + name` needs no special case.
+#[derive(Default)]
+pub struct PathCache {
+    dirs: HashMap<i64, String>,
 }
 
-fn dir_id(conn: &Connection, dir: &str) -> Result<Option<i64>> {
-    conn.prepare_cached("SELECT id FROM dirs WHERE path = ?1")?
-        .query_row(params![dir], |r| r.get(0))
-        .optional()
-}
-
-fn dir_id_or_create(conn: &Connection, dir: &str) -> Result<i64> {
-    if let Some(id) = dir_id(conn, dir)? {
-        return Ok(id);
+impl PathCache {
+    pub fn dir(&mut self, conn: &Connection, id: i64) -> Result<String> {
+        if id == ROOT {
+            return Ok(String::new());
+        }
+        if let Some(p) = self.dirs.get(&id) {
+            return Ok(p.clone());
+        }
+        // Walk up to the first cached ancestor, then build back down.
+        let mut chain: Vec<(i64, String)> = Vec::new();
+        let mut cur = id;
+        let base = loop {
+            if cur == ROOT {
+                break String::new();
+            }
+            if let Some(p) = self.dirs.get(&cur) {
+                break p.clone();
+            }
+            let (parent, name): (Option<i64>, String) = conn
+                .prepare_cached(
+                    "SELECT d.parent, n.name FROM dirs d JOIN names n ON n.id = d.name_id
+                     WHERE d.id = ?1",
+                )?
+                .query_row(params![cur], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            chain.push((cur, name));
+            cur = parent.unwrap_or(ROOT);
+        };
+        let mut path = base;
+        for (did, name) in chain.into_iter().rev() {
+            path.push('/');
+            path.push_str(&name);
+            self.dirs.insert(did, path.clone());
+        }
+        Ok(path)
     }
-    conn.prepare_cached("INSERT INTO dirs (path) VALUES (?1)")?
-        .execute(params![dir])?;
-    Ok(conn.last_insert_rowid())
+
+    pub fn full(&mut self, conn: &Connection, dir_id: i64, name: &str) -> Result<String> {
+        let mut p = self.dir(conn, dir_id)?;
+        p.push('/');
+        p.push_str(name);
+        Ok(p)
+    }
 }
+
+/// `WITH RECURSIVE sub(id)`: directory `?1` and every directory below it.
+const SUBTREE: &str =
+    "WITH RECURSIVE sub(id) AS (SELECT ?1 UNION ALL SELECT d.id FROM dirs d JOIN sub ON d.parent = sub.id) ";
 
 // ---------------------------------------------------------------------------
 // Entry operations
 // ---------------------------------------------------------------------------
 
-/// Batch inserter that remembers the last parent directory, so the many
-/// consecutive entries of one directory resolve its id once. Use within a
-/// single transaction (ids can change once directories are deleted).
+/// Batch inserter that remembers directory and name ids, so the many
+/// entries of one directory and the many repeated names resolve once. Use
+/// within a single transaction: ids can change once rows are deleted.
 pub struct Inserter<'c> {
     conn: &'c Connection,
-    last: Option<(String, i64)>,
+    dirs: HashMap<String, i64>,
+    names: HashMap<String, i64>,
+    /// Names already indexed in the current directory, preloaded in one
+    /// ordered read: a rescan then finds almost every name here instead of
+    /// a random hash-index probe per entry.
+    dir_names: Option<(i64, HashMap<String, i64>)>,
 }
+
+/// Names remembered per Inserter (they repeat: index.js, __init__.py, ...).
+const NAME_CACHE: usize = 100_000;
 
 impl<'c> Inserter<'c> {
     pub fn new(conn: &'c Connection) -> Self {
-        Self { conn, last: None }
+        Self {
+            conn,
+            dirs: HashMap::new(),
+            names: HashMap::new(),
+            dir_names: None,
+        }
+    }
+
+    fn name(&mut self, name: &str) -> Result<i64> {
+        if let Some(id) = self.names.get(name) {
+            return Ok(*id);
+        }
+        let id = name_or_create(self.conn, name)?;
+        if self.names.len() < NAME_CACHE {
+            self.names.insert(name.to_string(), id);
+        }
+        Ok(id)
+    }
+
+    /// `dirs.id` of `path`, creating it and missing ancestors.
+    fn dir(&mut self, path: &str) -> Result<i64> {
+        let path = path.trim_end_matches('/');
+        if path.is_empty() {
+            return Ok(ROOT);
+        }
+        if let Some(id) = self.dirs.get(path) {
+            return Ok(*id);
+        }
+        let (parent, name) = split_path(path);
+        let pid = self.dir(parent)?;
+        let nid = self.name(name)?;
+        let id = match child_dir(self.conn, pid, nid)? {
+            Some(id) => id,
+            None => {
+                self.conn
+                    .prepare_cached("INSERT INTO dirs (parent, name_id) VALUES (?1, ?2)")?
+                    .execute(params![pid, nid])?;
+                self.conn.last_insert_rowid()
+            }
+        };
+        self.dirs.insert(path.to_string(), id);
+        Ok(id)
     }
 
     /// Insert or update the entry at `full_path`.
@@ -205,30 +397,39 @@ impl<'c> Inserter<'c> {
     ) -> Result<()> {
         let (dir, name) = split_path(full_path);
         if name.is_empty() {
-            return Ok(());
-        } // the root itself is not an entry
-        let did = match &self.last {
-            Some((d, id)) if d == dir => *id,
-            _ => {
-                let id = dir_id_or_create(self.conn, dir)?;
-                self.last = Some((dir.to_string(), id));
-                id
+            return Ok(()); // the root itself is not an entry
+        }
+        let did = self.dir(dir)?;
+        if self.dir_names.as_ref().is_none_or(|(d, _)| *d != did) {
+            let mut known = HashMap::new();
+            let mut stmt = self.conn.prepare_cached(
+                "SELECT n.name, e.name_id FROM entries e JOIN names n ON n.id = e.name_id
+                 WHERE e.dir_id = ?1",
+            )?;
+            let mut rows = stmt.query(params![did])?;
+            while let Some(r) = rows.next()? {
+                known.insert(r.get(0)?, r.get(1)?);
             }
+            self.dir_names = Some((did, known));
+        }
+        let nid = match self.dir_names.as_ref().and_then(|(_, m)| m.get(name)) {
+            Some(id) => *id,
+            None => self.name(name)?,
         };
         self.conn
             .prepare_cached(
-                "INSERT INTO entries (dir_id, name, is_dir, mtime_sec, mtime_nsec, size, scan_gen)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE(?7, 0))
-             ON CONFLICT(dir_id, name) DO UPDATE SET
-                 is_dir     = excluded.is_dir,
-                 mtime_sec  = excluded.mtime_sec,
-                 mtime_nsec = excluded.mtime_nsec,
-                 size       = excluded.size,
-                 scan_gen   = COALESCE(?7, scan_gen)",
+                "INSERT INTO entries (dir_id, name_id, is_dir, mtime_sec, mtime_nsec, size, scan_gen)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE(?7, 0))
+                 ON CONFLICT(dir_id, name_id) DO UPDATE SET
+                     is_dir     = excluded.is_dir,
+                     mtime_sec  = excluded.mtime_sec,
+                     mtime_nsec = excluded.mtime_nsec,
+                     size       = excluded.size,
+                     scan_gen   = COALESCE(?7, scan_gen)",
             )?
             .execute(params![
                 did,
-                name,
+                nid,
                 is_dir as i32,
                 mtime_sec,
                 mtime_nsec,
@@ -252,29 +453,47 @@ pub fn insert_entry(
     Inserter::new(conn).insert(full_path, is_dir, mtime_sec, mtime_nsec, size, scan_gen)
 }
 
-pub fn delete_entry_by_path(conn: &Connection, path: &str) -> Result<usize> {
+/// (parent dir id, name id) of an indexed path, if both exist.
+fn locate(conn: &Connection, path: &str) -> Result<Option<(i64, i64)>> {
     let (dir, name) = split_path(path);
-    conn.execute(
-        "DELETE FROM entries
-         WHERE dir_id = (SELECT id FROM dirs WHERE path = ?1) AND name = ?2",
-        params![dir, name],
-    )
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let Some(did) = find_dir(conn, dir)? else {
+        return Ok(None);
+    };
+    Ok(find_name(conn, name)?.map(|nid| (did, nid)))
+}
+
+pub fn delete_entry_by_path(conn: &Connection, path: &str) -> Result<usize> {
+    match locate(conn, path)? {
+        Some((did, nid)) => conn.execute(
+            "DELETE FROM entries WHERE dir_id = ?1 AND name_id = ?2",
+            params![did, nid],
+        ),
+        None => Ok(0),
+    }
 }
 
 /// Delete `path` itself and everything beneath it.
 pub fn delete_entries_under(conn: &Connection, path: &str) -> Result<usize> {
-    let p = norm_dir(path);
-    let (lo, hi) = subtree_range(p);
-    let mut n = delete_entry_by_path(conn, p)?;
-    n += conn.execute(
-        "DELETE FROM entries WHERE dir_id IN
-             (SELECT id FROM dirs WHERE path = ?1 OR (path >= ?2 AND path < ?3))",
-        params![p, lo, hi],
+    let Some((did, nid)) = locate(conn, path)? else {
+        return Ok(0);
+    };
+    let mut n = conn.execute(
+        "DELETE FROM entries WHERE dir_id = ?1 AND name_id = ?2",
+        params![did, nid],
     )?;
-    conn.execute(
-        "DELETE FROM dirs WHERE path = ?1 OR (path >= ?2 AND path < ?3)",
-        params![p, lo, hi],
-    )?;
+    if let Some(sub) = child_dir(conn, did, nid)? {
+        n += conn.execute(
+            &format!("{SUBTREE} DELETE FROM entries WHERE dir_id IN sub"),
+            params![sub],
+        )?;
+        conn.execute(
+            &format!("{SUBTREE} DELETE FROM dirs WHERE id IN sub"),
+            params![sub],
+        )?;
+    }
     Ok(n)
 }
 
@@ -282,152 +501,177 @@ pub fn delete_entries_under(conn: &Connection, path: &str) -> Result<usize> {
 /// `new` is replaced, matching rename(2) semantics. Returns the number of
 /// entries moved (0 if `old` was not indexed).
 pub fn rename_entry(conn: &Connection, old: &str, new: &str) -> Result<usize> {
-    let (old, new) = (norm_dir(old), norm_dir(new));
+    let (old, new) = (old.trim_end_matches('/'), new.trim_end_matches('/'));
     if old == new {
         return Ok(0);
     }
-    let (old_dir, old_name) = split_path(old);
-    let (new_dir, new_name) = split_path(new);
-    let Some(old_did) = dir_id(conn, old_dir)? else {
+    let Some((old_did, old_nid)) = locate(conn, old)? else {
         return Ok(0);
     };
-
-    delete_entries_under(conn, new)?;
-    let new_did = dir_id_or_create(conn, new_dir)?;
-    let mut moved = conn.execute(
-        "UPDATE entries SET dir_id = ?1, name = ?2 WHERE dir_id = ?3 AND name = ?4",
-        params![new_did, new_name, old_did, old_name],
-    )?;
-    if moved == 0 {
+    let exists: bool = conn
+        .prepare_cached("SELECT 1 FROM entries WHERE dir_id = ?1 AND name_id = ?2")?
+        .exists(params![old_did, old_nid])?;
+    if !exists {
         return Ok(0);
     }
-
-    // Re-root the directory rows of the subtree; entries follow by id.
-    let (lo, hi) = subtree_range(old);
+    delete_entries_under(conn, new)?;
+    let (new_dir, new_name) = split_path(new);
+    let mut ins = Inserter::new(conn);
+    let new_did = ins.dir(new_dir)?;
+    let new_nid = ins.name(new_name)?;
     conn.execute(
-        "UPDATE dirs SET path = ?1 || SUBSTR(path, LENGTH(?2) + 1)
-         WHERE path = ?2 OR (path >= ?3 AND path < ?4)",
-        params![new, old, lo, hi],
+        "UPDATE entries SET dir_id = ?1, name_id = ?2 WHERE dir_id = ?3 AND name_id = ?4",
+        params![new_did, new_nid, old_did, old_nid],
     )?;
-    let (lo, hi) = subtree_range(new);
-    moved += conn.query_row(
-        "SELECT COUNT(*) FROM entries WHERE dir_id IN
-             (SELECT id FROM dirs WHERE path = ?1 OR (path >= ?2 AND path < ?3))",
-        params![new, lo, hi],
-        |r| r.get::<_, i64>(0),
-    )? as usize;
+    let mut moved = 1;
+    // A directory: re-parent its row; everything beneath follows by id.
+    if let Some(d) = child_dir(conn, old_did, old_nid)? {
+        conn.execute(
+            "UPDATE dirs SET parent = ?1, name_id = ?2 WHERE id = ?3",
+            params![new_did, new_nid, d],
+        )?;
+        moved += conn.query_row(
+            &format!("{SUBTREE} SELECT COUNT(*) FROM entries WHERE dir_id IN sub"),
+            params![d],
+            |r| r.get::<_, i64>(0),
+        )? as usize;
+    }
     Ok(moved)
+}
+
+/// Drop `dirs` rows that no longer hold entries or lead to any, and
+/// names nothing refers to. Run after bulk deletes (sweeps).
+fn collect_garbage(conn: &Connection) -> Result<()> {
+    loop {
+        let n = conn.execute(
+            "DELETE FROM dirs WHERE id <> 1
+               AND id NOT IN (SELECT DISTINCT dir_id FROM entries)
+               AND id NOT IN (SELECT parent FROM dirs WHERE parent IS NOT NULL)",
+            [],
+        )?;
+        if n == 0 {
+            break;
+        }
+    }
+    conn.execute(
+        "DELETE FROM names
+         WHERE id NOT IN (SELECT name_id FROM entries)
+           AND id NOT IN (SELECT name_id FROM dirs WHERE name_id IS NOT NULL)",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Integer list for an SQL `IN (...)`, from typed ids (injection-safe).
+fn id_list(ids: &[i64]) -> String {
+    if ids.is_empty() {
+        // Not NULL: `x NOT IN (NULL)` is never true. No row has id -1.
+        "-1".to_string()
+    } else {
+        ids.iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
 }
 
 /// Delete entries under `root` not seen by scan generation `scan_gen`,
 /// leaving alone any subtree listed in `keep` (nested roots maintained by
-/// their own scans), then drop directory rows left without entries.
+/// their own scans), then drop rows left unused.
 pub fn sweep_stale(conn: &Connection, root: &str, keep: &[String], scan_gen: i64) -> Result<usize> {
-    let root = norm_dir(root);
-    let (lo, hi) = subtree_range(root);
-    let mut sql = "DELETE FROM entries WHERE id IN (
-             SELECT e.id FROM entries e JOIN dirs d ON d.id = e.dir_id
-             WHERE e.scan_gen < ?1
-               AND (d.path = ?2 OR (d.path >= ?3 AND d.path < ?4))"
-        .to_string();
-    let mut args: Vec<String> = vec![root.to_string(), lo, hi];
+    let Some(rid) = find_dir(conn, root)? else {
+        return Ok(0);
+    };
+    let mut keep_dirs = Vec::new();
+    let mut keep_entries = Vec::new();
     for k in keep {
-        let k = norm_dir(k);
-        let (klo, khi) = subtree_range(k);
-        let n = args.len();
-        sql.push_str(&format!(
-            " AND d.path <> ?{a} AND NOT (d.path >= ?{b} AND d.path < ?{c})
-              AND {PATH_EXPR} <> ?{a}",
-            a = n + 2,
-            b = n + 3,
-            c = n + 4,
-        ));
-        args.extend([k.to_string(), klo, khi]);
+        if let Some(d) = find_dir(conn, k)? {
+            keep_dirs.push(d);
+        }
+        if let Some((did, nid)) = locate(conn, k)? {
+            keep_entries.push(format!("({did},{nid})"));
+        }
     }
-    sql.push(')');
-    let mut stmt = conn.prepare(&sql)?;
-    stmt.raw_bind_parameter(1, scan_gen)?;
-    for (i, a) in args.iter().enumerate() {
-        stmt.raw_bind_parameter(i + 2, a)?;
-    }
-    let n = stmt.raw_execute()?;
+    let keep_entries = if keep_entries.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " AND (dir_id, name_id) NOT IN (VALUES {})",
+            keep_entries.join(",")
+        )
+    };
+    let n = conn.execute(
+        &format!(
+            "WITH RECURSIVE sub(id) AS (SELECT ?1 UNION ALL SELECT d.id FROM dirs d
+                 JOIN sub ON d.parent = sub.id WHERE d.id NOT IN ({}))
+             DELETE FROM entries WHERE dir_id IN sub AND scan_gen < ?2{keep_entries}",
+            id_list(&keep_dirs)
+        ),
+        params![rid, scan_gen],
+    )?;
     if n > 0 {
-        conn.execute(
-            "DELETE FROM dirs WHERE NOT EXISTS
-                 (SELECT 1 FROM entries WHERE entries.dir_id = dirs.id)",
-            [],
-        )?;
+        collect_garbage(conn)?;
     }
     Ok(n)
 }
 
 /// Delete entries that are not under any of `roots` (after roots were
-/// removed from the config), then drop emptied directory rows.
+/// removed from the config), then drop rows left unused.
 pub fn delete_outside_roots(conn: &Connection, roots: &[String]) -> Result<usize> {
-    let mut cond = String::from("0");
-    let mut args: Vec<String> = Vec::new();
+    let mut ids = Vec::new();
     for r in roots {
-        let r = norm_dir(r);
-        let (lo, hi) = subtree_range(r);
-        let n = args.len();
-        cond.push_str(&format!(
-            " OR d.path = ?{a} OR (d.path >= ?{b} AND d.path < ?{c})",
-            a = n + 1,
-            b = n + 2,
-            c = n + 3
-        ));
-        args.extend([r.to_string(), lo, hi]);
+        if let Some(d) = find_dir(conn, r)? {
+            ids.push(d);
+        }
     }
-    let sql = format!(
-        "DELETE FROM entries WHERE id IN (
-             SELECT e.id FROM entries e JOIN dirs d ON d.id = e.dir_id WHERE NOT ({cond}))"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    for (i, a) in args.iter().enumerate() {
-        stmt.raw_bind_parameter(i + 1, a)?;
-    }
-    let n = stmt.raw_execute()?;
+    let n = conn.execute(
+        &format!(
+            "WITH RECURSIVE sub(id) AS (SELECT id FROM dirs WHERE id IN ({})
+                 UNION ALL SELECT d.id FROM dirs d JOIN sub ON d.parent = sub.id)
+             DELETE FROM entries WHERE dir_id NOT IN sub",
+            id_list(&ids)
+        ),
+        [],
+    )?;
     if n > 0 {
-        conn.execute(
-            "DELETE FROM dirs WHERE NOT EXISTS
-                 (SELECT 1 FROM entries WHERE entries.dir_id = dirs.id)",
-            [],
-        )?;
+        collect_garbage(conn)?;
     }
     Ok(n)
 }
 
 pub fn entry_exists(conn: &Connection, path: &str) -> Result<bool> {
-    let (dir, name) = split_path(path);
-    let n: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM entries e JOIN dirs d ON d.id = e.dir_id
-         WHERE d.path = ?1 AND e.name = ?2",
-        params![dir, name],
-        |r| r.get(0),
-    )?;
-    Ok(n > 0)
+    match locate(conn, path)? {
+        Some((did, nid)) => conn
+            .prepare_cached("SELECT 1 FROM entries WHERE dir_id = ?1 AND name_id = ?2")?
+            .exists(params![did, nid]),
+        None => Ok(false),
+    }
 }
 
 pub fn entry_count(conn: &Connection) -> Result<i64> {
     conn.query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
 }
 
-/// Full paths of every indexed directory.
+/// Full paths of every indexed directory, sorted.
 pub fn get_all_dirs(conn: &Connection) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {PATH_EXPR} FROM entries e JOIN dirs d ON d.id = e.dir_id
-         WHERE e.is_dir = 1 ORDER BY 1"
-    ))?;
-    let rows = stmt.query_map([], |r| r.get(0))?;
-    rows.collect()
+    let mut stmt = conn.prepare(
+        "SELECT e.dir_id, n.name FROM entries e JOIN names n ON n.id = e.name_id
+         WHERE e.is_dir = 1",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut paths = PathCache::default();
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? {
+        out.push(paths.full(conn, r.get(0)?, r.get_ref(1)?.as_str()?)?);
+    }
+    out.sort();
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
-// Search — streaming via callback to avoid Vec allocation
+// Search — streaming via callback
 // ---------------------------------------------------------------------------
 
-/// Run a path-returning query, streaming each path to `on_result` until
-/// it returns false or `limit` is reached.
 /// One search result.
 #[derive(Debug, Clone, Copy)]
 pub struct Hit<'a> {
@@ -438,81 +682,8 @@ pub struct Hit<'a> {
     pub size: u64,
 }
 
-/// Run a query selecting (path, is_dir, mtime_sec, size), streaming each hit to
-/// `on_result` until it returns false or `limit` is reached.
-fn stream_paths(
-    conn: &Connection,
-    sql: &str,
-    params: &[&dyn rusqlite::ToSql],
-    limit: Option<usize>,
-    on_result: &mut dyn FnMut(&Hit) -> bool,
-) -> Result<u64> {
-    let limit_val = limit.unwrap_or(usize::MAX);
-    let mut count = 0u64;
-    let mut stmt = conn.prepare_cached(sql)?;
-    let mut rows = stmt.query(params)?;
-    while let Some(row) = rows.next()? {
-        if count as usize >= limit_val {
-            break;
-        }
-        let hit = Hit {
-            path: row.get_ref(0)?.as_str()?,
-            is_dir: row.get::<_, i32>(1)? != 0,
-            mtime_sec: row.get(2)?,
-            size: row.get::<_, i64>(3)? as u64,
-        };
-        if !on_result(&hit) {
-            break;
-        }
-        count += 1;
-    }
-    Ok(count)
-}
-
-/// Threshold of the partial index `idx_entries_big` (1 MiB).
-const BIG_FILE: u64 = 1 << 20;
-
-/// `entries e`, forced onto the big-file partial index when the query is
-/// restricted to files of 1 MiB+ (SQLite's planner otherwise prefers
-/// walking the directory range: 2.5 s instead of <1 ms at 10M entries).
-/// Only when the index exists: an index created by a newer rfindd isn't
-/// there until it restarts, and INDEXED BY would fail.
-fn entries_from(conn: &Connection, big_only: bool) -> &'static str {
-    let has_index = || {
-        conn.query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_entries_big'",
-            [],
-            |_| Ok(()),
-        )
-        .is_ok()
-    };
-    if big_only && has_index() {
-        "entries e INDEXED BY idx_entries_big"
-    } else {
-        "entries e"
-    }
-}
-
-impl Filter {
-    /// Only files of at least BIG_FILE bytes match.
-    fn big_only(&self) -> bool {
-        self.min_size.is_some_and(|n| n >= BIG_FILE)
-    }
-}
-
-/// `ORDER BY 1` (by path) — unless a limit is set: sorting means reading
-/// every match before returning the first, so a limited search returns
-/// the first matches found instead.
-fn order_by_path(limit: Option<usize>) -> &'static str {
-    if limit.is_some() {
-        ""
-    } else {
-        " ORDER BY 1"
-    }
-}
-
-/// Columns every search selects (see [`Hit`]).
-const HIT_COLS: &str = "(d.path || '/' || e.name), e.is_dir, e.mtime_sec, e.size";
+/// Columns every search selects: dir_id, name, is_dir, mtime_sec, size.
+const HIT_COLS: &str = "e.dir_id, n.name, e.is_dir, e.mtime_sec, e.size";
 
 /// Result filters shared by all searches.
 #[derive(Debug, Clone, Copy, Default)]
@@ -531,6 +702,11 @@ impl Filter {
             is_dir: Some(false),
             ..Self::default()
         }
+    }
+
+    /// Only files of at least BIG_FILE bytes match.
+    fn big_only(&self) -> bool {
+        self.min_size.is_some_and(|n| n >= BIG_FILE)
     }
 
     /// SQL conditions to append to a WHERE clause. Only integers from typed
@@ -557,9 +733,107 @@ impl Filter {
     }
 }
 
+/// `entries e`, forced onto the big-file partial index when the query is
+/// restricted to files of 1 MiB+ (SQLite's planner otherwise walks
+/// directories: 2.5 s instead of <1 ms at 10M entries). Only when the
+/// index exists, since INDEXED BY fails otherwise.
+fn entries_from(conn: &Connection, big_only: bool) -> &'static str {
+    let has_index = || {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_entries_big'",
+            [],
+            |_| Ok(()),
+        )
+        .is_ok()
+    };
+    if big_only && has_index() {
+        "entries e INDEXED BY idx_entries_big"
+    } else {
+        "entries e"
+    }
+}
+
+/// What a row filter decides beyond SQL (path globs, path regexes).
+type RowCheck<'a> = Option<&'a dyn Fn(&str) -> bool>;
+
+/// Note: name searches use `names n CROSS JOIN entries e` — CROSS JOIN fixes
+/// the order. Left to itself SQLite scans every entry and looks its name up
+/// (9.3 s at 10M entries) instead of filtering names first (0.8 s).
+///
+/// Run a query selecting [`HIT_COLS`], build each path, and stream hits to
+/// `on_result` until it returns false or `limit` is reached.
+///
+/// `sort`: order by path. That means reading every match before returning
+/// the first, so callers sort only when no limit is set; a limited search
+/// returns the first matches found.
+fn stream_hits(
+    conn: &Connection,
+    sql: &str,
+    params: &[&dyn rusqlite::ToSql],
+    limit: Option<usize>,
+    sort: bool,
+    check: RowCheck,
+    on_result: &mut dyn FnMut(&Hit) -> bool,
+) -> Result<u64> {
+    let limit_val = limit.unwrap_or(usize::MAX);
+    let mut paths = PathCache::default();
+    let mut stmt = conn.prepare_cached(sql)?;
+    let mut rows = stmt.query(params)?;
+    let mut collected: Vec<(String, bool, i64, u64)> = Vec::new();
+    let mut count = 0u64;
+    while let Some(row) = rows.next()? {
+        if !sort && count as usize >= limit_val {
+            break;
+        }
+        let path = paths.full(conn, row.get(0)?, row.get_ref(1)?.as_str()?)?;
+        if check.is_some_and(|f| !f(&path)) {
+            continue;
+        }
+        let (is_dir, mtime_sec, size) = (
+            row.get::<_, i32>(2)? != 0,
+            row.get(3)?,
+            row.get::<_, i64>(4)? as u64,
+        );
+        if sort {
+            collected.push((path, is_dir, mtime_sec, size));
+        } else {
+            let hit = Hit {
+                path: &path,
+                is_dir,
+                mtime_sec,
+                size,
+            };
+            if !on_result(&hit) {
+                break;
+            }
+            count += 1;
+        }
+    }
+    if sort {
+        collected.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        for (path, is_dir, mtime_sec, size) in collected.iter().take(limit_val) {
+            let hit = Hit {
+                path,
+                is_dir: *is_dir,
+                mtime_sec: *mtime_sec,
+                size: *size,
+            };
+            if !on_result(&hit) {
+                break;
+            }
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn is_glob(pattern: &str) -> bool {
+    pattern.contains(['*', '?', '['])
+}
+
 /// Call `on_result` for each entry whose name matches `pattern` (exact, or
-/// GLOB when it contains `*` or `?`). Return false from the callback to
-/// stop early (e.g. --limit reached).
+/// GLOB when it contains `*`, `?` or `[`). Return false from the callback
+/// to stop early (e.g. --limit reached).
 pub fn search_by_glob_streaming(
     conn: &Connection,
     pattern: &str,
@@ -567,19 +841,50 @@ pub fn search_by_glob_streaming(
     limit: Option<usize>,
     mut on_result: impl FnMut(&Hit) -> bool,
 ) -> Result<u64> {
-    let op = if pattern.contains('*') || pattern.contains('?') {
-        "GLOB"
+    if !is_glob(pattern) {
+        let Some(nid) = find_name(conn, pattern)? else {
+            return Ok(0);
+        };
+        let sql = format!(
+            "SELECT {HIT_COLS} FROM entries e JOIN names n ON n.id = e.name_id
+             WHERE e.name_id = ?1{}",
+            filter.clause()
+        );
+        return stream_hits(
+            conn,
+            &sql,
+            &[&nid],
+            limit,
+            limit.is_none(),
+            None,
+            &mut on_result,
+        );
+    }
+    let sql = if filter.big_only() {
+        // Few files are this large: walk them, then test the name.
+        format!(
+            "SELECT {HIT_COLS} FROM {} JOIN names n ON n.id = e.name_id
+             WHERE n.name GLOB ?1{}",
+            entries_from(conn, true),
+            filter.clause()
+        )
     } else {
-        "="
+        // Scan the (smaller) names table, then the entries using each name.
+        format!(
+            "SELECT {HIT_COLS} FROM names n CROSS JOIN entries e ON e.name_id = n.id
+             WHERE n.name GLOB ?1{}",
+            filter.clause()
+        )
     };
-    let sql = format!(
-        "SELECT {HIT_COLS} FROM {from} JOIN dirs d ON d.id = e.dir_id
-         WHERE e.name {op} ?1{}{}",
-        filter.clause(),
-        order_by_path(limit),
-        from = entries_from(conn, filter.big_only() && op == "GLOB"),
-    );
-    stream_paths(conn, &sql, &[&pattern], limit, &mut on_result)
+    stream_hits(
+        conn,
+        &sql,
+        &[&pattern],
+        limit,
+        limit.is_none(),
+        None,
+        &mut on_result,
+    )
 }
 
 /// Entries under directory `prefix` whose name matches `name_pattern`
@@ -592,29 +897,61 @@ pub fn search_under_streaming(
     limit: Option<usize>,
     mut on_result: impl FnMut(&Hit) -> bool,
 ) -> Result<u64> {
-    let dir = norm_dir(prefix);
-    let (lo, hi) = subtree_range(dir);
-    let name_pat = name_pattern.unwrap_or("*");
-    let op = if name_pat.contains('*') || name_pat.contains('?') {
-        "GLOB"
-    } else {
-        "="
+    let Some(root) = find_dir(conn, prefix)? else {
+        return Ok(0);
     };
-    let sql = format!(
-        "SELECT {HIT_COLS} FROM {from} JOIN dirs d ON d.id = e.dir_id
-         WHERE (d.path = ?1 OR (d.path >= ?2 AND d.path < ?3))
-           AND e.name {op} ?4{}{}",
-        filter.clause(),
-        order_by_path(limit),
-        from = entries_from(conn, filter.big_only() && op == "GLOB"),
-    );
-    stream_paths(
-        conn,
-        &sql,
-        &[&dir, &lo, &hi, &name_pat],
-        limit,
-        &mut on_result,
-    )
+    let pattern = name_pattern.unwrap_or("*");
+    if root == ROOT {
+        // Everything is under "/": skip materializing the whole tree.
+        return search_by_glob_streaming(conn, pattern, filter, limit, on_result);
+    }
+    let (cond, arg): (&str, Box<dyn rusqlite::ToSql>) = if is_glob(pattern) {
+        if pattern == "*" {
+            ("", Box::new(0))
+        } else {
+            (" AND n.name GLOB ?2", Box::new(pattern.to_string()))
+        }
+    } else {
+        match find_name(conn, pattern)? {
+            Some(nid) => (" AND e.name_id = ?2", Box::new(nid)),
+            None => return Ok(0),
+        }
+    };
+    let sql = if filter.big_only() {
+        format!(
+            "{SUBTREE} SELECT {HIT_COLS} FROM {} JOIN names n ON n.id = e.name_id
+             WHERE e.dir_id IN sub{cond}{}",
+            entries_from(conn, true),
+            filter.clause()
+        )
+    } else {
+        format!(
+            "{SUBTREE} SELECT {HIT_COLS} FROM sub JOIN entries e ON e.dir_id = sub.id
+             JOIN names n ON n.id = e.name_id WHERE 1{cond}{}",
+            filter.clause()
+        )
+    };
+    if cond.is_empty() {
+        stream_hits(
+            conn,
+            &sql,
+            &[&root],
+            limit,
+            limit.is_none(),
+            None,
+            &mut on_result,
+        )
+    } else {
+        stream_hits(
+            conn,
+            &sql,
+            &[&root, &*arg],
+            limit,
+            limit.is_none(),
+            None,
+            &mut on_result,
+        )
+    }
 }
 
 /// Directory part of the literal prefix of a path glob ("/etc/*.conf" →
@@ -626,6 +963,68 @@ fn literal_dir_prefix(pattern: &str) -> &str {
     lit.rfind('/').map_or("", |i| &lit[..i])
 }
 
+/// SQLite GLOB semantics: `*` any run (including '/'), `?` one character,
+/// `[...]` a set with ranges, `[^...]` a negated set. Case-sensitive.
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    let (p, t): (Vec<char>, Vec<char>) = (pattern.chars().collect(), text.chars().collect());
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star, mut mark) = (None::<usize>, 0usize);
+    // Length of the set at p[i] ("[...]"), and whether c matches it.
+    let set = |i: usize, c: char| -> Option<(usize, bool)> {
+        let mut j = i + 1;
+        let negate = p.get(j) == Some(&'^');
+        if negate {
+            j += 1;
+        }
+        let mut matched = false;
+        let mut first = true;
+        while j < p.len() && (p[j] != ']' || first) {
+            if j + 2 < p.len() && p[j + 1] == '-' && p[j + 2] != ']' {
+                matched |= p[j] <= c && c <= p[j + 2];
+                j += 3;
+            } else {
+                matched |= p[j] == c;
+                j += 1;
+            }
+            first = false;
+        }
+        (j < p.len()).then_some((j + 1 - i, matched != negate))
+    };
+    while ti < t.len() {
+        let step = match p.get(pi) {
+            Some('*') => {
+                star = Some(pi);
+                mark = ti;
+                pi += 1;
+                continue;
+            }
+            Some('?') => Some(1),
+            Some('[') => match set(pi, t[ti]) {
+                Some((len, true)) => Some(len),
+                Some((_, false)) => None,
+                None => (t[ti] == '[').then_some(1),
+            },
+            Some(c) => (*c == t[ti]).then_some(1),
+            None => None,
+        };
+        match step {
+            Some(len) => {
+                pi += len;
+                ti += 1;
+            }
+            None => match star {
+                Some(s) => {
+                    pi = s + 1;
+                    mark += 1;
+                    ti = mark;
+                }
+                None => return false,
+            },
+        }
+    }
+    p[pi..].iter().all(|c| *c == '*')
+}
+
 /// Entries whose full path matches the GLOB `pattern`.
 pub fn search_by_path_glob_streaming(
     conn: &Connection,
@@ -634,59 +1033,92 @@ pub fn search_by_path_glob_streaming(
     limit: Option<usize>,
     mut on_result: impl FnMut(&Hit) -> bool,
 ) -> Result<u64> {
-    let dir = literal_dir_prefix(pattern);
-    let (lo, hi) = subtree_range(dir);
+    let Some(root) = find_dir(conn, literal_dir_prefix(pattern))? else {
+        return Ok(0);
+    };
     let sql = format!(
-        "SELECT {HIT_COLS} FROM {from} JOIN dirs d ON d.id = e.dir_id
-         WHERE (d.path = ?2 OR (d.path >= ?3 AND d.path < ?4))
-           AND {PATH_EXPR} GLOB ?1{}{}",
-        filter.clause(),
-        order_by_path(limit),
-        from = entries_from(conn, filter.big_only()),
+        "{SUBTREE} SELECT {HIT_COLS} FROM sub JOIN entries e ON e.dir_id = sub.id
+         JOIN names n ON n.id = e.name_id WHERE 1{}",
+        filter.clause()
     );
-    stream_paths(
+    let check = |path: &str| glob_match(pattern, path);
+    stream_hits(
         conn,
         &sql,
-        &[&pattern, &dir, &lo, &hi],
+        &[&root],
         limit,
+        limit.is_none(),
+        Some(&check),
         &mut on_result,
     )
 }
 
-/// Regex search using SQLite REGEXP (user-defined function registered here),
-/// optionally restricted to the subtree under directory `under`.
+/// Regex search, matched against names (`field` "basename") or full paths
+/// ("full_path"), optionally restricted to the subtree under `under`.
 pub fn search_by_regex_streaming(
     conn: &Connection,
     pattern: &str,
-    field: &str, // "basename" or "full_path"
+    field: &str,
     under: Option<&str>,
     filter: &Filter,
     limit: Option<usize>,
     mut on_result: impl FnMut(&Hit) -> bool,
 ) -> Result<u64> {
-    register_regexp(conn)?;
-    let target = if field == "full_path" {
-        PATH_EXPR
-    } else {
-        "e.name"
+    let re = regex_lite::Regex::new(pattern)
+        .map_err(|e| rusqlite::Error::UserFunctionError(e.into()))?;
+    let root = match under {
+        Some(u) => match find_dir(conn, u)? {
+            Some(d) => Some(d),
+            None => return Ok(0),
+        },
+        None => None,
     };
-    let dir = under.map(norm_dir).unwrap_or("");
-    let (lo, hi) = subtree_range(dir);
-    let sql = format!(
-        "SELECT {HIT_COLS} FROM {from} JOIN dirs d ON d.id = e.dir_id
-         WHERE (d.path = ?2 OR (d.path >= ?3 AND d.path < ?4))
-           AND {target} REGEXP ?1{}{}",
-        filter.clause(),
-        order_by_path(limit),
-        from = entries_from(conn, filter.big_only()),
-    );
-    stream_paths(
-        conn,
-        &sql,
-        &[&pattern, &dir, &lo, &hi],
-        limit,
-        &mut on_result,
-    )
+    let by_path = field == "full_path";
+    let check = |path: &str| re.is_match(path);
+    let check: RowCheck = if by_path { Some(&check) } else { None };
+    let sql = match (root, by_path) {
+        // Names: test each distinct name once, in SQL.
+        (None, false) => {
+            register_regexp(conn)?;
+            format!(
+                "SELECT {HIT_COLS} FROM names n CROSS JOIN entries e ON e.name_id = n.id
+                 WHERE n.name REGEXP ?1{}",
+                filter.clause()
+            )
+        }
+        (Some(_), false) => {
+            register_regexp(conn)?;
+            format!(
+                "{SUBTREE} SELECT {HIT_COLS} FROM sub JOIN entries e ON e.dir_id = sub.id
+                 JOIN names n ON n.id = e.name_id WHERE n.name REGEXP ?2{}",
+                filter.clause()
+            )
+        }
+        (None, true) => format!(
+            "SELECT {HIT_COLS} FROM entries e JOIN names n ON n.id = e.name_id WHERE 1{}",
+            filter.clause()
+        ),
+        (Some(_), true) => format!(
+            "{SUBTREE} SELECT {HIT_COLS} FROM sub JOIN entries e ON e.dir_id = sub.id
+             JOIN names n ON n.id = e.name_id WHERE 1{}",
+            filter.clause()
+        ),
+    };
+    let sort = limit.is_none();
+    match (root, by_path) {
+        (None, false) => stream_hits(conn, &sql, &[&pattern], limit, sort, None, &mut on_result),
+        (Some(r), false) => stream_hits(
+            conn,
+            &sql,
+            &[&r, &pattern],
+            limit,
+            sort,
+            None,
+            &mut on_result,
+        ),
+        (None, true) => stream_hits(conn, &sql, &[], limit, sort, check, &mut on_result),
+        (Some(r), true) => stream_hits(conn, &sql, &[&r], limit, sort, check, &mut on_result),
+    }
 }
 
 fn register_regexp(conn: &Connection) -> Result<()> {
@@ -734,12 +1166,17 @@ pub fn search_recent_streaming(
     let limit_val = limit.unwrap_or(usize::MAX);
     let mut count = 0u64;
     let sql = format!(
-        "SELECT {PATH_EXPR}, e.mtime_sec, e.mtime_nsec, e.is_dir, e.size
-         FROM entries e JOIN dirs d ON d.id = e.dir_id
-         WHERE e.mtime_sec BETWEEN ?1 AND ?2{}
+        // Sort and limit the entries first, then join names for the
+        // survivors only (not for every candidate in the time window).
+        "SELECT e.dir_id, n.name, e.mtime_sec, e.mtime_nsec, e.is_dir, e.size
+         FROM (SELECT * FROM entries e WHERE e.mtime_sec BETWEEN ?1 AND ?2{}
+               ORDER BY e.mtime_sec DESC, e.mtime_nsec DESC LIMIT {}) e
+         JOIN names n ON n.id = e.name_id
          ORDER BY e.mtime_sec DESC, e.mtime_nsec DESC",
         filter.clause(),
+        limit.map_or(-1, |l| l as i64),
     );
+    let mut paths = PathCache::default();
     let mut stmt = conn.prepare_cached(&sql)?;
     let mut rows = stmt.query(params![from_sec, to_sec])?;
     while let Some(row) = rows.next()? {
@@ -747,11 +1184,11 @@ pub fn search_recent_streaming(
             break;
         }
         let entry = RecentEntry {
-            full_path: row.get(0)?,
-            mtime_sec: row.get(1)?,
-            mtime_nsec: row.get(2)?,
-            is_dir: row.get::<_, i32>(3)? != 0,
-            size: row.get::<_, i64>(4)? as u64,
+            full_path: paths.full(conn, row.get(0)?, row.get_ref(1)?.as_str()?)?,
+            mtime_sec: row.get(2)?,
+            mtime_nsec: row.get(3)?,
+            is_dir: row.get::<_, i32>(4)? != 0,
+            size: row.get::<_, i64>(5)? as u64,
         };
         if !on_result(&entry) {
             break;
@@ -779,90 +1216,95 @@ pub struct Usage {
 /// direct children (subdirectories summed over their whole tree; files
 /// directly in `path` as themselves), largest first — like `du -d1`.
 ///
-/// One pass: entries are summed per directory in SQL (cheap: grouped by
-/// dir_id), then directories are folded into the child they belong to.
+/// One pass: the recursive walk tags every directory with the child of
+/// `path` it belongs to, and entries are summed per child in SQL.
 pub fn usage(conn: &Connection, path: &str, top: usize) -> Result<(Usage, Vec<Usage>)> {
-    use std::collections::HashMap;
-    let dir = norm_dir(path);
-    let (lo, hi) = subtree_range(dir);
-
-    // dir_id → path for every directory in the tree.
-    let mut paths: HashMap<i64, String> = HashMap::new();
-    {
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, path FROM dirs WHERE path = ?1 OR (path >= ?2 AND path < ?3)",
-        )?;
-        let rows = stmt.query_map(params![dir, lo, hi], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        for row in rows {
-            let (id, p) = row?;
-            paths.insert(id, p);
-        }
-    }
-
+    let name = if path.trim_end_matches('/').is_empty() {
+        "/".to_string()
+    } else {
+        path.trim_end_matches('/').to_string()
+    };
     let mut total = Usage {
-        name: if dir.is_empty() {
-            "/".into()
-        } else {
-            dir.to_string()
-        },
+        name,
         ..Usage::default()
     };
-    let mut children: HashMap<String, Usage> = HashMap::new();
-    let mut add = |name: &str, files: u64, dirs: u64, bytes: u64| {
-        let u = children.entry(name.to_string()).or_insert_with(|| Usage {
-            name: name.to_string(),
-            ..Usage::default()
-        });
-        u.files += files;
-        u.dirs += dirs;
-        u.bytes += bytes;
+    let Some(root) = find_dir(conn, path)? else {
+        return Ok((total, vec![]));
     };
+    let mut children: HashMap<i64, Usage> = HashMap::new(); // by child name_id
 
-    // Per-directory sums, folded into the first path component below `dir`.
-    let mut stmt = conn.prepare_cached(
-        "SELECT dir_id, SUM(is_dir = 0), SUM(is_dir), SUM(size) FROM entries
-         WHERE dir_id IN (SELECT id FROM dirs WHERE path = ?1 OR (path >= ?2 AND path < ?3))
-         GROUP BY dir_id",
-    )?;
-    let mut rows = stmt.query(params![dir, lo, hi])?;
-    let prefix_len = dir.len() + 1;
-    let mut direct_id = None;
-    while let Some(r) = rows.next()? {
-        let id: i64 = r.get(0)?;
-        let (files, dirs, bytes) = (
-            r.get::<_, i64>(1)? as u64,
-            r.get::<_, i64>(2)? as u64,
-            r.get::<_, i64>(3)? as u64,
-        );
-        total.files += files;
-        total.dirs += dirs;
-        total.bytes += bytes;
-        let Some(p) = paths.get(&id) else { continue };
-        if p == dir {
-            direct_id = Some(id); // entries directly in `dir`: listed below
-        } else if top > 0 {
-            let rest = &p[prefix_len..];
-            add(rest.split('/').next().unwrap_or(rest), files, dirs, bytes);
-        }
-    }
-
-    // Entries directly in `dir`: each file is its own child; a directory
-    // entry counts toward the child of the same name.
-    if let (Some(id), true) = (direct_id, top > 0) {
-        let mut stmt =
-            conn.prepare_cached("SELECT name, is_dir, size FROM entries WHERE dir_id = ?1")?;
-        let mut rows = stmt.query(params![id])?;
+    // Which child of `path` each directory below it belongs to.
+    let mut top_of: HashMap<i64, i64> = HashMap::new();
+    {
+        let mut stmt = conn.prepare_cached(
+            "WITH RECURSIVE sub(id, top) AS (
+                 SELECT id, name_id FROM dirs WHERE parent = ?1
+                 UNION ALL SELECT d.id, sub.top FROM dirs d JOIN sub ON d.parent = sub.id)
+             SELECT id, top FROM sub",
+        )?;
+        let mut rows = stmt.query(params![root])?;
         while let Some(r) = rows.next()? {
-            let name: String = r.get(0)?;
-            if r.get::<_, i32>(1)? != 0 {
-                add(&name, 0, 1, 0);
-            } else {
-                add(&name, 1, 0, r.get::<_, i64>(2)? as u64);
-            }
+            top_of.insert(r.get(0)?, r.get(1)?);
         }
     }
-
+    // Sums per directory. `entries` is clustered on (dir_id, name_id), so
+    // grouping by dir_id streams in key order without a sort.
+    let sql = if root == ROOT {
+        "SELECT dir_id, COUNT(*) - SUM(is_dir), SUM(is_dir), SUM(size) FROM entries GROUP BY dir_id"
+            .to_string()
+    } else {
+        format!(
+            "{SUBTREE} SELECT dir_id, COUNT(*) - SUM(is_dir), SUM(is_dir), SUM(size) FROM entries
+             WHERE dir_id IN sub GROUP BY dir_id"
+        )
+    };
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let mut rows = if root == ROOT {
+        stmt.query([])?
+    } else {
+        stmt.query(params![root])?
+    };
+    while let Some(r) = rows.next()? {
+        let Some(top) = top_of.get(&r.get::<_, i64>(0)?) else {
+            continue; // `path` itself: its direct entries are listed below
+        };
+        let u = children.entry(*top).or_default();
+        u.files += r.get::<_, i64>(1)? as u64;
+        u.dirs += r.get::<_, i64>(2)? as u64;
+        u.bytes += r.get::<_, i64>(3)? as u64;
+    }
+    // Entries directly in `path`: each file is its own child; a directory
+    // entry counts toward the child of the same name.
+    let mut stmt = conn.prepare_cached(
+        "SELECT e.name_id, n.name, e.is_dir, e.size FROM entries e
+         JOIN names n ON n.id = e.name_id WHERE e.dir_id = ?1",
+    )?;
+    let mut rows = stmt.query(params![root])?;
+    while let Some(r) = rows.next()? {
+        let u = children.entry(r.get(0)?).or_default();
+        u.name = r.get(1)?;
+        if r.get::<_, i32>(2)? != 0 {
+            u.dirs += 1;
+        } else {
+            u.files += 1;
+            u.bytes += r.get::<_, i64>(3)? as u64;
+        }
+    }
+    // Children that are only containers (no entry of their own, e.g. the
+    // parent of a nested root) are named from the dictionary.
+    for (nid, u) in children.iter_mut() {
+        if u.name.is_empty() {
+            u.name = conn
+                .prepare_cached("SELECT name FROM names WHERE id = ?1")?
+                .query_row(params![nid], |r| r.get(0))?;
+        }
+    }
     let mut out: Vec<Usage> = children.into_values().collect();
+    for u in &out {
+        total.files += u.files;
+        total.dirs += u.dirs;
+        total.bytes += u.bytes;
+    }
     out.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
     out.truncate(top);
     Ok((total, out))
@@ -886,17 +1328,28 @@ pub fn largest_files_streaming(
     limit: Option<usize>,
     mut on_result: impl FnMut(&Hit) -> bool,
 ) -> Result<u64> {
-    let dir = under.map(norm_dir).unwrap_or("");
-    let (lo, hi) = subtree_range(dir);
+    let root = match under {
+        Some(u) => match find_dir(conn, u)? {
+            Some(d) => d,
+            None => return Ok(0),
+        },
+        None => ROOT,
+    };
     let filter = Filter {
         is_dir: Some(false),
         ..*filter
     };
+    let scope = if root == ROOT {
+        ""
+    } else {
+        " AND e.dir_id IN sub"
+    };
     let query = |big_only: bool| {
         format!(
-            "SELECT {HIT_COLS} FROM {} JOIN dirs d ON d.id = e.dir_id
-             WHERE (d.path = ?1 OR (d.path >= ?2 AND d.path < ?3)){}{}
-             ORDER BY e.size DESC, 1",
+            // Limit the entries first, then join names for those only.
+            "{SUBTREE} SELECT {HIT_COLS} FROM (SELECT * FROM {}
+                 WHERE 1{scope}{}{} ORDER BY e.size DESC LIMIT {}) e
+             JOIN names n ON n.id = e.name_id ORDER BY e.size DESC",
             entries_from(conn, big_only),
             filter.clause(),
             if big_only {
@@ -904,6 +1357,7 @@ pub fn largest_files_streaming(
             } else {
                 String::new()
             },
+            limit.map_or(-1, |l| l as i64),
         )
     };
     // Usually enough files of 1 MiB+ exist: walk the partial index. If
@@ -911,23 +1365,32 @@ pub fn largest_files_streaming(
     if let Some(n) = limit {
         let big: i64 = conn.query_row(
             &format!(
-                "SELECT COUNT(*) FROM (SELECT 1 FROM {} JOIN dirs d ON d.id = e.dir_id
-                 WHERE (d.path = ?1 OR (d.path >= ?2 AND d.path < ?3)){} AND e.size >= {BIG_FILE} LIMIT ?4)",
+                "{SUBTREE} SELECT COUNT(*) FROM (SELECT 1 FROM {} WHERE 1{scope}{} AND e.size >= {BIG_FILE} LIMIT ?2)",
                 entries_from(conn, true),
                 filter.clause()
             ),
-            params![dir, lo, hi, n as i64],
+            params![root, n as i64],
             |r| r.get(0),
         )?;
         if big as usize >= n {
-            return stream_paths(conn, &query(true), &[&dir, &lo, &hi], limit, &mut on_result);
+            return stream_hits(
+                conn,
+                &query(true),
+                &[&root],
+                limit,
+                false,
+                None,
+                &mut on_result,
+            );
         }
     }
-    stream_paths(
+    stream_hits(
         conn,
         &query(false),
-        &[&dir, &lo, &hi],
+        &[&root],
         limit,
+        false,
+        None,
         &mut on_result,
     )
 }
@@ -951,14 +1414,11 @@ pub struct HealthInfo {
 }
 
 pub fn get_health(conn: &Connection, db_path: &Path) -> Result<HealthInfo> {
-    let entry_count = entry_count(conn)?;
-    let dir_count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM entries WHERE is_dir=1", [], |r| {
-            r.get(0)
-        })?;
-    let file_count = entry_count - dir_count;
-    let pending_events = pending_event_count(conn)?;
-
+    let (entry_count, dir_count, total_bytes): (i64, i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(is_dir), 0), COALESCE(SUM(size), 0) FROM entries",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
     let last_scan = get_metadata(conn, "last_scan_completed")?.and_then(|v| v.parse::<i64>().ok());
     let last_count = get_metadata(conn, "last_entry_count")?.and_then(|v| v.parse::<i64>().ok());
     let monitoring_mode =
@@ -967,22 +1427,32 @@ pub fn get_health(conn: &Connection, db_path: &Path) -> Result<HealthInfo> {
     Ok(HealthInfo {
         entry_count,
         dir_count,
-        file_count,
+        file_count: entry_count - dir_count,
         last_scan_completed: last_scan,
         last_entry_count: last_count,
         monitoring_mode,
-        pending_events,
+        pending_events: pending_event_count(conn)?,
         db_size_bytes: db_size_bytes(db_path),
-        total_bytes: conn.query_row("SELECT COALESCE(SUM(size), 0) FROM entries", [], |r| {
-            r.get::<_, i64>(0)
-        })? as u64,
+        total_bytes: total_bytes as u64,
     })
 }
 
 /// Database file plus its WAL.
 fn db_size_bytes(db_path: &Path) -> u64 {
     let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-    size(db_path) + size(&db_path.with_extension("db-wal"))
+    let wal = size(&std::path::PathBuf::from(format!(
+        "{}-wal",
+        db_path.display()
+    )));
+    if rfind_zvfs::is_compressed(db_path) {
+        rfind_zvfs::store_files(db_path)
+            .iter()
+            .map(|p| size(p))
+            .sum::<u64>()
+            + wal
+    } else {
+        size(db_path) + wal
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1013,27 +1483,18 @@ pub struct IndexStats {
 }
 
 pub fn get_stats(conn: &Connection, db_path: &Path) -> Result<IndexStats> {
-    let entry_count = entry_count(conn)?;
-    let dir_count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM entries WHERE is_dir=1", [], |r| {
-            r.get(0)
-        })?;
-    let file_count = entry_count - dir_count;
+    let (entry_count, dir_count): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(is_dir), 0) FROM entries",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
 
     // Top 10 extensions by count.
     let mut ext_stmt = conn.prepare(
-        "SELECT
-            CASE
-                WHEN INSTR(name, '.') > 0
-                THEN LOWER(SUBSTR(name, INSTR(name, '.')+1))
-                ELSE ''
-            END as ext,
-            COUNT(*) as cnt
-         FROM entries
-         WHERE is_dir=0 AND name LIKE '%.%'
-         GROUP BY ext
-         ORDER BY cnt DESC
-         LIMIT 10",
+        "SELECT LOWER(SUBSTR(n.name, INSTR(n.name, '.') + 1)) AS ext, COUNT(*) AS cnt
+         FROM entries e JOIN names n ON n.id = e.name_id
+         WHERE e.is_dir = 0 AND INSTR(n.name, '.') > 0
+         GROUP BY ext ORDER BY cnt DESC LIMIT 10",
     )?;
     let top_extensions: Vec<ExtStat> = ext_stmt
         .query_map([], |r| {
@@ -1047,21 +1508,21 @@ pub fn get_stats(conn: &Connection, db_path: &Path) -> Result<IndexStats> {
 
     // Top 10 largest directories by direct child count.
     let mut dir_stmt = conn.prepare(
-        "SELECT CASE WHEN d.path = '' THEN '/' ELSE d.path END, c.cnt
-         FROM (SELECT dir_id, COUNT(*) AS cnt FROM entries
-               GROUP BY dir_id ORDER BY cnt DESC LIMIT 10) c
-         JOIN dirs d ON d.id = c.dir_id
-         ORDER BY c.cnt DESC",
+        "SELECT dir_id, COUNT(*) AS cnt FROM entries GROUP BY dir_id ORDER BY cnt DESC LIMIT 10",
     )?;
-    let largest_dirs: Vec<DirStat> = dir_stmt
-        .query_map([], |r| {
-            Ok(DirStat {
-                path: r.get(0)?,
-                count: r.get(1)?,
-            })
-        })?
+    let counts: Vec<(i64, i64)> = dir_stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .flatten()
         .collect();
+    let mut paths = PathCache::default();
+    let mut largest_dirs = Vec::new();
+    for (id, count) in counts {
+        let p = paths.dir(conn, id)?;
+        largest_dirs.push(DirStat {
+            path: if p.is_empty() { "/".into() } else { p },
+            count,
+        });
+    }
 
     let index_age_secs = get_metadata(conn, "last_scan_completed")?
         .and_then(|v| v.parse::<i64>().ok())
@@ -1076,7 +1537,7 @@ pub fn get_stats(conn: &Connection, db_path: &Path) -> Result<IndexStats> {
     Ok(IndexStats {
         entry_count,
         dir_count,
-        file_count,
+        file_count: entry_count - dir_count,
         top_extensions,
         largest_dirs,
         db_size_bytes: db_size_bytes(db_path),
@@ -1232,15 +1693,30 @@ mod tests {
     }
 
     fn paths(c: &Connection) -> Vec<String> {
-        let mut s = c
-            .prepare(&format!(
-                "SELECT {PATH_EXPR} FROM entries e JOIN dirs d ON d.id = e.dir_id ORDER BY 1"
-            ))
-            .unwrap();
-        s.query_map([], |r| r.get(0))
+        let mut v = Vec::new();
+        search_under_streaming(c, "/", None, &Filter::default(), None, |h| {
+            v.push(h.path.to_string());
+            true
+        })
+        .unwrap();
+        v
+    }
+
+    fn dir_paths(c: &Connection) -> Vec<String> {
+        let mut cache = PathCache::default();
+        let ids: Vec<i64> = c
+            .prepare("SELECT id FROM dirs")
+            .unwrap()
+            .query_map([], |r| r.get(0))
             .unwrap()
             .map(|r| r.unwrap())
-            .collect()
+            .collect();
+        let mut v: Vec<String> = ids
+            .into_iter()
+            .map(|id| cache.dir(c, id).unwrap())
+            .collect();
+        v.sort();
+        v
     }
 
     fn glob(c: &Connection, pat: &str) -> Vec<String> {
@@ -1322,15 +1798,9 @@ mod tests {
         add(&c, "/mnt/cx", false, Some(1));
         sweep_stale(&c, "/", &["/mnt/c".to_string()], 2).unwrap();
         assert_eq!(paths(&c), vec!["/etc/new", "/mnt/c", "/mnt/c/win"]);
-        // Directory rows left without entries are dropped: only the parents
-        // of surviving entries remain ('' never held an entry here).
-        let mut s = c.prepare("SELECT path FROM dirs ORDER BY path").unwrap();
-        let dirs: Vec<String> = s
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
-        assert_eq!(dirs, vec!["/etc", "/mnt", "/mnt/c"]);
+        // Directory rows left without entries are dropped: only the root
+        // and the parents of surviving entries remain.
+        assert_eq!(dir_paths(&c), vec!["", "/etc", "/mnt", "/mnt/c"]);
     }
 
     #[test]
@@ -1413,6 +1883,97 @@ mod tests {
         })
         .unwrap();
         assert_eq!(v, vec![("/a/big".into(), 5000), ("/a/mid".into(), 500)]);
+    }
+
+    #[test]
+    fn names_are_stored_once_and_collected_when_unused() {
+        let c = mem();
+        for p in ["/a/index.js", "/b/index.js", "/c/index.js", "/c/other.js"] {
+            add(&c, p, false, Some(1));
+        }
+        let names: i64 = c
+            .query_row("SELECT COUNT(*) FROM names", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(names, 5); // a, b, c, index.js, other.js
+        add(&c, "/a/index.js", false, Some(2));
+        sweep_stale(&c, "/", &[], 2).unwrap();
+        assert_eq!(paths(&c), vec!["/a/index.js"]);
+        let mut left: Vec<String> = c
+            .prepare("SELECT name FROM names ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["a", "index.js"]);
+        assert_eq!(dir_paths(&c), vec!["", "/a"]);
+    }
+
+    #[test]
+    fn renaming_a_directory_rewrites_one_row() {
+        let c = mem();
+        for p in ["/x/old", "/x/old/a/b/c.txt", "/x/old/d.txt"] {
+            add(&c, p, true, None);
+        }
+        let dirs_before: i64 = c
+            .query_row("SELECT COUNT(*) FROM dirs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rename_entry(&c, "/x/old", "/y/new").unwrap(), 3);
+        assert_eq!(
+            paths(&c),
+            vec!["/y/new", "/y/new/a/b/c.txt", "/y/new/d.txt"]
+        );
+        let mut v = Vec::new();
+        search_under_streaming(&c, "/y/new/a", None, &Filter::default(), None, |h| {
+            v.push(h.path.to_string());
+            true
+        })
+        .unwrap();
+        assert_eq!(v, vec!["/y/new/a/b/c.txt"]);
+        // /y was created; nothing beneath the renamed directory was copied.
+        let dirs_after: i64 = c
+            .query_row("SELECT COUNT(*) FROM dirs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(dirs_after, dirs_before + 1);
+    }
+
+    #[test]
+    fn path_glob_matching_follows_sqlite_glob() {
+        for (p, t, m) in [
+            ("/etc/*.conf", "/etc/a.conf", true),
+            ("/etc/*.conf", "/etc/x/b.conf", true), // * crosses '/'
+            ("/etc/*.conf", "/etcfoo/c.conf", false),
+            ("a?c", "abc", true),
+            ("a?c", "ac", false),
+            ("[ab]x", "bx", true),
+            ("[^ab]x", "bx", false),
+            ("[a-c]1", "c1", true),
+            ("photo [1]*", "photo 1.jpg", true), // [1] is a set
+            ("*", "", true),
+            ("x*", "y", false),
+        ] {
+            assert_eq!(glob_match(p, t), m, "{p} vs {t}");
+        }
+    }
+
+    #[test]
+    fn under_root_matches_a_plain_search() {
+        let c = mem();
+        for (p, sz) in [("/a/big.iso", 5u64 << 20), ("/b/small", 10)] {
+            insert_entry(&c, p, false, 0, 0, sz, None).unwrap();
+        }
+        let f = Filter {
+            min_size: Some(1 << 20),
+            ..Filter::default()
+        };
+        let mut v = Vec::new();
+        search_under_streaming(&c, "/", None, &f, None, |h| {
+            v.push(h.path.to_string());
+            true
+        })
+        .unwrap();
+        assert_eq!(v, vec!["/a/big.iso"]);
     }
 
     #[test]
@@ -1556,6 +2117,31 @@ mod tests {
         drop(open(&path).unwrap()); // the daemon's open rebuilds it
         assert!(open_readonly(&path).is_ok());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn switching_storage_format_rebuilds_and_readers_follow() {
+        let dir = std::env::temp_dir().join(format!("rfind-fmt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.db");
+        {
+            let c = open_with(&path, false).unwrap();
+            add(&c, "/plain/x", false, None);
+        }
+        assert!(!rfind_zvfs::is_compressed(&path));
+        assert_eq!(entry_count(&open_readonly(&path).unwrap()).unwrap(), 1);
+        {
+            let c = open_with(&path, true).unwrap(); // format changed: rebuilt
+            assert_eq!(entry_count(&c).unwrap(), 0);
+            add(&c, "/zstd/y", false, None);
+            c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        }
+        assert!(rfind_zvfs::is_compressed(&path));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        let r = open_readonly(&path).unwrap();
+        assert!(entry_exists(&r, "/zstd/y").unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

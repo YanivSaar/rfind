@@ -264,7 +264,7 @@ fn main() {
     }
     info!("Excludes: {:?}", cfg.scan.exclude);
     info!(
-        "Workers: {} | collect mtime/size: {} | io_uring: {} | reindex interval: {}h",
+        "Workers: {} | collect mtime/size: {} | io_uring: {} | compressed index: {} | reindex interval: {}h",
         if cfg.scan.workers == 0 {
             num_cpus::get()
         } else {
@@ -272,6 +272,7 @@ fn main() {
         },
         cfg.scan.collect_mtime,
         cfg.scan.io_uring,
+        cfg.index.compress,
         cfg.scan.reindex_interval_hours
     );
     warn_drvfs_under_live_roots(&cfg, &mount_table);
@@ -279,7 +280,7 @@ fn main() {
     let db_file = cfg.index.db_path.clone();
     fs::create_dir_all(db_file.parent().unwrap()).expect("Failed to create db directory");
     let conn = Arc::new(Mutex::new(
-        db::open(&db_file).expect("Failed to open database"),
+        db::open_with(&db_file, cfg.index.compress).expect("Failed to open database"),
     ));
     restrict_index_permissions(&db_file);
 

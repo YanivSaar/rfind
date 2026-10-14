@@ -1,4 +1,4 @@
-.TH RFIND.CONF 5 "2026-10-14" "rfind 0.6.0" "File Formats"
+.TH RFIND.CONF 5 "2026-10-14" "rfind 0.7.0" "File Formats"
 .SH NAME
 rfind.conf \- configuration of the rfindd indexing daemon
 .SH SYNOPSIS
@@ -71,6 +71,16 @@ The index database.
 .TP
 .BR batch_size " (integer; default " 10000 )
 Entries per scanner write transaction.
+.TP
+.BR compress " (boolean; default " true )
+Store the index with zstd-compressed pages, about 3 times smaller.
+Searches and live updates work the same; the database file itself becomes
+an empty stub next to
+.I index.db-zdata.*
+and
+.I index.db-zmap
+files.
+Changing this setting rebuilds the index.
 .SH [monitor]
 .TP
 .BR prefer_fanotify " (boolean; default " true )
@@ -110,6 +120,7 @@ interval_hours = 12
 [index]
 db_path = "/var/lib/rfindd/index.db"
 batch_size = 10000
+compress = true
 
 [monitor]
 prefer_fanotify = true

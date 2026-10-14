@@ -6,6 +6,7 @@ members = [
     "crates/rfind-monitor",
     "crates/rfindd",
     "crates/rfind-cli",
+    "crates/rfind-zvfs",
     "tests/integration",
 ]
 resolver = "2"

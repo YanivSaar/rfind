@@ -1,4 +1,4 @@
-.TH RFINDD 8 "2026-10-14" "rfind 0.6.0" "System Administration"
+.TH RFINDD 8 "2026-10-14" "rfind 0.7.0" "System Administration"
 .SH NAME
 rfindd \- filesystem indexing daemon for rfind
 .SH SYNOPSIS
@@ -117,6 +117,13 @@ The index, with its
 and
 .I \-shm
 files.
+With
+.B index.compress
+(the default) this file is an empty stub that carries SQLite's locks; the
+pages are stored zstd-compressed in
+.I index.db\-zdata.N
+with a page map in
+.IR index.db\-zmap .
 .TP
 .I /run/rfindd/progress.json
 Current phase and scan progress.

@@ -18,44 +18,60 @@
 ## ⚡ Performance
 
 Measured with `scripts/bench.sh` (release build, WSL2, 4 cores) on a real
-system with 1.52M indexed entries, against plocate, GNU locate and find.
-Every query returned exactly `find`'s results.
+system with 1.54M indexed entries (450 GB of files), against plocate, GNU
+locate and find. Every query returned exactly `find`'s results.
 
 | Operation | rfind | plocate | find |
 |-----------|------:|--------:|-----:|
-| Exact name (`passwd`) | **7 ms** | 13 ms | 1.7 s |
-| Glob `*.conf` | 104 ms | **15 ms** | 1.6 s |
-| Under a directory (`/etc`, `*.conf`) | **7 ms** | 6 ms | 8 ms |
-| Total size of `/usr` (9.8 GB) | **25 ms** | — | 5.0 s |
-| 10 largest files under `/usr` | **38 ms** | — | 5.3 s |
+| Exact name (`passwd`) | **7 ms** | 14 ms | 1.6 s |
+| Under a directory (`/etc`, `*.conf`) | 7 ms | **6 ms** | 8 ms |
+| Glob `*.conf` | 127 ms | **19 ms** | 1.7 s |
+| Total size of `/usr` (9.8 GB) | **30 ms** | — | 4.1 s |
+| 10 largest files under `/usr` | **19 ms** | — | 3.5 s |
 | Change visible (create / rename / append / delete) | **≤ 5 s** | at next `updatedb` | immediate |
-| Linux side index build (185k entries) | **2.2 s** | 2.3 s | — |
+| Index size | 70 MB (1.54M entries) | **5 MB** (194k entries) | — |
+| Daemon memory | 33 MB | — | — |
 
-> plocate's database here held only the 185k Linux-side entries while rfind
-> searched all 1.52M (including a Windows drive), so plocate's glob and regex
-> times are not like-for-like. On equal data (10M below) rfind is faster on
-> globs and exact names; plocate keeps the edge on regexes and size.
+> plocate's database here held only the 194k Linux-side entries while rfind
+> searched all 1.54M (including a Windows drive), so plocate's glob times are
+> not like-for-like.
+
+### Index size and speed by version
+
+Same real system (1.54M entries), each search timed end to end:
+
+| | v0.6 | **v0.7 compressed** (default) | v0.7 plain |
+|---|---:|---:|---:|
+| **Index size** | 302 MB | **69 MB (−77%)** | 163 MB (−46%) |
+| Exact name / under / recent | 1–1.5 ms | 2–3 ms | 1.4–1.6 ms |
+| Glob `*.conf` | 94 ms | 119 ms | **66 ms** |
+| Glob `*.dll` (79k results) | **155 ms** | 253 ms | 183 ms |
+| Regex | 244 ms | 137 ms | **87 ms** |
+| Size of `/` | 521 ms | 373 ms | **296 ms** |
+| Full index incl. a Windows drive | 337 s | **247 s** | 270 s |
+
+Compression trades some CPU on broad scans for a 2.4× smaller index; set
+`index.compress = false` to prefer speed.
 
 ### Scale: 10 million files
 
-A real 10,000,001-file tree on ext4 (10,201 directories), indexed by an
-isolated rfindd:
+10,000,001 files on ext4 in 10,201 directories, half named like a real
+system's files and half random, indexed by an isolated rfindd:
 
-| | rfind | plocate | find |
+| | v0.6 | **v0.7 compressed** | v0.7 plain |
 |---|---:|---:|---:|
-| Initial index build | 70 s (with sizes, io_uring) | **14 s** (names only) | — |
-| Index size | 1.03 GB (103 B/entry) | **62 MB** | — |
-| Daemon memory (peak) | 84 MB | — | — |
-| Exact name | **8–13 ms** | 380 ms | 0.7 s warm / 5.3 s cold |
-| Glob `*.md` (1M results) | **1.6 s** | 3.6 s | 1.8 s |
-| First 10 matches of a glob | **5 ms** | 32 ms | — |
-| Regex over all names | 1.5 s | **0.85 s** | — |
-| Total size of all 10M files | **3.1 s** | — | `du`: 61 s |
-| Size of a 50k-file subtree | **21 ms** | — | — |
-| `largest` / `--larger-than 1M` | **4–7 ms** | — | — |
-| Create, rename (50k-entry dir), delete (50k subtree) visible | **≤ 5 s** | at next `updatedb` | — |
-| Daemon restart (journal replay) | **0.4 s** | — | — |
-| Full rescan | 57 s | 14 s | — |
+| **Index size** | 1.35 GB | **0.40 GB (−71%)** | 0.90 GB (−34%) |
+| Daemon memory (peak) | 91 MB | 97 MB | 90 MB |
+| Initial index build | **280 s** | 423 s | 304 s |
+| Full rescan | **39 s** | 53 s | 45 s |
+| Daemon restart (journal replay) | **0.2 s** | 0.6 s | 0.2 s |
+| Exact name | 4 ms | 6 ms | **3 ms** |
+| Glob `*.json` (133k results) | 777 ms | 1.2 s | **629 ms** |
+| First 10 matches of a glob | 8 ms | 6 ms | **4 ms** |
+| Regex over all names | 1.4 s | 0.83 s | **0.48 s** |
+| Total size of all 10M files | 3.0 s | 0.94 s | **0.66 s** |
+| `--larger-than 1K` | 2.9 s | 0.81 s | **0.46 s** |
+| Change visible (create / rename / delete 50k) | ≤ 5 s | ≤ 5 s | ≤ 5 s |
 
 ### io_uring
 
@@ -134,7 +150,7 @@ periodic roots.
 |------|-----------|
 | Install / update | `curl -fsSL https://raw.githubusercontent.com/YanivSaar/rfind/main/scripts/install.sh \| sudo bash` |
 | From a clone | `git clone https://github.com/YanivSaar/rfind.git && cd rfind && sudo ./scripts/install.sh` |
-| Specific release | `curl -fsSL …/install.sh \| sudo RFIND_VERSION=v0.6.0 bash` |
+| Specific release | `curl -fsSL …/install.sh \| sudo RFIND_VERSION=v0.7.0 bash` |
 | Build from source | `curl -fsSL …/install.sh \| sudo RFIND_FROM_SOURCE=1 bash` |
 | Uninstall (keep index) | `sudo rfind uninstall` |
 | Uninstall + purge | `sudo rfind uninstall --purge` |
@@ -316,15 +332,18 @@ roots = ["/"]
 exclude = ["/proc", "/sys", "/dev", "/run", "/media"]
 workers = 0                    # 0 = auto-detect CPU count
 reindex_interval_hours = 6     # auto re-index every 6h in index-only mode
-collect_mtime = true           # collect file modification times (recommended)
+collect_mtime = true           # modification times and sizes (recommended)
+io_uring = true                # batch statx through io_uring when available
 
 [index]
 db_path = "/var/lib/rfindd/index.db"
 batch_size = 10000
+compress = true                # zstd-compressed pages (~3× smaller); changing it rebuilds
 
 [monitor]
 prefer_fanotify = true         # one mark per filesystem (kernel 5.9+, root)
 inotify_fallback = true        # per-directory watches if fanotify is unavailable
+watch_new_mounts = true        # index filesystems mounted under a live root later
 ```
 
 ### Periodic roots (WSL2 Windows drives, network mounts)
@@ -359,6 +378,7 @@ rfind/
 │   ├── rfind-core/       # Shared types, DB schema, all search queries
 │   ├── rfind-scanner/    # Parallel scanner: getdents64 + statx
 │   ├── rfind-monitor/    # fanotify + inotify filesystem monitoring
+│   ├── rfind-zvfs/       # SQLite VFS storing pages zstd-compressed
 │   ├── rfindd/           # Daemon binary
 │   └── rfind-cli/        # rfind CLI binary
 ├── tests/
@@ -435,51 +455,65 @@ fanotify_init(FID mode) + FAN_MARK_FILESYSTEM on each filesystem
 
 ### Database schema
 
-Schema v4 is normalized: each directory path is stored once, and each entry
-stores only its name and its parent directory's id. A full path is
-`dirs.path || '/' || entries.name` (the root directory is stored as `''`).
-This halves the index compared with storing every full path (which SQLite
-also duplicated in the path index), and renaming a directory only rewrites
-`dirs` rows.
+Schema v6 stores nothing twice:
 
 ```sql
--- One row per directory that has entries
-CREATE TABLE dirs (
-    id   INTEGER PRIMARY KEY,
-    path TEXT NOT NULL UNIQUE        -- no trailing '/'; root is ''
-);
+-- Every distinct file or directory name, once (half of all names repeat:
+-- index.js, __init__.py, ...). Looked up by an 8-byte hash, not a text index.
+CREATE TABLE names (id INTEGER PRIMARY KEY, name TEXT NOT NULL, hash INTEGER NOT NULL);
+CREATE INDEX idx_names_hash ON names (hash);
 
--- Every filesystem entry
+-- The directory tree as (parent, name). Paths are built from this chain,
+-- so renaming a directory rewrites one row. The root is id 1.
+CREATE TABLE dirs (id INTEGER PRIMARY KEY, parent INTEGER, name_id INTEGER);
+CREATE UNIQUE INDEX idx_dirs_parent_name ON dirs (parent, name_id);
+
+-- Every entry, clustered on its key: the table is its own unique index.
 CREATE TABLE entries (
-    id         INTEGER PRIMARY KEY,
-    dir_id     INTEGER NOT NULL,     -- parent directory (dirs.id)
-    name       TEXT    NOT NULL,     -- basename
-    is_dir     INTEGER NOT NULL,
-    mtime_sec  INTEGER NOT NULL,     -- modification time (Unix seconds)
-    mtime_nsec INTEGER NOT NULL,
-    scan_gen   INTEGER NOT NULL      -- last scan generation that saw it
-);
-CREATE UNIQUE INDEX idx_entries_dir_name ON entries (dir_id, name);  -- upserts
-CREATE INDEX        idx_entries_name     ON entries (name);          -- name search
-CREATE INDEX        idx_entries_mtime    ON entries (mtime_sec);     -- rfind recent
+    dir_id INTEGER NOT NULL, name_id INTEGER NOT NULL,
+    is_dir INTEGER NOT NULL, mtime_sec INTEGER NOT NULL, mtime_nsec INTEGER NOT NULL,
+    size INTEGER NOT NULL,          -- bytes; 0 for directories
+    scan_gen INTEGER NOT NULL,      -- last scan generation that saw it
+    PRIMARY KEY (dir_id, name_id)
+) WITHOUT ROWID;
+CREATE INDEX idx_entries_name  ON entries (name_id);
+CREATE INDEX idx_entries_mtime ON entries (mtime_sec);
+CREATE INDEX idx_entries_big   ON entries (size) WHERE size >= 1048576;  -- partial
 
--- Durable event journal: survives daemon crashes and restarts
-CREATE TABLE pending_events (
-    id         INTEGER PRIMARY KEY,
-    event_type TEXT,      -- CREATE / DELETE / RENAME / MODIFY
-    path       TEXT,
-    new_path   TEXT,      -- for RENAME events
-    is_dir     INTEGER,
-    timestamp  INTEGER,
-    applied    INTEGER    -- 0=pending, 1=applied
-);
-
--- Daemon state: last scan time, scan generation, monitoring mode
+-- Durable event journal and daemon state
+CREATE TABLE pending_events (id INTEGER PRIMARY KEY, event_type TEXT, path TEXT,
+    new_path TEXT, is_dir INTEGER, timestamp INTEGER, applied INTEGER);
 CREATE TABLE scan_metadata (key TEXT PRIMARY KEY, value TEXT);
 ```
 
-The index is a cache of the filesystem: an index with an older schema
-version (`PRAGMA user_version`) is dropped and rebuilt by a full scan.
+An index with an older schema version (`PRAGMA user_version`) is dropped and
+rebuilt by a full scan.
+
+### Compressed storage (`index.compress`, default on)
+
+`rfind-zvfs` is a SQLite VFS that keeps the database's pages
+zstd-compressed — about 3× smaller on real data:
+
+- `index.db` stays an empty stub that carries SQLite's locks; the `-wal`
+  and `-shm` files work exactly as with plain SQLite, so WAL mode and
+  concurrent readers are unchanged.
+- Pages live in an append-only `index.db-zdata.N` file of checksummed
+  records; `index.db-zmap` is a page-map snapshot replaced atomically.
+  Readers load the map when a read transaction starts and replay only the
+  records appended since.
+- Crash safety comes from SQLite's WAL: the main database is written only
+  while checkpointing, and SQLite keeps the WAL until that checkpoint is
+  synced. A torn record at the end fails its CRC and is ignored — SQLite
+  redoes the checkpoint. Tested by SIGKILLing a writer 45 times mid-write:
+  `PRAGMA integrity_check` was `ok` every time.
+- Old page versions are reclaimed by compaction (a new generation file);
+  rfindd compacts after every scan, and readers still on the old file keep
+  reading it until they reload.
+
+The tradeoff is CPU: every page a search reads is decompressed, so
+scan-heavy searches (broad globs) are slower than uncompressed — see
+Performance. `rfind config set index.compress false` switches to plain
+SQLite (the index is rebuilt automatically).
 
 **Consistency:** scans upsert rows tagged with a new generation, then delete
 the rows under their root that they didn't see — searches never see an
@@ -505,8 +539,18 @@ On daemon restart:
 
 ## 📊 Storage estimates
 
-| Entries | Index size (approx) |
-|--------:|--------------------:|
+| Entries | Compressed (default) | Plain (`index.compress = false`) |
+|--------:|---------------------:|---------------------------------:|
+| 150k | ~7 MB | ~16 MB |
+| 1.5M | ~70 MB | ~165 MB |
+| 10M | ~400–500 MB | ~0.9–1.1 GB |
+| 100M | ~4–5 GB | ~9–11 GB |
+
+Measured: a real system with 1.54M entries → 69 MB compressed (45 B/entry),
+163 MB plain; 10M entries with realistic names (half random) → 396 MB
+compressed, 0.90 GB plain. v0.6.0 needed 302 MB and 1.35 GB for the same.
+
+--------:|--------------------:|
 | 150k | ~30 MB |
 | 1.5M | ~300 MB |
 | 10M | ~1–2 GB |
@@ -594,7 +638,8 @@ All tests pass in ~0.2s.
 ## 🛣️ Roadmap
 
 - [x] Parallel scanner with `getdents64` + `statx`, batched through io_uring
-- [x] SQLite persistent index (WAL), normalized schema
+- [x] SQLite persistent index (WAL): names stored once, directory tree, clustered entries
+- [x] zstd page compression via a custom crash-safe SQLite VFS (−77% on real data)
 - [x] fanotify monitoring: per-filesystem marks in FID mode (kernel 5.9+)
 - [x] inotify fallback (older kernels / containers)
 - [x] Durable event journal with idempotent replay

@@ -170,6 +170,12 @@ pub fn scan_root(ctx: &Ctx, root: &Path, report: bool) -> ScanResult {
         Err(e) => error!("sweep {}: {e}", root.display()),
     }
     let _ = db::set_metadata(&c, &root_scan_key(root), &now_secs().to_string());
+    if !report {
+        // Background scans end without reconcile_and_mark_ready.
+        if let Err(e) = db::compact(&c) {
+            warn!("compacting the index: {e}");
+        }
+    }
     info!(
         "Scanned {}: {} entries, {} dirs in {:.1}s{}",
         root.display(),
@@ -212,7 +218,9 @@ pub fn reconcile_and_mark_ready(ctx: &Ctx, scanned: bool) {
     let applied = index::reconcile(&ctx.conn, &ctx.cfg);
 
     let c = ctx.conn.lock().unwrap();
-    let _ = c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    if let Err(e) = db::compact(&c) {
+        warn!("compacting the index: {e}");
+    }
     let count = db::entry_count(&c).unwrap_or(0) as u64;
     if scanned {
         let _ = db::set_metadata(&c, "last_scan_completed", &now_secs().to_string());

@@ -61,6 +61,9 @@ fn default_periodic_interval() -> u64 {
 pub struct IndexConfig {
     pub db_path: PathBuf,
     pub batch_size: usize,
+    /// Store the index zstd-compressed (about 3× smaller). Changing it
+    /// rebuilds the index.
+    pub compress: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +103,7 @@ impl Default for IndexConfig {
         Self {
             db_path: PathBuf::from("/var/lib/rfindd/index.db"),
             batch_size: 10_000,
+            compress: true,
         }
     }
 }

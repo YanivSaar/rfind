@@ -15,7 +15,7 @@
 # format changed, rfindd rebuilds the index automatically.
 #
 # Environment:
-#   RFIND_VERSION      release to install, e.g. v0.6.0 (default: latest)
+#   RFIND_VERSION      release to install, e.g. v0.7.0 (default: latest)
 #   RFIND_FROM_SOURCE  1 = always build from source
 #   RFIND_REPO         git URL to clone for source builds
 #   RFIND_REF          branch or tag to build from source (default: main)

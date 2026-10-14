@@ -198,8 +198,9 @@ note "rfind builds once, then stays current from kernel events; the locates must
 
 # ── 3. Footprint ───────────────────────────────────────────────────────────────
 section "3 · Footprint"
-DB=$("$RFIND" config get index.db_path)
-DB_BYTES=$(( $(stat -c %s "$DB" 2>/dev/null || echo 0) + $(stat -c %s "$DB-wal" 2>/dev/null || echo 0) ))
+# From rfind itself: counts the compressed store (index.compress) and the WAL.
+DB_BYTES=$("$RFIND" --json health 2>/dev/null | grep -o '"db_size_bytes":[0-9]*' | cut -d: -f2)
+DB_BYTES=${DB_BYTES:-0}
 RFIND_N=$("$RFIND" --json health 2>/dev/null | grep -o '"entries":[0-9]*' | cut -d: -f2)
 RSS_KB=$(awk '/VmRSS/ {print $2}' /proc/$PID/status)
 CPU_S=$(awk -v hz="$(getconf CLK_TCK)" '{printf "%.1f", ($14+$15)/hz}' /proc/$PID/stat)
@@ -215,6 +216,7 @@ printf '  %-22s %12s %12s %12s\n' "Bytes / entry" \
     "$([ -n "$PLOCATE" ] && per "${P_N:-0}" "$(stat -c %s "$PDB")" || echo -)" \
     "$([ -n "$GLOCATE" ] && per "${L_N:-0}" "$(stat -c %s "$LDB")" || echo -)" "$(per "${RFIND_N:-0}" $DB_BYTES)"
 printf '  %-22s %12s %12s %12s\n' "Stores" "paths" "paths" "paths+size+mtime"
+printf '  %-22s %12s %12s %12s\n' "Compression" "custom" "front-coded" "$("$RFIND" config get index.compress 2>/dev/null | grep -q true && echo zstd pages || echo none)"
 printf '  %-22s %12s %12s %12s\n' "Daemon RSS" "-" "-" "$(fmt_bytes $((RSS_KB*1024)))"
 printf '  %-22s %12s %12s %12s\n' "Daemon CPU (total)" "-" "-" "${CPU_S}s"
 printf '  %-22s %12s %12s %12s\n' "Kernel watches" "-" "-" "$([ "$MARKS" -gt 0 ] && echo "fanotify" || echo "$(fmt_num "$WATCHES") inotify")"

@@ -1,6 +1,6 @@
 [package]
 name = "rfind-core"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 
 [dependencies]
@@ -9,3 +9,4 @@ serde_json = "1"
 thiserror = "2"
 rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 regex-lite = "0.1"
+rfind-zvfs = { path = "../rfind-zvfs" }

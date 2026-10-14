@@ -1,0 +1,14 @@
+[package]
+name = "rfind-zvfs"
+version = "0.7.0"
+edition = "2021"
+description = "SQLite VFS that stores the main database file zstd-compressed"
+
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+zstd = "0.13"
+crc32fast = "1"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
