@@ -1,0 +1,138 @@
+.TH RFINDD 8 "2026-10-14" "rfind 0.6.0" "System Administration"
+.SH NAME
+rfindd \- filesystem indexing daemon for rfind
+.SH SYNOPSIS
+.B rfindd
+.SH DESCRIPTION
+.B rfindd
+builds and maintains the index searched by
+.BR rfind (1):
+the name, type, size and modification time of every file and directory
+under the configured roots, stored in an SQLite database.
+It runs as root, normally as the systemd service
+.BR rfindd.service ,
+and logs to standard error (the journal).
+.SS Scanning
+The first start scans every live root with a parallel scanner that reads
+directories with
+.BR getdents64 (2)
+and collects metadata with
+.BR statx (2),
+batched through
+.BR io_uring (7)
+when the kernel allows it.
+Scans never empty the index: each one upserts the entries it sees and then
+deletes the entries under its root that it didn't see, so searches keep
+returning complete results while a scan runs.
+.SS Live updates
+Changes are reported by the kernel and applied within about five seconds:
+.TP
+.B fanotify
+(preferred; Linux 5.9 or newer, root): one mark per filesystem covers
+everything on it, with no per-directory watches.
+Renames arrive as single events on Linux 5.17 or newer.
+.TP
+.B inotify
+(fallback): one watch per directory, registered before each directory is
+read so nothing is missed between listing and watching.
+.TP
+.B index-only
+(neither available): live roots are rescanned every
+.B reindex_interval_hours
+hours.
+.PP
+Events are first written to a journal in the database and then applied by
+re-checking each path on disk, so a crash or a replay never corrupts the
+index.
+If the kernel's event queue overflows, the live roots are rescanned.
+.SS Periodic roots
+Roots listed as periodic (see
+.BR rfind.conf (5))
+are rescanned in a background thread on their own interval and never
+monitored.
+This suits filesystems whose changes the kernel can't report: Windows
+drives under WSL2 (changes made from Windows produce no events) and network
+shares (changes made by other clients don't either).
+.SS Mounts
+Bind mounts that show files already indexed through another mount point
+(WSL2's
+.IR /mnt/wslg/distro ,
+container volumes) are detected from
+.I /proc/self/mountinfo
+and skipped.
+With
+.B monitor.watch_new_mounts
+(default on), filesystems mounted under a live root after startup are
+indexed and watched, and the mount point of an unmounted filesystem is
+rescanned.
+rfindd never keeps files open on marked filesystems, so they can be
+unmounted normally.
+.SS Restarts
+On restart rfindd replays the journal instead of rescanning when the last
+full scan is younger than
+.BR reindex_interval_hours .
+If the configuration changed, it removes entries that are now excluded or
+outside every root and rescans the live roots; periodic roots are rescanned
+only if something inside them stopped being excluded.
+An index written by an incompatible version is rebuilt from scratch.
+.SH SIGNALS
+.TP
+.B SIGHUP
+Reload the configuration: running scans are cancelled and rfindd
+re-executes itself (keeping its PID) with the new configuration.
+An invalid configuration is reported and ignored.
+.RB "Sent by " "rfind reload" ", " "rfind config" " and " "systemctl reload rfindd" .
+.TP
+.B SIGUSR1
+Rescan the live roots now and schedule the periodic roots.
+Signals arriving during that rescan are merged into it.
+.RB "Sent by " "rfind update" .
+.TP
+.BR SIGTERM ", " SIGINT
+Stop: running scans are cancelled and the daemon exits within a second.
+.SH SECURITY
+The index lists every file name on the system, including other users'.
+rfindd runs with umask 077, keeps
+.I /var/lib/rfindd
+at mode 0700 and the database at 0600, so only root can search.
+Searching opens the database read-only.
+.SH ENVIRONMENT
+.TP
+.B RFIND_CONFIG
+Configuration file to use instead of
+.IR /etc/rfindd/config.toml .
+.TP
+.B RUST_LOG
+Log level filter, e.g.
+.BR debug .
+.SH FILES
+.TP
+.I /etc/rfindd/config.toml
+Configuration, written with defaults on first start; see
+.BR rfind.conf (5).
+.TP
+.I /var/lib/rfindd/index.db
+The index, with its
+.I \-wal
+and
+.I \-shm
+files.
+.TP
+.I /run/rfindd/progress.json
+Current phase and scan progress.
+.TP
+.I /etc/systemd/system/rfindd.service
+The service unit installed by
+.IR scripts/install.sh .
+.SH EXIT STATUS
+0 after a clean shutdown; 1 if the configuration is invalid or the index
+can't be opened.
+.SH SEE ALSO
+.BR rfind (1),
+.BR rfind.conf (5),
+.BR fanotify (7),
+.BR inotify (7),
+.BR io_uring (7),
+.BR systemctl (1)
+.PP
+https://github.com/YanivSaar/rfind

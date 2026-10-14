@@ -18,8 +18,9 @@
 
 use crate::sink::EventSink;
 use libc::{
-    close, inotify_add_watch, inotify_init1, inotify_rm_watch, read, IN_CREATE, IN_DELETE,
-    IN_DELETE_SELF, IN_IGNORED, IN_ISDIR, IN_MOVED_FROM, IN_MOVED_TO, IN_NONBLOCK, IN_Q_OVERFLOW,
+    close, inotify_add_watch, inotify_init1, inotify_rm_watch, read, IN_CLOEXEC, IN_CLOSE_WRITE,
+    IN_CREATE, IN_DELETE, IN_DELETE_SELF, IN_IGNORED, IN_ISDIR, IN_MOVED_FROM, IN_MOVED_TO,
+    IN_NONBLOCK, IN_Q_OVERFLOW,
 };
 use rfind_core::db::EventType;
 use std::{
@@ -37,7 +38,9 @@ use std::{
 };
 use tracing::{error, warn};
 
-const WATCH_MASK: u32 = IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MOVED_FROM | IN_MOVED_TO;
+/// IN_CLOSE_WRITE keeps sizes and mtimes current after files are written.
+const WATCH_MASK: u32 =
+    IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MOVED_FROM | IN_MOVED_TO | IN_CLOSE_WRITE;
 
 /// How long a MOVED_FROM waits for its MOVED_TO before it is treated as
 /// a move out of the watched tree.
@@ -171,7 +174,7 @@ impl InotifyMonitor {
         sink: (EventSink, thread::JoinHandle<()>),
         excludes: Vec<PathBuf>,
     ) -> Result<Self, InotifyError> {
-        let fd = unsafe { inotify_init1(IN_NONBLOCK) };
+        let fd = unsafe { inotify_init1(IN_NONBLOCK | IN_CLOEXEC) };
         if fd < 0 {
             return Err(InotifyError::Init(std::io::Error::last_os_error()));
         }
@@ -344,6 +347,8 @@ fn event_loop(
                         watch_new_tree(&watches, &sink, &full_path);
                     }
                 }
+            } else if ev.mask & IN_CLOSE_WRITE != 0 {
+                sink.send(EventType::Modify, lossy(&full_path), None, is_dir);
             }
         }
 

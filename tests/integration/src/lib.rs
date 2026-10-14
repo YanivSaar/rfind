@@ -10,13 +10,13 @@
 use rfind_core::{db, db_path};
 
 fn open() -> rusqlite::Connection {
-    db::open(&db_path()).expect("Cannot open index database — is rfindd done scanning?")
+    db::open_readonly(&db_path()).expect("Cannot open index database — is rfindd done scanning?")
 }
 
 fn search_by_glob(conn: &rusqlite::Connection, pattern: &str) -> rusqlite::Result<Vec<String>> {
     let mut v = Vec::new();
-    db::search_by_glob_streaming(conn, pattern, None, None, |p| {
-        v.push(p.to_string());
+    db::search_by_glob_streaming(conn, pattern, &db::Filter::default(), None, |p| {
+        v.push(p.path.to_string());
         true
     })?;
     Ok(v)
@@ -28,8 +28,8 @@ fn search_under(
     name: Option<&str>,
 ) -> rusqlite::Result<Vec<String>> {
     let mut v = Vec::new();
-    db::search_under_streaming(conn, prefix, name, None, None, |p| {
-        v.push(p.to_string());
+    db::search_under_streaming(conn, prefix, name, &db::Filter::default(), None, |p| {
+        v.push(p.path.to_string());
         true
     })?;
     Ok(v)

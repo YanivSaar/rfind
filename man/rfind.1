@@ -1,0 +1,424 @@
+.TH RFIND 1 "2026-10-14" "rfind 0.6.0" "User Commands"
+.SH NAME
+rfind \- search the filesystem instantly using the rfindd index
+.SH SYNOPSIS
+.B rfind
+.RB [ \-\-json ]
+.B name
+.I PATTERN
+.RB [ \-\-under
+.IR DIR ]
+.RB [ \-\-regex ]
+.RI [ FILTERS ]
+.br
+.B rfind
+.RB [ \-\-json ]
+.B path
+.I GLOB
+.RI [ FILTERS ]
+.br
+.B rfind
+.RB [ \-\-json ]
+.B recent
+.RB [ \-\-minutes | \-\-hours | \-\-days
+.IR N " | " \fB\-\-from\fR " " DATE " " \fB\-\-to\fR " " DATE ]
+.RI [ FILTERS ]
+.br
+.B rfind
+.RB [ \-\-json ]
+.B size
+.RI [ DIR ]
+.RB [ \-\-top
+.IR N ]
+.br
+.B rfind
+.RB [ \-\-json ]
+.B largest
+.RB [ \-\-under
+.IR DIR ]
+.RB [ \-\-limit
+.IR N ]
+.RI [ FILTERS ]
+.br
+.B rfind
+.BR status " [" \-\-watch "] | " health " | " stats " | " update " | " reload
+.br
+.B rfind config
+.I SUBCOMMAND
+.br
+.B rfind completions
+.I SHELL
+.br
+.B rfind uninstall
+.RB [ \-\-purge ]
+.RB [ \-\-yes ]
+.SH DESCRIPTION
+.B rfind
+answers file-name, path, modification-time and disk-usage questions from an
+index kept current by the
+.BR rfindd (8)
+daemon, instead of walking the disk like
+.BR find (1).
+Unlike
+.BR locate (1),
+the index is updated live from kernel filesystem events (fanotify, or inotify
+as a fallback), so new, renamed and deleted files are reflected within
+seconds.
+.PP
+The index lists every file name on the system, so it is readable by root only:
+searches must be run with
+.BR sudo (8).
+Searching never modifies the index.
+.SH SEARCH COMMANDS
+.TP
+.BI "name " PATTERN
+Match entry names (the last path component).
+.I PATTERN
+is an exact name, a glob where
+.B *
+matches any characters and
+.B ?
+one character, or with
+.B \-\-regex
+a regular expression matched against the name.
+Matching is case-sensitive.
+.RS
+.TP
+.BI \-\-under " DIR"
+Only search inside the tree rooted at
+.IR DIR .
+.TP
+.B \-\-regex
+Treat
+.I PATTERN
+as a regular expression (Rust
+.B regex
+syntax; anchor with
+.B ^
+and
+.BR $ ).
+.TP
+.BI \-\-limit " N"
+Stop after
+.I N
+results.
+.RE
+.TP
+.BI "path " GLOB
+Match full paths against
+.IR GLOB ;
+here
+.B *
+also matches
+.BR / .
+A literal leading directory (as in
+.BR /etc/*.conf )
+restricts the search to that tree, which makes it fast.
+.TP
+.B recent
+Entries modified in a time window, newest first: the last
+.B \-\-minutes
+.IR N ,
+.B \-\-hours
+.IR N ,
+.B \-\-days
+.IR N ,
+or the local-time date range
+.B \-\-from
+.I YYYY-MM-DD
+.B \-\-to
+.I YYYY-MM-DD
+(inclusive).
+Default: the last 24 hours, at most 50 results
+.RB ( \-\-limit ).
+.TP
+.BI "size " "\fR[\fPDIR\fR]\fP"
+Disk usage of a directory tree (default
+.BR / ),
+computed from the indexed file sizes without touching the disk: the total
+bytes, files and directories, and the
+.B \-\-top
+.I N
+(default 20) largest direct children, like
+.BR "du \-d1" .
+.B du
+is an alias.
+Sizes are apparent sizes (file length), not allocated blocks.
+.TP
+.B largest
+The biggest files, largest first, optionally
+.B \-\-under
+.IR DIR ;
+.B \-\-limit
+.I N
+(default 20).
+.SS Filters
+Accepted by
+.BR name ,
+.BR path ,
+.B recent
+and
+.BR largest :
+.TP
+.BR \-\-type " " f | d
+Only files or only directories.
+.TP
+.BI \-\-larger\-than " SIZE"
+Only files of at least
+.IR SIZE .
+.TP
+.BI \-\-smaller\-than " SIZE"
+Only files of at most
+.IR SIZE .
+.TP
+.BR \-l ", " \-\-long
+Print size and modification time before each path.
+.PP
+.I SIZE
+is a number of bytes with an optional binary suffix:
+.BR K ,
+.BR M ,
+.B G
+or
+.B T
+(powers of 1024), e.g.
+.BR 500K ,
+.BR 1.5G .
+A trailing
+.B B
+or
+.B iB
+is accepted.
+.SH DAEMON COMMANDS
+.TP
+.B status
+Scan phase and progress of
+.BR rfindd ;
+.B \-\-watch
+refreshes every second until it is ready.
+.TP
+.B health
+Whether the index is current
+.RB ( LIVE
+when monitored), when the last full scan ran, entry counts, total indexed
+bytes, monitoring mode, and database size.
+.TP
+.B stats
+Entry counts, the most common file extensions, and the directories with the
+most direct entries.
+.TP
+.B update
+Rescan now: live roots immediately, periodic roots in the background
+(sends SIGUSR1 to rfindd).
+.TP
+.B reload
+Make rfindd re-read its configuration (sends SIGHUP).
+Only needed after editing the file by hand;
+.B rfind config
+reloads automatically.
+.SH CONFIGURATION COMMANDS
+.B rfind config
+reads and changes
+.IR /etc/rfindd/config.toml ,
+described in
+.BR rfind.conf (5).
+Changes keep the file's comments and formatting, are validated before
+anything is written, and are written atomically.
+Afterwards rfindd is told to reload: it removes entries that are now excluded
+or outside every root and scans what was added, without rebuilding the index.
+Add
+.B \-\-no\-reload
+to only write the file.
+.TP
+.BR "config show" " [" \-\-defaults ]
+Print the file (with
+.BR \-\-json :
+the effective settings), or the built-in defaults.
+.TP
+.B config path
+Print the config file's location.
+.TP
+.B config check
+Validate the file: syntax, unknown keys, relative paths, conflicting roots.
+.TP
+.B config keys
+List the settings understood by
+.B get
+and
+.BR set ,
+with current values and descriptions.
+.TP
+.BI "config get " KEY
+Print one setting, e.g.
+.BR scan.workers " or " scan.exclude .
+.TP
+.BI "config set " "KEY VALUE"
+Change one setting, e.g.
+.BR "rfind config set scan.workers 8" .
+Booleans accept true/false, yes/no, on/off, 1/0.
+.TP
+.BI "config unset " KEY
+Remove a setting from the file so its default applies.
+.TP
+.BR "config exclude add" | remove | list " [\fIPATH\fR...]"
+Paths that are never indexed nor descended into.
+.TP
+.BR "config root add" | remove | list " [\fIPATH\fR...]"
+Live roots: scanned, then kept current by fanotify or inotify.
+.TP
+.BR "config periodic add" " \fIPATH\fR... [" \-\-every " \fIHOURS\fR] | " remove " \fIPATH\fR... | " list
+Periodic roots: rescanned every
+.I HOURS
+(default 12) in the background and never monitored.
+Use them for filesystems whose changes the kernel can't report, such as
+Windows drives under WSL2 or network shares.
+.TP
+.B config edit
+Open the file in
+.BR $VISUAL ,
+.B $EDITOR
+or
+.BR vi ;
+it is validated before saving, and an invalid edit can be corrected or
+discarded.
+.TP
+.BR "config reset \-\-yes"
+Replace the file with the defaults, keeping a
+.I .bak
+copy.
+.PP
+Paths are normalized
+.RB ( . ,
+.B ..
+and trailing slashes are removed) and must be absolute.
+Adding a path that doesn't exist yet is allowed, with a warning.
+.SH OTHER COMMANDS
+.TP
+.BI "completions " SHELL
+Print a completion script for
+.BR bash ,
+.BR zsh ,
+.BR fish ,
+.B elvish
+or
+.BR powershell .
+The installer installs them for bash, zsh and fish.
+.TP
+.B uninstall
+Stop and disable rfindd and remove the binaries, man pages, completions and
+systemd unit.
+.B \-\-purge
+also deletes the index and the configuration.
+Asks for confirmation unless
+.BR \-\-yes .
+.SH OPTIONS
+.TP
+.B \-\-json
+Machine-readable output.
+Searches print one JSON object per result (JSON Lines) with the keys
+.BR path ,
+.B type
+.RB ( file " or " dir ),
+.B size
+(bytes, 0 for directories) and
+.B mtime
+(Unix seconds);
+.B recent
+adds
+.B modified
+(local time).
+Other commands print a single object.
+.TP
+.BR \-h ", " \-\-help
+Help for any command.
+.TP
+.BR \-V ", " \-\-version
+Version.
+.SH OUTPUT
+Results go to standard output, one per line, sorted by path (by time for
+.BR recent ,
+by size for
+.BR largest ).
+The result count goes to standard error, so output can be piped.
+Paths containing newlines are printed as-is; use
+.B \-\-json
+for unambiguous parsing.
+.SH EXIT STATUS
+.TP
+.B 0
+Results found, or the command succeeded.
+.TP
+.B 1
+A search found nothing.
+.TP
+.B 2
+An error: invalid arguments, not root, no index, or an invalid configuration.
+.SH ENVIRONMENT
+.TP
+.B RFIND_CONFIG
+Use this configuration file instead of
+.IR /etc/rfindd/config.toml .
+.BR rfindd (8)
+honors it too.
+.TP
+.BR VISUAL ", " EDITOR
+Editor for
+.BR "rfind config edit" .
+.SH FILES
+.TP
+.I /etc/rfindd/config.toml
+Configuration; see
+.BR rfind.conf (5).
+.TP
+.I /var/lib/rfindd/index.db
+The index (SQLite, root-only).
+.TP
+.I /run/rfindd/progress.json
+Daemon status read by
+.BR "rfind status" .
+.SH EXAMPLES
+.TP
+.B sudo rfind name passwd
+Every entry named exactly
+.BR passwd .
+.TP
+.B sudo rfind name '*.conf' \-\-under /etc
+Config files under /etc.
+.TP
+.B sudo rfind name '^lib.*\e.so\e.[0-9]+$' \-\-regex
+Versioned shared libraries.
+.TP
+.B sudo rfind path '/home/*/.ssh/*'
+Everything in users' .ssh directories.
+.TP
+.B sudo rfind recent \-\-hours 2 \-\-type f \-l
+Files changed in the last two hours, with size and time.
+.TP
+.B sudo rfind name '*.iso' \-\-larger\-than 1G
+Disk images of 1 GiB or more.
+.TP
+.B sudo rfind size /home \-\-top 10
+Which home directories use the most space.
+.TP
+.B sudo rfind largest \-\-under /var \-\-limit 10
+The ten biggest files under /var.
+.TP
+.B sudo rfind name '*.log' \-\-json | jq \-r 'select(.size > 1e8) | .path'
+Logs over 100 MB, via jq.
+.TP
+.B sudo rfind config exclude add /home/moshe
+Stop indexing a directory; its entries are removed right away.
+.TP
+.B sudo rfind config periodic add /mnt/nas \-\-every 24
+Index a network share once a day.
+.SH SEE ALSO
+.BR rfindd (8),
+.BR rfind.conf (5),
+.BR find (1),
+.BR locate (1),
+.BR plocate (1),
+.BR du (1),
+.BR fanotify (7),
+.BR inotify (7)
+.PP
+https://github.com/YanivSaar/rfind

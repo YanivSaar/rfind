@@ -150,6 +150,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap_complete"
+version = "4.6.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "037e2a1a92236d0aff7e845093f64661d6df4c02c9fcc61a60e9e1d736fa392f"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "clap_derive"
 version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -305,6 +314,17 @@ checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
+]
+
+[[package]]
+name = "io-uring"
+version = "0.7.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed3bd0ecfbb87805f538bb7b32e5239ca0763890c623e349860ecba69469f2bb"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
 ]
 
 [[package]]
@@ -469,29 +489,32 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rfind-cli"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "clap",
+ "clap_complete",
  "libc",
  "rfind-config",
  "rfind-core",
  "rusqlite",
+ "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "rfind-config"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "serde",
  "thiserror",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]
 name = "rfind-core"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "regex-lite",
  "rusqlite",
@@ -502,7 +525,7 @@ dependencies = [
 
 [[package]]
 name = "rfind-integration-tests"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "rfind-config",
  "rfind-core",
@@ -511,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "rfind-monitor"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "libc",
  "rfind-core",
@@ -522,8 +545,9 @@ dependencies = [
 
 [[package]]
 name = "rfind-scanner"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
+ "io-uring",
  "libc",
  "num_cpus",
  "rfind-core",
@@ -533,7 +557,7 @@ dependencies = [
 
 [[package]]
 name = "rfindd"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "libc",
  "num_cpus",
@@ -542,6 +566,7 @@ dependencies = [
  "rfind-monitor",
  "rfind-scanner",
  "rusqlite",
+ "serde",
  "serde_json",
  "signal-hook",
  "thiserror",

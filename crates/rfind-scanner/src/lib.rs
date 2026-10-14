@@ -29,7 +29,7 @@ use std::{
     os::unix::io::RawFd,
     path::PathBuf,
     sync::{
-        atomic::{AtomicI64, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
         Arc, Condvar, Mutex,
     },
     thread,
@@ -93,11 +93,35 @@ struct Statx {
     _pad2: [u64; 13],
 }
 
+const STATX_TYPE: u32 = 0x1;
 const STATX_MTIME: u32 = 0x40;
+const STATX_SIZE: u32 = 0x200;
+const STATX_MASK: u32 = STATX_TYPE | STATX_MTIME | STATX_SIZE;
+const S_IFMT: u16 = 0o170000;
+const S_IFDIR: u16 = 0o040000;
 
-/// Call statx(dirfd, name, AT_SYMLINK_NOFOLLOW, STATX_MTIME, out).
-/// Returns (mtime_sec, mtime_nsec) or (0,0) on error.
-fn statx_mtime(dirfd: RawFd, name: &CStr) -> (i64, i64) {
+/// What the scanner needs from statx: file type, mtime and size.
+#[derive(Clone, Copy)]
+struct Stat {
+    is_dir: bool,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+    size: u64,
+}
+
+impl Stat {
+    fn from_statx(stx: &Statx) -> Self {
+        Self {
+            is_dir: stx.stx_mode & S_IFMT == S_IFDIR,
+            mtime_sec: stx.stx_mtime.tv_sec,
+            mtime_nsec: stx.stx_mtime.tv_nsec as i64,
+            size: stx.stx_size,
+        }
+    }
+}
+
+/// statx(dirfd, name, AT_SYMLINK_NOFOLLOW, TYPE|MTIME|SIZE) as a plain syscall.
+fn statx_one(dirfd: RawFd, name: &CStr) -> Option<Stat> {
     let mut stx = Statx::default();
     let ret = unsafe {
         syscall(
@@ -105,15 +129,84 @@ fn statx_mtime(dirfd: RawFd, name: &CStr) -> (i64, i64) {
             dirfd as libc::c_long,
             name.as_ptr() as libc::c_long,
             AT_SYMLINK_NOFOLLOW as libc::c_long,
-            STATX_MTIME as libc::c_long,
+            STATX_MASK as libc::c_long,
             &mut stx as *mut Statx as libc::c_long,
         )
     };
-    if ret == 0 {
-        (stx.stx_mtime.tv_sec, stx.stx_mtime.tv_nsec as i64)
-    } else {
-        (0, 0)
+    (ret == 0).then(|| Stat::from_statx(&stx))
+}
+
+/// Ring size for batched statx; one batch per getdents64 buffer chunk.
+const URING_ENTRIES: u32 = 256;
+
+/// Set once io_uring turned out to be unusable, so it's reported once.
+static URING_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+
+fn new_ring() -> Option<io_uring::IoUring> {
+    if URING_UNAVAILABLE.load(Ordering::Relaxed) {
+        return None;
     }
+    match io_uring::IoUring::new(URING_ENTRIES) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            if !URING_UNAVAILABLE.swap(true, Ordering::Relaxed) {
+                warn!("io_uring unavailable ({e}); using plain statx syscalls");
+            }
+            None
+        }
+    }
+}
+
+/// statx for every name in `names` (relative to `dirfd`). With a ring the
+/// calls are submitted in batches: one syscall per batch instead of one
+/// per entry, and on slow filesystems (network, WSL2 drvfs) the kernel
+/// runs them concurrently.
+fn statx_batch(
+    ring: &mut Option<io_uring::IoUring>,
+    dirfd: RawFd,
+    names: &[&CStr],
+) -> Vec<Option<Stat>> {
+    let Some(r) = ring.as_mut() else {
+        return names.iter().map(|n| statx_one(dirfd, n)).collect();
+    };
+    let mut out = vec![None; names.len()];
+    let mut bufs: Vec<Statx> = (0..names.len()).map(|_| Statx::default()).collect();
+    for (chunk_start, chunk) in names.chunks(URING_ENTRIES as usize).enumerate() {
+        let base = chunk_start * URING_ENTRIES as usize;
+        for (i, name) in chunk.iter().enumerate() {
+            let sqe = io_uring::opcode::Statx::new(
+                io_uring::types::Fd(dirfd),
+                name.as_ptr(),
+                &mut bufs[base + i] as *mut Statx as *mut io_uring::types::statx,
+            )
+            .flags(AT_SYMLINK_NOFOLLOW)
+            .mask(STATX_MASK)
+            .build()
+            .user_data((base + i) as u64);
+            // The ring has URING_ENTRIES slots and the chunk is no larger.
+            unsafe { r.submission().push(&sqe).expect("submission queue full") };
+        }
+        if let Err(e) = r.submit_and_wait(chunk.len()) {
+            warn!("io_uring submit failed ({e}); falling back to statx syscalls");
+            URING_UNAVAILABLE.store(true, Ordering::Relaxed);
+            *ring = None;
+            return names.iter().map(|n| statx_one(dirfd, n)).collect();
+        }
+        let mut done = 0;
+        while done < chunk.len() {
+            for cqe in r.completion() {
+                let i = cqe.user_data() as usize;
+                if cqe.result() >= 0 {
+                    out[i] = Some(Stat::from_statx(&bufs[i]));
+                }
+                done += 1;
+            }
+            if done < chunk.len() && r.submit_and_wait(chunk.len() - done).is_err() {
+                break;
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -183,6 +276,8 @@ pub struct EntryInfo {
     pub is_dir: bool,
     pub mtime_sec: i64,
     pub mtime_nsec: i64,
+    /// Size in bytes (0 for directories).
+    pub size: u64,
 }
 
 pub type ProgressFn = Box<dyn Fn(ScanProgress) + Send + Sync + 'static>;
@@ -195,6 +290,10 @@ pub struct ScanConfig {
     pub workers: usize,
     pub progress_interval: Duration,
     pub collect_mtime: bool,
+    /// Batch statx through io_uring when available.
+    pub io_uring: bool,
+    /// Set to stop the scan early; the result is then marked cancelled.
+    pub cancel: Arc<AtomicBool>,
     pub on_progress: ProgressFn,
     pub on_entry: EntryFn,
     pub on_error: ErrorFn,
@@ -213,6 +312,8 @@ impl ScanConfig {
             workers: num_cpus::get().max(2),
             progress_interval: Duration::from_secs(1),
             collect_mtime,
+            io_uring: false,
+            cancel: Arc::new(AtomicBool::new(false)),
             on_progress: Box::new(on_progress),
             on_entry: Box::new(on_entry),
             on_error: Box::new(|p, e| eprintln!("SCAN ERROR {}: {}", p.display(), e)),
@@ -239,9 +340,33 @@ impl ScanConfig {
         self.skip_dir = Box::new(f);
         self
     }
+
+    pub fn with_io_uring(mut self, on: bool) -> Self {
+        self.io_uring = on;
+        self
+    }
+
+    pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = cancel;
+        self
+    }
 }
 
-pub fn run_scan(config: ScanConfig) -> u64 {
+/// Outcome of [`run_scan`].
+#[derive(Debug, Clone, Copy)]
+pub struct ScanResult {
+    pub entries: u64,
+    pub dirs: u64,
+    pub errors: u64,
+    /// Stopped early via [`ScanConfig::cancel`]: the scan is incomplete
+    /// and must not be used to delete entries it didn't see.
+    pub cancelled: bool,
+    /// statx calls went through io_uring.
+    pub io_uring: bool,
+    pub elapsed: Duration,
+}
+
+pub fn run_scan(config: ScanConfig) -> ScanResult {
     let wq = Arc::new(WorkQueue::new());
     let counters = Arc::new(Counters::default());
     let on_entry = Arc::new(config.on_entry);
@@ -265,10 +390,21 @@ pub fn run_scan(config: ScanConfig) -> u64 {
         let on_entry = Arc::clone(&on_entry);
         let on_error = Arc::clone(&on_error);
         let skip_dir = Arc::clone(&skip_dir);
-        let collect_mtime = config.collect_mtime;
+        let cancel = Arc::clone(&config.cancel);
+        let (collect_mtime, io_uring) = (config.collect_mtime, config.io_uring);
 
         handles.push(thread::spawn(move || {
-            worker_loop(wq, counters, on_entry, on_error, skip_dir, collect_mtime);
+            let ring = if io_uring { new_ring() } else { None };
+            worker_loop(
+                wq,
+                counters,
+                on_entry,
+                on_error,
+                skip_dir,
+                &cancel,
+                collect_mtime,
+                ring,
+            );
         }));
     }
 
@@ -277,13 +413,20 @@ pub fn run_scan(config: ScanConfig) -> u64 {
     let mut last_entries = 0u64;
     let mut last_tick = Instant::now();
 
+    let mut last_report = Instant::now();
     loop {
-        thread::sleep(config.progress_interval);
+        // Poll often (so short scans and cancellation finish promptly),
+        // report every progress_interval.
+        thread::sleep(Duration::from_millis(20));
+        let in_flight = counters.in_flight.load(Ordering::Relaxed).max(0) as u64;
+        if in_flight > 0 && last_report.elapsed() < config.progress_interval {
+            continue;
+        }
+        last_report = Instant::now();
 
         let entries = counters.entries_found.load(Ordering::Relaxed);
         let dirs_done = counters.dirs_completed.load(Ordering::Relaxed);
         let errors = counters.errors.load(Ordering::Relaxed);
-        let in_flight = counters.in_flight.load(Ordering::Relaxed).max(0) as u64;
         let done = in_flight == 0;
 
         let tick_secs = last_tick.elapsed().as_secs_f64();
@@ -339,7 +482,14 @@ pub fn run_scan(config: ScanConfig) -> u64 {
     for h in handles {
         let _ = h.join();
     }
-    counters.entries_found.load(Ordering::Relaxed)
+    ScanResult {
+        entries: counters.entries_found.load(Ordering::Relaxed),
+        dirs: counters.dirs_completed.load(Ordering::Relaxed),
+        errors: counters.errors.load(Ordering::Relaxed),
+        cancelled: config.cancel.load(Ordering::Relaxed),
+        io_uring: config.io_uring && !URING_UNAVAILABLE.load(Ordering::Relaxed),
+        elapsed: start.elapsed(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -354,16 +504,30 @@ fn open_dir_fd(path: &std::path::Path) -> RawFd {
     unsafe { openat(AT_FDCWD, cpath.as_ptr(), O_RDONLY | O_DIRECTORY | O_CLOEXEC) }
 }
 
+/// Finish one queued directory: drop it from the in-flight count and wake
+/// the others if it was the last.
+fn finish_item(wq: &WorkQueue, counters: &Counters) {
+    let remaining = counters.in_flight.fetch_sub(1, Ordering::SeqCst) - 1;
+    if remaining == 0 {
+        wq.wake_all();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn worker_loop(
     wq: Arc<WorkQueue>,
     counters: Arc<Counters>,
     on_entry: Arc<EntryFn>,
     on_error: Arc<ErrorFn>,
     skip_dir: Arc<SkipDirFn>,
+    cancel: &AtomicBool,
     collect_mtime: bool,
+    mut ring: Option<io_uring::IoUring>,
 ) {
     const BUF_SIZE: usize = 65536;
     let mut buf = vec![0u8; BUF_SIZE];
+    // Entries of the current getdents64 buffer: (name, d_type).
+    let mut batch: Vec<(CString, u8)> = Vec::with_capacity(512);
 
     loop {
         let item = match wq.pop_or_done(&counters.in_flight) {
@@ -373,6 +537,11 @@ fn worker_loop(
                 break;
             }
         };
+        // Cancelled: drain the queue without reading anything.
+        if cancel.load(Ordering::Relaxed) {
+            finish_item(&wq, &counters);
+            continue;
+        }
 
         let dir_path = item.path;
         let dir_fd = open_dir_fd(&dir_path);
@@ -380,10 +549,7 @@ fn worker_loop(
             let err = std::io::Error::last_os_error();
             on_error(&dir_path, &err.to_string());
             counters.errors.fetch_add(1, Ordering::Relaxed);
-            let remaining = counters.in_flight.fetch_sub(1, Ordering::SeqCst) - 1;
-            if remaining == 0 {
-                wq.wake_all();
-            }
+            finish_item(&wq, &counters);
             continue;
         }
 
@@ -399,7 +565,6 @@ fn worker_loop(
                     BUF_SIZE as libc::c_long,
                 )
             };
-
             if n < 0 {
                 let err = std::io::Error::last_os_error();
                 on_error(&dir_path, &err.to_string());
@@ -407,60 +572,68 @@ fn worker_loop(
                 break;
             }
             if n == 0 {
-                break;
-            } // end of directory
+                break; // end of directory
+            }
 
+            batch.clear();
             let mut pos = 0usize;
-            let n = n as usize;
-
-            while pos < n {
+            while pos < n as usize {
                 let dent = unsafe { &*(buf.as_ptr().add(pos) as *const LinuxDirent64) };
-
-                // Name starts after the fixed fields.
                 let name_offset = mem::offset_of!(LinuxDirent64, d_type) + 1;
-                let name_ptr = unsafe { buf.as_ptr().add(pos + name_offset) as *const c_char };
-                let name_cstr = unsafe { CStr::from_ptr(name_ptr) };
-                let name_bytes = name_cstr.to_bytes();
-
-                // Skip . and ..
-                if name_bytes == b"." || name_bytes == b".." {
-                    pos += dent.d_reclen as usize;
-                    continue;
+                let name =
+                    unsafe { CStr::from_ptr(buf.as_ptr().add(pos + name_offset) as *const c_char) };
+                pos += dent.d_reclen as usize;
+                if name.to_bytes() != b"." && name.to_bytes() != b".." {
+                    batch.push((name.to_owned(), dent.d_type));
                 }
+            }
 
-                let is_dir = dent.d_type == DT_DIR;
-                // Keep the raw bytes: a lossy name could not be reopened.
-                let child_path = dir_path.join(std::ffi::OsStr::from_bytes(name_bytes));
+            // statx when we want mtimes, or when getdents didn't say
+            // whether the entry is a directory (DT_UNKNOWN on some network
+            // and FUSE filesystems) — otherwise those would never be scanned.
+            let wants_stat = |d_type: u8| {
+                d_type == DT_UNKNOWN || (collect_mtime && (d_type == DT_REG || d_type == DT_DIR))
+            };
+            let to_stat: Vec<&CStr> = batch
+                .iter()
+                .filter(|(_, t)| wants_stat(*t))
+                .map(|(n, _)| n.as_c_str())
+                .collect();
+            let mut stats = statx_batch(&mut ring, dir_fd, &to_stat).into_iter();
 
-                if is_dir && skip_dir(&child_path) {
-                    pos += dent.d_reclen as usize;
-                    continue;
-                }
-
-                // Get mtime via statx(dirfd, relative_name).
-                let (mtime_sec, mtime_nsec) = if collect_mtime
-                    && (dent.d_type == DT_REG || dent.d_type == DT_DIR || dent.d_type == DT_UNKNOWN)
-                {
-                    statx_mtime(dir_fd, name_cstr)
+            for (name, d_type) in &batch {
+                let st = if wants_stat(*d_type) {
+                    stats.next().flatten()
                 } else {
-                    (0, 0)
+                    None
                 };
-
+                let is_dir =
+                    *d_type == DT_DIR || (*d_type == DT_UNKNOWN && st.is_some_and(|s| s.is_dir));
+                // Keep the raw bytes: a lossy name could not be reopened.
+                let child_path = dir_path.join(std::ffi::OsStr::from_bytes(name.to_bytes()));
+                if is_dir && skip_dir(&child_path) {
+                    continue;
+                }
+                let (mtime_sec, mtime_nsec, size) = match st {
+                    // Directory sizes are derived from their files at query time.
+                    Some(s) if collect_mtime => {
+                        (s.mtime_sec, s.mtime_nsec, if is_dir { 0 } else { s.size })
+                    }
+                    _ => (0, 0, 0),
+                };
                 on_entry(EntryInfo {
                     path: child_path.clone(),
                     is_dir,
                     mtime_sec,
                     mtime_nsec,
+                    size,
                 });
                 local_count += 1;
 
-                // Push subdirectories onto the work queue.
                 if is_dir {
                     counters.in_flight.fetch_add(1, Ordering::SeqCst);
                     wq.push(WorkItem { path: child_path });
                 }
-
-                pos += dent.d_reclen as usize;
             }
         }
 
@@ -469,10 +642,6 @@ fn worker_loop(
             .entries_found
             .fetch_add(local_count, Ordering::Relaxed);
         counters.dirs_completed.fetch_add(1, Ordering::Relaxed);
-
-        let remaining = counters.in_flight.fetch_sub(1, Ordering::SeqCst) - 1;
-        if remaining == 0 {
-            wq.wake_all();
-        }
+        finish_item(&wq, &counters);
     }
 }

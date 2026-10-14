@@ -94,6 +94,15 @@ impl Monitor {
         }
     }
 
+    /// Watch a filesystem mounted after startup. fanotify marks it; inotify
+    /// needs no action here (the scan of the new mount adds watches).
+    pub fn add_filesystem(&self, point: &Path) -> Result<bool, String> {
+        match self {
+            Monitor::Fanotify(m) => m.add_filesystem(point).map_err(|e| e.to_string()),
+            Monitor::Inotify(_) => Ok(false),
+        }
+    }
+
     /// True (once) if events were lost to a kernel queue overflow since
     /// the last call; the index must be rescanned to recover.
     pub fn take_overflow(&self) -> bool {

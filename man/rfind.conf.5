@@ -1,0 +1,143 @@
+.TH RFIND.CONF 5 "2026-10-14" "rfind 0.6.0" "File Formats"
+.SH NAME
+rfind.conf \- configuration of the rfindd indexing daemon
+.SH SYNOPSIS
+.I /etc/rfindd/config.toml
+.SH DESCRIPTION
+.BR rfindd (8)
+reads its configuration from a TOML file, written with the defaults on its
+first start.
+Every setting is optional.
+Unknown keys are an error, so a typo can't silently change behavior; check
+the file with
+.BR "rfind config check" .
+.PP
+The file can be edited by hand (then run
+.BR "rfind reload" )
+or changed with
+.BR "rfind config" ,
+which keeps comments, validates every change and reloads the daemon; see
+.BR rfind (1).
+All paths must be absolute.
+.SH [scan]
+.TP
+.BR roots " (list of paths; default " [\(dq/\(dq] )
+Live roots: scanned, then kept current by fanotify or inotify.
+.TP
+.BR exclude " (list of paths; default " /proc ", " /sys ", " /dev ", " /run ", " /media )
+Paths never indexed and never descended into, with everything below them.
+.TP
+.BR workers " (integer; default " 0 )
+Scanner threads;
+.B 0
+means one per CPU.
+.TP
+.BR reindex_interval_hours " (integer; default " 6 )
+Full rescan of the live roots when the last one is older than this at
+startup, and periodically in index-only mode.
+.B 0
+disables it.
+.TP
+.BR collect_mtime " (boolean; default " true )
+Record modification times and file sizes.
+Without them,
+.BR "rfind recent" ,
+.BR "rfind size" ,
+.B rfind largest
+and the size filters have nothing to work with; scanning is slightly faster.
+.TP
+.BR io_uring " (boolean; default " true )
+Batch the scanner's
+.BR statx (2)
+calls through
+.BR io_uring (7).
+About twice as fast on local disks and network filesystems; rfindd falls
+back to plain system calls when io_uring is unavailable.
+.SS [[scan.periodic_roots]]
+One table per root that is rescanned on an interval instead of monitored.
+A periodic root inside a live root is skipped by the live root's scans.
+.TP
+.B path
+The root.
+.TP
+.BR interval_hours " (integer; default " 12 )
+Hours between rescans;
+.B 0
+scans only once.
+.SH [index]
+.TP
+.BR db_path " (path; default " /var/lib/rfindd/index.db )
+The index database.
+.TP
+.BR batch_size " (integer; default " 10000 )
+Entries per scanner write transaction.
+.SH [monitor]
+.TP
+.BR prefer_fanotify " (boolean; default " true )
+Use fanotify (one mark per filesystem; Linux 5.9+) when possible.
+.TP
+.BR inotify_fallback " (boolean; default " true )
+Fall back to per-directory inotify watches when fanotify is unavailable.
+With both disabled or unavailable, rfindd rescans the live roots every
+.B reindex_interval_hours
+hours.
+.TP
+.BR watch_new_mounts " (boolean; default " true )
+Index and watch filesystems mounted under a live root after startup.
+Overlay and pseudo filesystems and bind mounts of indexed files are ignored.
+.SH EXAMPLE
+.nf
+# Index the whole system; Windows drives are rescanned twice a day.
+[scan]
+roots = ["/"]
+exclude = [
+    "/proc",
+    "/sys",
+    "/dev",
+    "/run",
+    "/media",
+    "/home/moshe",
+]
+workers = 0
+reindex_interval_hours = 6
+collect_mtime = true
+io_uring = true
+
+[[scan.periodic_roots]]
+path = "/mnt/c"
+interval_hours = 12
+
+[index]
+db_path = "/var/lib/rfindd/index.db"
+batch_size = 10000
+
+[monitor]
+prefer_fanotify = true
+inotify_fallback = true
+watch_new_mounts = true
+.fi
+.SH NOTES
+Under WSL2, put Windows drives
+.RI ( /mnt/c ", " /mnt/d ", ...)"
+in
+.B periodic_roots
+or
+.BR exclude :
+changes made from Windows produce no kernel events.
+rfindd logs a warning for a Windows drive under a live root.
+Network filesystems (NFS, SMB) belong in
+.B periodic_roots
+for the same reason.
+.SH FILES
+.TP
+.I /etc/rfindd/config.toml
+The configuration.
+The
+.B RFIND_CONFIG
+environment variable selects another file for both
+.B rfind
+and
+.BR rfindd .
+.SH SEE ALSO
+.BR rfind (1),
+.BR rfindd (8)

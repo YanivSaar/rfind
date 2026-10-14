@@ -35,13 +35,16 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, RwLock,
     },
     thread,
     time::Duration,
 };
 use thiserror::Error;
 use tracing::{error, info, warn};
+
+/// Set after the first unexpected handle-resolution failure is reported.
+static RESOLVE_WARNED: AtomicBool = AtomicBool::new(false);
 
 const MASK_COMMON: u64 = FAN_CREATE | FAN_DELETE | FAN_CLOSE_WRITE | FAN_ONDIR;
 
@@ -55,11 +58,40 @@ pub enum FanotifyError {
     NoMarks,
 }
 
-/// A marked filesystem: its fsid (as reported in events) and an open fd
-/// of the mount used to resolve handles.
+/// A marked filesystem: its fsid (as reported in events) and the mount
+/// point used to resolve handles. The mount is opened per lookup, never
+/// held open: an open fd would keep the filesystem busy and make
+/// `umount` of a marked disk fail.
 struct MarkedFs {
     fsid: [i32; 2],
-    mount_fd: RawFd,
+    point: PathBuf,
+}
+
+/// The fanotify fd and its marks, shared with the event loop so
+/// filesystems can be added while it runs.
+struct FanState {
+    fd: RawFd,
+    mask: u64,
+    marked: RwLock<Vec<MarkedFs>>,
+}
+
+impl Drop for FanState {
+    fn drop(&mut self) {
+        unsafe { close(self.fd) };
+    }
+}
+
+impl FanState {
+    /// Mark the filesystem at `point` (no-op if it is already marked).
+    fn add(&self, point: &Path) -> Result<bool, FanotifyError> {
+        let m = mark_filesystem(self.fd, point, self.mask)?;
+        let mut marked = self.marked.write().unwrap();
+        if marked.iter().any(|x| x.fsid == m.fsid) {
+            return Ok(false);
+        }
+        marked.push(m);
+        Ok(true)
+    }
 }
 
 struct Scope {
@@ -75,6 +107,7 @@ impl Scope {
 }
 
 pub struct FanotifyMonitor {
+    state: Arc<FanState>,
     stop: Arc<AtomicBool>,
     overflow: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
@@ -102,20 +135,16 @@ impl FanotifyMonitor {
                 FAN_MOVED_FROM | FAN_MOVED_TO
             };
 
-        let mut marked = Vec::new();
+        let state = Arc::new(FanState {
+            fd,
+            mask,
+            marked: RwLock::new(Vec::new()),
+        });
         for (i, point) in mark_points.iter().enumerate() {
-            match mark_filesystem(fd, point, mask) {
-                Ok(m) => {
-                    info!("fanotify: watching filesystem at {}", point.display());
-                    marked.push(m);
-                }
-                Err(e) if i == 0 => {
-                    for m in &marked {
-                        unsafe { close(m.mount_fd) };
-                    }
-                    unsafe { close(fd) };
-                    return Err(e);
-                }
+            match state.add(point) {
+                Ok(_) => info!("fanotify: watching filesystem at {}", point.display()),
+                // Dropping `state` closes the fanotify fd.
+                Err(e) if i == 0 => return Err(e),
                 Err(e) => {
                     warn!("{e} — changes there won't be seen live; consider scan.periodic_roots")
                 }
@@ -134,23 +163,24 @@ impl FanotifyMonitor {
         let stop = Arc::new(AtomicBool::new(false));
         let overflow = Arc::new(AtomicBool::new(false));
         let handle = {
-            let (s, o) = (Arc::clone(&stop), Arc::clone(&overflow));
+            let (s, o, st) = (Arc::clone(&stop), Arc::clone(&overflow), Arc::clone(&state));
             let scope = Scope { roots, excludes };
-            thread::spawn(move || {
-                event_loop(fd, &marked, &scope, &sink, &s, &o);
-                for m in &marked {
-                    unsafe { close(m.mount_fd) };
-                }
-                unsafe { close(fd) };
-            })
+            thread::spawn(move || event_loop(&st, &scope, &sink, &s, &o))
         };
 
         Ok(Self {
+            state,
             stop,
             overflow,
             handle: Some(handle),
             writer: Some(writer),
         })
+    }
+
+    /// Start watching another filesystem (e.g. one mounted after startup).
+    /// Returns false if it was already watched.
+    pub fn add_filesystem(&self, point: &Path) -> Result<bool, FanotifyError> {
+        self.state.add(point)
     }
 
     /// True (once) if the kernel queue overflowed since the last call.
@@ -213,19 +243,23 @@ fn mark_filesystem(fd: RawFd, point: &Path, mask: u64) -> Result<MarkedFs, Fanot
         return Err(err(errno()));
     }
     let mut st: libc::statfs = unsafe { mem::zeroed() };
-    if unsafe { fstatfs(mount_fd, &mut st) } < 0 {
-        let e = errno();
-        unsafe { close(mount_fd) };
+    let ret = unsafe { fstatfs(mount_fd, &mut st) };
+    let e = errno();
+    unsafe { close(mount_fd) };
+    if ret < 0 {
         return Err(err(e));
     }
     // fsid_t's field is private; it is two i32s, as in event records.
     let fsid: [i32; 2] = unsafe { mem::transmute(st.f_fsid) };
-    Ok(MarkedFs { fsid, mount_fd })
+    Ok(MarkedFs {
+        fsid,
+        point: point.to_path_buf(),
+    })
 }
 
 /// Resolve a DFID_NAME info record (header + fsid + file_handle + name)
 /// to the full path of the entry it names.
-fn resolve(rec: &[u8], marked: &[MarkedFs]) -> Option<PathBuf> {
+fn resolve(rec: &[u8], marked: &RwLock<Vec<MarkedFs>>) -> Option<PathBuf> {
     let i32_at = |o: usize| {
         rec.get(o..o + 4)
             .map(|b| i32::from_ne_bytes(b.try_into().unwrap()))
@@ -236,7 +270,19 @@ fn resolve(rec: &[u8], marked: &[MarkedFs]) -> Option<PathBuf> {
     if rec.len() < handle_end {
         return None;
     }
-    let mount_fd = marked.iter().find(|m| m.fsid == fsid)?.mount_fd;
+    let point = marked
+        .read()
+        .unwrap()
+        .iter()
+        .find(|m| m.fsid == fsid)?
+        .point
+        .clone();
+    let cpoint = CString::new(point.as_os_str().as_encoded_bytes()).ok()?;
+    // Not O_PATH: open_by_handle_at() rejects O_PATH fds with EBADF.
+    let mount_fd = unsafe { open(cpoint.as_ptr(), O_RDONLY | O_DIRECTORY | O_CLOEXEC) };
+    if mount_fd < 0 {
+        return None; // unmounted meanwhile
+    }
 
     // struct file_handle { u32 handle_bytes; i32 handle_type; u8 f_handle[] },
     // copied into a 4-byte-aligned buffer.
@@ -255,6 +301,14 @@ fn resolve(rec: &[u8], marked: &[MarkedFs]) -> Option<PathBuf> {
             O_PATH | O_CLOEXEC,
         )
     };
+    let open_err = errno();
+    unsafe { close(mount_fd) };
+    if dfd < 0 && open_err != libc::ESTALE && !RESOLVE_WARNED.swap(true, Ordering::Relaxed) {
+        warn!(
+            "fanotify: cannot resolve file handles ({}); events are being lost",
+            strerror(open_err)
+        );
+    }
     if dfd < 0 {
         return None;
     } // directory already gone (ESTALE)
@@ -274,8 +328,7 @@ fn resolve(rec: &[u8], marked: &[MarkedFs]) -> Option<PathBuf> {
 }
 
 fn event_loop(
-    fd: RawFd,
-    marked: &[MarkedFs],
+    state: &FanState,
     scope: &Scope,
     sink: &EventSink,
     stop: &AtomicBool,
@@ -290,7 +343,7 @@ fn event_loop(
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        let len = unsafe { read(fd, buf.as_mut_ptr() as *mut _, BUF) };
+        let len = unsafe { read(state.fd, buf.as_mut_ptr() as *mut _, BUF) };
         if len < 0 {
             let e = std::io::Error::last_os_error();
             if e.kind() == std::io::ErrorKind::WouldBlock {
@@ -335,9 +388,9 @@ fn event_loop(
                 }
                 let rec = &buf[p..p + rec_len];
                 match kind {
-                    FAN_EVENT_INFO_TYPE_DFID_NAME => path = resolve(rec, marked),
-                    FAN_EVENT_INFO_TYPE_OLD_DFID_NAME => old = resolve(rec, marked),
-                    FAN_EVENT_INFO_TYPE_NEW_DFID_NAME => new = resolve(rec, marked),
+                    FAN_EVENT_INFO_TYPE_DFID_NAME => path = resolve(rec, &state.marked),
+                    FAN_EVENT_INFO_TYPE_OLD_DFID_NAME => old = resolve(rec, &state.marked),
+                    FAN_EVENT_INFO_TYPE_NEW_DFID_NAME => new = resolve(rec, &state.marked),
                     _ => {}
                 }
                 p += rec_len;

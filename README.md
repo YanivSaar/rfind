@@ -17,19 +17,54 @@
 
 ## ⚡ Performance
 
-| Operation | rfind | GNU find | Speedup |
-|-----------|------:|--------:|--------:|
-| Search by exact name | **6 ms** | 1.8 s | ~300× |
-| Search by glob `*.conf` | **116 ms** | 1.9 s | ~16× |
-| Regex `^lib.*\.so\.[0-9]+$` | **189 ms** | 2.0 s | ~10× |
-| Under a directory (`/etc`, `*.conf`) | **5 ms** | 8 ms | ~1.6× |
-| Change visible after create / rename / delete | **≤ 5 s** | immediate | — |
-| Initial index build, Linux side (146k entries) | **2.0 s** | — | — |
+Measured with `scripts/bench.sh` (release build, WSL2, 4 cores) on a real
+system with 1.52M indexed entries, against plocate, GNU locate and find.
+Every query returned exactly `find`'s results.
 
-> Release build, WSL2 (4 cores), 1.46M indexed entries (Linux + a Windows
-> drive). `find` timings cover the Linux side only (146k entries); rfind
-> searched all 1.46M. Every query returned exactly `find`'s results.
-> Reproduce on your machine: `sudo ./scripts/bench.sh`.
+| Operation | rfind | plocate | find |
+|-----------|------:|--------:|-----:|
+| Exact name (`passwd`) | **7 ms** | 13 ms | 1.7 s |
+| Glob `*.conf` | 104 ms | **15 ms** | 1.6 s |
+| Under a directory (`/etc`, `*.conf`) | **7 ms** | 6 ms | 8 ms |
+| Total size of `/usr` (9.8 GB) | **25 ms** | — | 5.0 s |
+| 10 largest files under `/usr` | **38 ms** | — | 5.3 s |
+| Change visible (create / rename / append / delete) | **≤ 5 s** | at next `updatedb` | immediate |
+| Linux side index build (185k entries) | **2.2 s** | 2.3 s | — |
+
+> plocate's database here held only the 185k Linux-side entries while rfind
+> searched all 1.52M (including a Windows drive), so plocate's glob and regex
+> times are not like-for-like. On equal data (10M below) rfind is faster on
+> globs and exact names; plocate keeps the edge on regexes and size.
+
+### Scale: 10 million files
+
+A real 10,000,001-file tree on ext4 (10,201 directories), indexed by an
+isolated rfindd:
+
+| | rfind | plocate | find |
+|---|---:|---:|---:|
+| Initial index build | 70 s (with sizes, io_uring) | **14 s** (names only) | — |
+| Index size | 1.03 GB (103 B/entry) | **62 MB** | — |
+| Daemon memory (peak) | 84 MB | — | — |
+| Exact name | **8–13 ms** | 380 ms | 0.7 s warm / 5.3 s cold |
+| Glob `*.md` (1M results) | **1.6 s** | 3.6 s | 1.8 s |
+| First 10 matches of a glob | **5 ms** | 32 ms | — |
+| Regex over all names | 1.5 s | **0.85 s** | — |
+| Total size of all 10M files | **3.1 s** | — | `du`: 61 s |
+| Size of a 50k-file subtree | **21 ms** | — | — |
+| `largest` / `--larger-than 1M` | **4–7 ms** | — | — |
+| Create, rename (50k-entry dir), delete (50k subtree) visible | **≤ 5 s** | at next `updatedb` | — |
+| Daemon restart (journal replay) | **0.4 s** | — | — |
+| Full rescan | 57 s | 14 s | — |
+
+### io_uring
+
+The scanner batches `statx` through io_uring (`scan.io_uring`, on by default):
+
+| Tree | plain `statx` | io_uring |
+|------|--------------:|---------:|
+| `/usr` on ext4 (57k entries) | 33–37k entries/s | **62–66k entries/s** |
+| `C:\Windows\System32` over 9p (35k) | 4.0k entries/s | **7.4k entries/s** |
 
 ---
 
@@ -89,17 +124,20 @@ and kept current via kernel filesystem notifications. No more waiting for
 curl -fsSL https://raw.githubusercontent.com/YanivSaar/rfind/main/scripts/install.sh | sudo bash
 ```
 
-Builds from source (installs a C compiler and Rust if missing), installs
-`rfind` + `rfindd` to `/usr/local/bin`, and enables the `rfindd` systemd
-service. On WSL2 a first install configures Windows drives as periodic roots.
+Downloads a static binary for your architecture (x86_64 or aarch64, checksum
+verified) — or builds from source if there's no release for it — and installs
+`rfind` + `rfindd`, the man pages and bash/zsh/fish completions, and the
+`rfindd` systemd service. On WSL2 a first install configures Windows drives as
+periodic roots.
 
 | Task | One-liner |
 |------|-----------|
 | Install / update | `curl -fsSL https://raw.githubusercontent.com/YanivSaar/rfind/main/scripts/install.sh \| sudo bash` |
 | From a clone | `git clone https://github.com/YanivSaar/rfind.git && cd rfind && sudo ./scripts/install.sh` |
-| Specific branch/tag | `curl -fsSL …/install.sh \| sudo RFIND_REF=<branch-or-tag> bash` |
-| Uninstall (keep index) | `curl -fsSL …/install.sh \| sudo bash -s -- --uninstall` |
-| Uninstall + purge | `curl -fsSL …/install.sh \| sudo bash -s -- --uninstall --purge` |
+| Specific release | `curl -fsSL …/install.sh \| sudo RFIND_VERSION=v0.6.0 bash` |
+| Build from source | `curl -fsSL …/install.sh \| sudo RFIND_FROM_SOURCE=1 bash` |
+| Uninstall (keep index) | `sudo rfind uninstall` |
+| Uninstall + purge | `sudo rfind uninstall --purge` |
 | Watch first scan | `rfind status --watch` |
 | Benchmark vs find/locate | `sudo ./scripts/bench.sh --quick` |
 
@@ -138,7 +176,7 @@ rfind path "/usr/lib/python*/*.py"
 | Requirement | Version |
 |-------------|---------|
 | Linux kernel | 5.9+ for fanotify (5.17+ for single-event renames); older kernels use inotify |
-| Rust | 1.77+ (for building; the installer sets it up) |
+| Rust | 1.77+ — only to build from source; the installer downloads static binaries |
 | Architecture | x86_64, aarch64 (any Linux target with `statx`) |
 | Root access | Required: the daemon needs it to monitor, and searches need it because the index lists every file name |
 | WSL2 | ✅ fanotify on `/`; Windows drives as periodic roots |
@@ -165,6 +203,9 @@ sudo ./scripts/install.sh
 
 ## 🔍 Usage
 
+Searching needs root (`sudo`): the index lists every file on the system.
+Every command has `--help`, and `man rfind` documents all of them.
+
 ### Search commands
 
 ```bash
@@ -181,40 +222,86 @@ rfind name "^app\." --regex          # regular expression
 # By path
 rfind path "/etc/nginx*"             # full path glob
 rfind path "/home/*/.*"              # dotfiles in home dirs
-rfind path "/usr/lib/*.so.*"         # shared libraries
 
 # By modification time
 rfind recent                         # last 24 hours (default)
 rfind recent --minutes 30            # last 30 minutes
-rfind recent --hours 6               # last 6 hours
-rfind recent --days 7                # last 7 days
-rfind recent --from 2026-10-01 --to 2026-10-13   # date range
-rfind recent --days 1 --type f       # files only, last day
-rfind recent --hours 1 --limit 20    # cap results
+rfind recent --from 2026-10-01 --to 2026-10-13   # date range (local time)
+
+# By size (any search; K/M/G/T are powers of 1024)
+rfind name "*.iso" --larger-than 1G
+rfind name "*.log" --under /var --smaller-than 1K
+rfind recent --hours 2 -l            # -l / --long: size and time per result
 ```
+
+### Disk usage — from the index, no disk walk
+
+```bash
+rfind size /home                     # total + 20 largest children (like du -d1)
+rfind size / --top 5
+rfind largest --under /var --limit 10
+```
+
+Directory sizes are summed from the indexed file sizes at query time;
+nothing extra is stored per directory.
+
+### Scripting
+
+```bash
+rfind name "*.log" --json            # one JSON object per result (JSON Lines)
+# {"path":"/var/log/syslog","type":"file","size":81234,"mtime":1791900000}
+rfind --json health                  # single objects for status/health/stats/config
+rfind name "*.log" --json | jq -r 'select(.size > 1e8) | .path'
+```
+
+Exit status: `0` results found, `1` no results, `2` error.
+
+### Configuration commands
+
+`rfind config` edits `/etc/rfindd/config.toml` in place — comments are kept,
+every change is validated before it's written, and rfindd reloads
+automatically (it purges newly excluded entries and scans what was added,
+without rebuilding the index):
+
+```bash
+rfind config exclude add /home/moshe        # stop indexing a directory
+rfind config exclude list
+rfind config root add /data                 # another live (monitored) root
+rfind config periodic add /mnt/nas --every 24   # rescan a share daily
+rfind config set scan.workers 8
+rfind config get scan.exclude
+rfind config keys                           # every setting, value and meaning
+rfind config edit                           # $EDITOR, validated on save
+rfind config check
+rfind config reset --yes                    # back to defaults (keeps a .bak)
+```
+
+Add `--no-reload` to only write the file; `rfind reload` applies it later.
 
 ### Daemon commands
 
 ```bash
-# Status
 rfind status                         # current state snapshot
 rfind status --watch                 # live refresh until Ready
-
-# Health and stats
-rfind health                         # index freshness, monitoring mode, DB size
-rfind stats                          # entry counts, top file types, largest dirs
-
-# Control
-rfind update                         # trigger immediate re-index (SIGUSR1)
+rfind health                         # LIVE/FRESH/STALE, entries, bytes, DB size
+rfind stats                          # top file types, largest directories
+rfind update                         # rescan now (SIGUSR1)
+rfind reload                         # re-read the config (SIGHUP)
+rfind uninstall [--purge]            # remove everything (--purge: index + config too)
 ```
+
+### Shell completions
+
+Installed for bash, zsh and fish by the installer; for other shells:
+`rfind completions <bash|zsh|fish|elvish|powershell>`.
 
 ### systemd integration
 
 ```bash
 systemctl status rfindd              # status + recent log lines
+systemctl reload rfindd              # re-read the config in place
 systemctl restart rfindd             # restart (smart: replays journal if fresh)
 journalctl -u rfindd -f              # follow live logs
-journalctl -u rfindd --since "1h ago"
 ```
 
 ---
@@ -422,6 +509,16 @@ On daemon restart:
 |--------:|--------------------:|
 | 150k | ~30 MB |
 | 1.5M | ~300 MB |
+| 10M | ~1–2 GB |
+| 100M | ~10–20 GB |
+
+Measured: 1.52M real entries → 302 MB (~200 B/entry, long Windows paths);
+10M synthetic entries with short names → 1.03 GB (103 B/entry). Includes the
+name, directory, mtime and big-file indexes.
+
+--------:|--------------------:|
+| 150k | ~30 MB |
+| 1.5M | ~300 MB |
 | 10M | ~2 GB |
 | 100M | ~20 GB |
 
@@ -466,10 +563,22 @@ sudo ./scripts/bench.sh --quick     # Linux side only, ~1 min
 sudo ./scripts/bench.sh             # include periodic roots such as /mnt/c
 ```
 
-### Test coverage (15 tests)
+### Test coverage
 
-| Category | Tests |
-|----------|------:|
+| Suite | Tests | Needs a running rfindd |
+|-------|------:|:---:|
+| Index: upserts, subtrees, renames, sweeps, sizes, disk usage, read-only open | 17 | no |
+| Mount table: bind-mount aliases, fanotify mark points | 8 | no |
+| Config: parsing, validation, comment-preserving edits | 10 | no |
+| CLI: size parsing | 1 | no |
+| Integration: searches and invariants on the live index | 15 | yes |
+
+End to end, the daemon is exercised in an isolated mount namespace
+(scanning, live events with fanotify and inotify, config reloads, new
+mounts, cancellation), and `scripts/bench.sh` checks every query against
+`find` on the real system.
+
+----------|------:|
 | Exact name match | 2 |
 | Case sensitivity | 2 |
 | Glob patterns (`*` and `?`) | 3 |
@@ -484,26 +593,24 @@ All tests pass in ~0.2s.
 
 ## 🛣️ Roadmap
 
-- [x] Parallel scanner with `getdents64` + `statx`
-- [x] SQLite persistent index with WAL mode
+- [x] Parallel scanner with `getdents64` + `statx`, batched through io_uring
+- [x] SQLite persistent index (WAL), normalized schema
 - [x] fanotify monitoring: per-filesystem marks in FID mode (kernel 5.9+)
-- [x] inotify fallback (WSL2 / containers)
-- [x] Durable event journal with reconciliation
-- [x] Smart restart (journal-only when index is fresh)
-- [x] `rfind recent` with time range queries (minutes/hours/days/date range)
-- [x] `rfind health` — index freshness and monitoring status
-- [x] `rfind stats` — entry counts, top file types, largest directories
-- [x] `rfind update` — force re-index via SIGUSR1
-- [x] `--type f/d`, `--limit N`, `--regex` search flags
-- [x] Configurable roots, excludes, worker count
-- [x] Periodic re-index in index-only mode
-- [x] systemd service with proper lifecycle management
-- [x] CI pipeline (fmt + clippy + test + release build)
-- [ ] Scale validation at 10M+ entries
-- [ ] Release build benchmarks vs `find` and `plocate`
-- [ ] `io_uring` batched statx for even faster scanning
-- [ ] JSON output mode (`--json`)
-- [ ] Man page (`rfind.1`)
+- [x] inotify fallback (older kernels / containers)
+- [x] Durable event journal with idempotent replay
+- [x] Smart restart, config-change aware (purge / rescan only what changed)
+- [x] Periodic roots (WSL2 Windows drives, network shares)
+- [x] Bind-mount alias detection; new mounts indexed and watched
+- [x] File sizes, `rfind size` (du from the index), `rfind largest`, size filters
+- [x] `rfind config` (comment-preserving edits, validation, live reload)
+- [x] JSON output (`--json`), grep-style exit codes, shell completions
+- [x] Man pages: `rfind(1)`, `rfindd(8)`, `rfind.conf(5)`
+- [x] Static x86_64 / aarch64 release binaries; one-line install and uninstall
+- [x] Scale validation at 10M entries; benchmarks vs find, locate, plocate
+- [ ] Cache resolved directory handles (fanotify CPU under event floods)
+- [ ] Extension index for `*.ext` globs
+- [ ] Per-directory size totals for instant whole-disk `rfind size`
+- [ ] Debian / RPM packages
 
 ---
 

@@ -1,6 +1,6 @@
 [package]
 name = "rfind-scanner"
-version = "0.1.0"
+version = "0.6.0"
 edition = "2021"
 
 [dependencies]
@@ -9,3 +9,4 @@ num_cpus = "1"
 thiserror = "2"
 tracing = "0.1"
 libc = "0.2"
+io-uring = "0.7"

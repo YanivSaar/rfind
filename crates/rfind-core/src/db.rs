@@ -24,7 +24,7 @@
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use std::path::Path;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// Full path of an entry `e` joined with its directory `d`.
 const PATH_EXPR: &str = "(d.path || '/' || e.name)";
@@ -70,6 +70,7 @@ pub fn open(path: &Path) -> Result<Connection> {
             is_dir     INTEGER NOT NULL DEFAULT 0,
             mtime_sec  INTEGER NOT NULL DEFAULT 0,
             mtime_nsec INTEGER NOT NULL DEFAULT 0,
+            size       INTEGER NOT NULL DEFAULT 0,  -- bytes; 0 for directories
             scan_gen   INTEGER NOT NULL DEFAULT 0
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_dir_name
@@ -78,6 +79,11 @@ pub fn open(path: &Path) -> Result<Connection> {
             ON entries (name);
         CREATE INDEX IF NOT EXISTS idx_entries_mtime
             ON entries (mtime_sec);
+        -- Partial: only files of BIG_FILE bytes or more (a few percent of
+        -- entries), so `largest` and large --larger-than filters are index
+        -- walks instead of full scans, at little cost in size.
+        CREATE INDEX IF NOT EXISTS idx_entries_big
+            ON entries (size) WHERE size >= 1048576;
 
         CREATE TABLE IF NOT EXISTS pending_events (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,6 +104,35 @@ pub fn open(path: &Path) -> Result<Connection> {
     ",
     )?;
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+    Ok(conn)
+}
+
+/// Open the index for reading only (rfind). Never creates, migrates or
+/// drops anything: only rfindd owns the schema. An index in another
+/// format (e.g. right after an upgrade, before rfindd has rebuilt it) is
+/// reported instead of touched.
+pub fn open_readonly(path: &Path) -> std::result::Result<Connection, String> {
+    use rusqlite::OpenFlags;
+    if !path.exists() {
+        return Err(format!(
+            "no index at {} (is rfindd installed and running?)",
+            path.display()
+        ));
+    }
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("cannot open index {}: {e}", path.display()))?;
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .map_err(|e| format!("cannot read index {}: {e}", path.display()))?;
+    if version != SCHEMA_VERSION {
+        return Err(format!(
+            "the index is format v{version}, this rfind expects v{SCHEMA_VERSION}; \
+             rfindd rebuilds it on its next start (sudo systemctl restart rfindd)"
+        ));
+    }
     Ok(conn)
 }
 
@@ -165,6 +200,7 @@ impl<'c> Inserter<'c> {
         is_dir: bool,
         mtime_sec: i64,
         mtime_nsec: i64,
+        size: u64,
         scan_gen: Option<i64>,
     ) -> Result<()> {
         let (dir, name) = split_path(full_path);
@@ -181,13 +217,14 @@ impl<'c> Inserter<'c> {
         };
         self.conn
             .prepare_cached(
-                "INSERT INTO entries (dir_id, name, is_dir, mtime_sec, mtime_nsec, scan_gen)
-             VALUES (?1, ?2, ?3, ?4, ?5, COALESCE(?6, 0))
+                "INSERT INTO entries (dir_id, name, is_dir, mtime_sec, mtime_nsec, size, scan_gen)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE(?7, 0))
              ON CONFLICT(dir_id, name) DO UPDATE SET
                  is_dir     = excluded.is_dir,
                  mtime_sec  = excluded.mtime_sec,
                  mtime_nsec = excluded.mtime_nsec,
-                 scan_gen   = COALESCE(?6, scan_gen)",
+                 size       = excluded.size,
+                 scan_gen   = COALESCE(?7, scan_gen)",
             )?
             .execute(params![
                 did,
@@ -195,6 +232,7 @@ impl<'c> Inserter<'c> {
                 is_dir as i32,
                 mtime_sec,
                 mtime_nsec,
+                if is_dir { 0 } else { size as i64 },
                 scan_gen
             ])?;
         Ok(())
@@ -208,9 +246,10 @@ pub fn insert_entry(
     is_dir: bool,
     mtime_sec: i64,
     mtime_nsec: i64,
+    size: u64,
     scan_gen: Option<i64>,
 ) -> Result<()> {
-    Inserter::new(conn).insert(full_path, is_dir, mtime_sec, mtime_nsec, scan_gen)
+    Inserter::new(conn).insert(full_path, is_dir, mtime_sec, mtime_nsec, size, scan_gen)
 }
 
 pub fn delete_entry_by_path(conn: &Connection, path: &str) -> Result<usize> {
@@ -322,6 +361,42 @@ pub fn sweep_stale(conn: &Connection, root: &str, keep: &[String], scan_gen: i64
     Ok(n)
 }
 
+/// Delete entries that are not under any of `roots` (after roots were
+/// removed from the config), then drop emptied directory rows.
+pub fn delete_outside_roots(conn: &Connection, roots: &[String]) -> Result<usize> {
+    let mut cond = String::from("0");
+    let mut args: Vec<String> = Vec::new();
+    for r in roots {
+        let r = norm_dir(r);
+        let (lo, hi) = subtree_range(r);
+        let n = args.len();
+        cond.push_str(&format!(
+            " OR d.path = ?{a} OR (d.path >= ?{b} AND d.path < ?{c})",
+            a = n + 1,
+            b = n + 2,
+            c = n + 3
+        ));
+        args.extend([r.to_string(), lo, hi]);
+    }
+    let sql = format!(
+        "DELETE FROM entries WHERE id IN (
+             SELECT e.id FROM entries e JOIN dirs d ON d.id = e.dir_id WHERE NOT ({cond}))"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    for (i, a) in args.iter().enumerate() {
+        stmt.raw_bind_parameter(i + 1, a)?;
+    }
+    let n = stmt.raw_execute()?;
+    if n > 0 {
+        conn.execute(
+            "DELETE FROM dirs WHERE NOT EXISTS
+                 (SELECT 1 FROM entries WHERE entries.dir_id = dirs.id)",
+            [],
+        )?;
+    }
+    Ok(n)
+}
+
 pub fn entry_exists(conn: &Connection, path: &str) -> Result<bool> {
     let (dir, name) = split_path(path);
     let n: i64 = conn.query_row(
@@ -353,12 +428,24 @@ pub fn get_all_dirs(conn: &Connection) -> Result<Vec<String>> {
 
 /// Run a path-returning query, streaming each path to `on_result` until
 /// it returns false or `limit` is reached.
+/// One search result.
+#[derive(Debug, Clone, Copy)]
+pub struct Hit<'a> {
+    pub path: &'a str,
+    pub is_dir: bool,
+    pub mtime_sec: i64,
+    /// Bytes; 0 for directories.
+    pub size: u64,
+}
+
+/// Run a query selecting (path, is_dir, mtime_sec, size), streaming each hit to
+/// `on_result` until it returns false or `limit` is reached.
 fn stream_paths(
     conn: &Connection,
     sql: &str,
     params: &[&dyn rusqlite::ToSql],
     limit: Option<usize>,
-    on_result: &mut dyn FnMut(&str) -> bool,
+    on_result: &mut dyn FnMut(&Hit) -> bool,
 ) -> Result<u64> {
     let limit_val = limit.unwrap_or(usize::MAX);
     let mut count = 0u64;
@@ -368,8 +455,13 @@ fn stream_paths(
         if count as usize >= limit_val {
             break;
         }
-        let path = row.get_ref(0)?.as_str()?;
-        if !on_result(path) {
+        let hit = Hit {
+            path: row.get_ref(0)?.as_str()?,
+            is_dir: row.get::<_, i32>(1)? != 0,
+            mtime_sec: row.get(2)?,
+            size: row.get::<_, i64>(3)? as u64,
+        };
+        if !on_result(&hit) {
             break;
         }
         count += 1;
@@ -377,11 +469,91 @@ fn stream_paths(
     Ok(count)
 }
 
-/// `AND e.is_dir = ?N` when filtering by type, else nothing.
-fn type_clause(type_filter: Option<bool>, n: usize) -> String {
-    match type_filter {
-        Some(_) => format!(" AND e.is_dir = ?{n}"),
-        None => String::new(),
+/// Threshold of the partial index `idx_entries_big` (1 MiB).
+const BIG_FILE: u64 = 1 << 20;
+
+/// `entries e`, forced onto the big-file partial index when the query is
+/// restricted to files of 1 MiB+ (SQLite's planner otherwise prefers
+/// walking the directory range: 2.5 s instead of <1 ms at 10M entries).
+/// Only when the index exists: an index created by a newer rfindd isn't
+/// there until it restarts, and INDEXED BY would fail.
+fn entries_from(conn: &Connection, big_only: bool) -> &'static str {
+    let has_index = || {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_entries_big'",
+            [],
+            |_| Ok(()),
+        )
+        .is_ok()
+    };
+    if big_only && has_index() {
+        "entries e INDEXED BY idx_entries_big"
+    } else {
+        "entries e"
+    }
+}
+
+impl Filter {
+    /// Only files of at least BIG_FILE bytes match.
+    fn big_only(&self) -> bool {
+        self.min_size.is_some_and(|n| n >= BIG_FILE)
+    }
+}
+
+/// `ORDER BY 1` (by path) — unless a limit is set: sorting means reading
+/// every match before returning the first, so a limited search returns
+/// the first matches found instead.
+fn order_by_path(limit: Option<usize>) -> &'static str {
+    if limit.is_some() {
+        ""
+    } else {
+        " ORDER BY 1"
+    }
+}
+
+/// Columns every search selects (see [`Hit`]).
+const HIT_COLS: &str = "(d.path || '/' || e.name), e.is_dir, e.mtime_sec, e.size";
+
+/// Result filters shared by all searches.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Filter {
+    /// Some(true) = directories only, Some(false) = files only.
+    pub is_dir: Option<bool>,
+    /// Files of at least this many bytes (implies files only).
+    pub min_size: Option<u64>,
+    /// Files of at most this many bytes (implies files only).
+    pub max_size: Option<u64>,
+}
+
+impl Filter {
+    pub fn files() -> Self {
+        Self {
+            is_dir: Some(false),
+            ..Self::default()
+        }
+    }
+
+    /// SQL conditions to append to a WHERE clause. Only integers from typed
+    /// fields are inlined, so this is injection-safe.
+    fn clause(&self) -> String {
+        let mut c = String::new();
+        let sized = self.min_size.is_some() || self.max_size.is_some();
+        match (self.is_dir, sized) {
+            (Some(true), _) => c.push_str(" AND e.is_dir = 1"),
+            (Some(false), _) | (None, true) => c.push_str(" AND e.is_dir = 0"),
+            (None, false) => {}
+        }
+        if let Some(n) = self.min_size {
+            c.push_str(&format!(" AND e.size >= {}", n.min(i64::MAX as u64)));
+            if n >= BIG_FILE {
+                // The literal term of idx_entries_big, so it can be used.
+                c.push_str(&format!(" AND e.size >= {BIG_FILE}"));
+            }
+        }
+        if let Some(n) = self.max_size {
+            c.push_str(&format!(" AND e.size <= {}", n.min(i64::MAX as u64)));
+        }
+        c
     }
 }
 
@@ -391,22 +563,23 @@ fn type_clause(type_filter: Option<bool>, n: usize) -> String {
 pub fn search_by_glob_streaming(
     conn: &Connection,
     pattern: &str,
-    type_filter: Option<bool>, // Some(true)=dirs, Some(false)=files, None=all
+    filter: &Filter,
     limit: Option<usize>,
-    mut on_result: impl FnMut(&str) -> bool,
+    mut on_result: impl FnMut(&Hit) -> bool,
 ) -> Result<u64> {
-    let is_glob = pattern.contains('*') || pattern.contains('?');
-    let op = if is_glob { "GLOB" } else { "=" };
+    let op = if pattern.contains('*') || pattern.contains('?') {
+        "GLOB"
+    } else {
+        "="
+    };
     let sql = format!(
-        "SELECT {PATH_EXPR} FROM entries e JOIN dirs d ON d.id = e.dir_id
-         WHERE e.name {op} ?1{} ORDER BY 1",
-        type_clause(type_filter, 2),
+        "SELECT {HIT_COLS} FROM {from} JOIN dirs d ON d.id = e.dir_id
+         WHERE e.name {op} ?1{}{}",
+        filter.clause(),
+        order_by_path(limit),
+        from = entries_from(conn, filter.big_only() && op == "GLOB"),
     );
-    let d = type_filter.map(|d| d as i32);
-    match &d {
-        Some(d) => stream_paths(conn, &sql, &[&pattern, d], limit, &mut on_result),
-        None => stream_paths(conn, &sql, &[&pattern], limit, &mut on_result),
-    }
+    stream_paths(conn, &sql, &[&pattern], limit, &mut on_result)
 }
 
 /// Entries under directory `prefix` whose name matches `name_pattern`
@@ -415,9 +588,9 @@ pub fn search_under_streaming(
     conn: &Connection,
     prefix: &str,
     name_pattern: Option<&str>,
-    type_filter: Option<bool>,
+    filter: &Filter,
     limit: Option<usize>,
-    mut on_result: impl FnMut(&str) -> bool,
+    mut on_result: impl FnMut(&Hit) -> bool,
 ) -> Result<u64> {
     let dir = norm_dir(prefix);
     let (lo, hi) = subtree_range(dir);
@@ -428,28 +601,20 @@ pub fn search_under_streaming(
         "="
     };
     let sql = format!(
-        "SELECT {PATH_EXPR} FROM entries e JOIN dirs d ON d.id = e.dir_id
+        "SELECT {HIT_COLS} FROM {from} JOIN dirs d ON d.id = e.dir_id
          WHERE (d.path = ?1 OR (d.path >= ?2 AND d.path < ?3))
-           AND e.name {op} ?4{} ORDER BY 1",
-        type_clause(type_filter, 5),
+           AND e.name {op} ?4{}{}",
+        filter.clause(),
+        order_by_path(limit),
+        from = entries_from(conn, filter.big_only() && op == "GLOB"),
     );
-    let d = type_filter.map(|d| d as i32);
-    match &d {
-        Some(d) => stream_paths(
-            conn,
-            &sql,
-            &[&dir, &lo, &hi, &name_pat, d],
-            limit,
-            &mut on_result,
-        ),
-        None => stream_paths(
-            conn,
-            &sql,
-            &[&dir, &lo, &hi, &name_pat],
-            limit,
-            &mut on_result,
-        ),
-    }
+    stream_paths(
+        conn,
+        &sql,
+        &[&dir, &lo, &hi, &name_pat],
+        limit,
+        &mut on_result,
+    )
 }
 
 /// Directory part of the literal prefix of a path glob ("/etc/*.conf" →
@@ -465,35 +630,27 @@ fn literal_dir_prefix(pattern: &str) -> &str {
 pub fn search_by_path_glob_streaming(
     conn: &Connection,
     pattern: &str,
-    type_filter: Option<bool>,
+    filter: &Filter,
     limit: Option<usize>,
-    mut on_result: impl FnMut(&str) -> bool,
+    mut on_result: impl FnMut(&Hit) -> bool,
 ) -> Result<u64> {
     let dir = literal_dir_prefix(pattern);
     let (lo, hi) = subtree_range(dir);
     let sql = format!(
-        "SELECT {PATH_EXPR} FROM entries e JOIN dirs d ON d.id = e.dir_id
+        "SELECT {HIT_COLS} FROM {from} JOIN dirs d ON d.id = e.dir_id
          WHERE (d.path = ?2 OR (d.path >= ?3 AND d.path < ?4))
-           AND {PATH_EXPR} GLOB ?1{} ORDER BY 1",
-        type_clause(type_filter, 5),
+           AND {PATH_EXPR} GLOB ?1{}{}",
+        filter.clause(),
+        order_by_path(limit),
+        from = entries_from(conn, filter.big_only()),
     );
-    let d = type_filter.map(|d| d as i32);
-    match &d {
-        Some(d) => stream_paths(
-            conn,
-            &sql,
-            &[&pattern, &dir, &lo, &hi, d],
-            limit,
-            &mut on_result,
-        ),
-        None => stream_paths(
-            conn,
-            &sql,
-            &[&pattern, &dir, &lo, &hi],
-            limit,
-            &mut on_result,
-        ),
-    }
+    stream_paths(
+        conn,
+        &sql,
+        &[&pattern, &dir, &lo, &hi],
+        limit,
+        &mut on_result,
+    )
 }
 
 /// Regex search using SQLite REGEXP (user-defined function registered here),
@@ -503,9 +660,9 @@ pub fn search_by_regex_streaming(
     pattern: &str,
     field: &str, // "basename" or "full_path"
     under: Option<&str>,
-    type_filter: Option<bool>,
+    filter: &Filter,
     limit: Option<usize>,
-    mut on_result: impl FnMut(&str) -> bool,
+    mut on_result: impl FnMut(&Hit) -> bool,
 ) -> Result<u64> {
     register_regexp(conn)?;
     let target = if field == "full_path" {
@@ -516,28 +673,20 @@ pub fn search_by_regex_streaming(
     let dir = under.map(norm_dir).unwrap_or("");
     let (lo, hi) = subtree_range(dir);
     let sql = format!(
-        "SELECT {PATH_EXPR} FROM entries e JOIN dirs d ON d.id = e.dir_id
+        "SELECT {HIT_COLS} FROM {from} JOIN dirs d ON d.id = e.dir_id
          WHERE (d.path = ?2 OR (d.path >= ?3 AND d.path < ?4))
-           AND {target} REGEXP ?1{} ORDER BY 1",
-        type_clause(type_filter, 5),
+           AND {target} REGEXP ?1{}{}",
+        filter.clause(),
+        order_by_path(limit),
+        from = entries_from(conn, filter.big_only()),
     );
-    let d = type_filter.map(|d| d as i32);
-    match &d {
-        Some(d) => stream_paths(
-            conn,
-            &sql,
-            &[&pattern, &dir, &lo, &hi, d],
-            limit,
-            &mut on_result,
-        ),
-        None => stream_paths(
-            conn,
-            &sql,
-            &[&pattern, &dir, &lo, &hi],
-            limit,
-            &mut on_result,
-        ),
-    }
+    stream_paths(
+        conn,
+        &sql,
+        &[&pattern, &dir, &lo, &hi],
+        limit,
+        &mut on_result,
+    )
 }
 
 fn register_regexp(conn: &Connection) -> Result<()> {
@@ -570,6 +719,7 @@ pub struct RecentEntry {
     pub mtime_sec: i64,
     pub mtime_nsec: i64,
     pub is_dir: bool,
+    pub size: u64,
 }
 
 /// Return entries with mtime in [from_sec, to_sec], newest first.
@@ -577,25 +727,21 @@ pub fn search_recent_streaming(
     conn: &Connection,
     from_sec: i64,
     to_sec: i64,
-    type_filter: Option<bool>,
+    filter: &Filter,
     limit: Option<usize>,
     mut on_result: impl FnMut(&RecentEntry) -> bool,
 ) -> Result<u64> {
     let limit_val = limit.unwrap_or(usize::MAX);
     let mut count = 0u64;
-
     let sql = format!(
-        "SELECT {PATH_EXPR}, e.mtime_sec, e.mtime_nsec, e.is_dir
+        "SELECT {PATH_EXPR}, e.mtime_sec, e.mtime_nsec, e.is_dir, e.size
          FROM entries e JOIN dirs d ON d.id = e.dir_id
          WHERE e.mtime_sec BETWEEN ?1 AND ?2{}
          ORDER BY e.mtime_sec DESC, e.mtime_nsec DESC",
-        type_clause(type_filter, 3),
+        filter.clause(),
     );
     let mut stmt = conn.prepare_cached(&sql)?;
-    let mut rows = match type_filter {
-        Some(d) => stmt.query(params![from_sec, to_sec, d as i32])?,
-        None => stmt.query(params![from_sec, to_sec])?,
-    };
+    let mut rows = stmt.query(params![from_sec, to_sec])?;
     while let Some(row) = rows.next()? {
         if count as usize >= limit_val {
             break;
@@ -605,6 +751,7 @@ pub fn search_recent_streaming(
             mtime_sec: row.get(1)?,
             mtime_nsec: row.get(2)?,
             is_dir: row.get::<_, i32>(3)? != 0,
+            size: row.get::<_, i64>(4)? as u64,
         };
         if !on_result(&entry) {
             break;
@@ -612,6 +759,177 @@ pub fn search_recent_streaming(
         count += 1;
     }
     Ok(count)
+}
+
+// ---------------------------------------------------------------------------
+// Disk usage — directory sizes derived from file sizes at query time
+// ---------------------------------------------------------------------------
+
+/// Totals for a directory tree.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Usage {
+    /// Name of the child (for breakdowns) or the directory itself.
+    pub name: String,
+    pub files: u64,
+    pub dirs: u64,
+    pub bytes: u64,
+}
+
+/// Disk usage of the tree under `path`: the total, and the `top` largest
+/// direct children (subdirectories summed over their whole tree; files
+/// directly in `path` as themselves), largest first — like `du -d1`.
+///
+/// One pass: entries are summed per directory in SQL (cheap: grouped by
+/// dir_id), then directories are folded into the child they belong to.
+pub fn usage(conn: &Connection, path: &str, top: usize) -> Result<(Usage, Vec<Usage>)> {
+    use std::collections::HashMap;
+    let dir = norm_dir(path);
+    let (lo, hi) = subtree_range(dir);
+
+    // dir_id → path for every directory in the tree.
+    let mut paths: HashMap<i64, String> = HashMap::new();
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, path FROM dirs WHERE path = ?1 OR (path >= ?2 AND path < ?3)",
+        )?;
+        let rows = stmt.query_map(params![dir, lo, hi], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        for row in rows {
+            let (id, p) = row?;
+            paths.insert(id, p);
+        }
+    }
+
+    let mut total = Usage {
+        name: if dir.is_empty() {
+            "/".into()
+        } else {
+            dir.to_string()
+        },
+        ..Usage::default()
+    };
+    let mut children: HashMap<String, Usage> = HashMap::new();
+    let mut add = |name: &str, files: u64, dirs: u64, bytes: u64| {
+        let u = children.entry(name.to_string()).or_insert_with(|| Usage {
+            name: name.to_string(),
+            ..Usage::default()
+        });
+        u.files += files;
+        u.dirs += dirs;
+        u.bytes += bytes;
+    };
+
+    // Per-directory sums, folded into the first path component below `dir`.
+    let mut stmt = conn.prepare_cached(
+        "SELECT dir_id, SUM(is_dir = 0), SUM(is_dir), SUM(size) FROM entries
+         WHERE dir_id IN (SELECT id FROM dirs WHERE path = ?1 OR (path >= ?2 AND path < ?3))
+         GROUP BY dir_id",
+    )?;
+    let mut rows = stmt.query(params![dir, lo, hi])?;
+    let prefix_len = dir.len() + 1;
+    let mut direct_id = None;
+    while let Some(r) = rows.next()? {
+        let id: i64 = r.get(0)?;
+        let (files, dirs, bytes) = (
+            r.get::<_, i64>(1)? as u64,
+            r.get::<_, i64>(2)? as u64,
+            r.get::<_, i64>(3)? as u64,
+        );
+        total.files += files;
+        total.dirs += dirs;
+        total.bytes += bytes;
+        let Some(p) = paths.get(&id) else { continue };
+        if p == dir {
+            direct_id = Some(id); // entries directly in `dir`: listed below
+        } else if top > 0 {
+            let rest = &p[prefix_len..];
+            add(rest.split('/').next().unwrap_or(rest), files, dirs, bytes);
+        }
+    }
+
+    // Entries directly in `dir`: each file is its own child; a directory
+    // entry counts toward the child of the same name.
+    if let (Some(id), true) = (direct_id, top > 0) {
+        let mut stmt =
+            conn.prepare_cached("SELECT name, is_dir, size FROM entries WHERE dir_id = ?1")?;
+        let mut rows = stmt.query(params![id])?;
+        while let Some(r) = rows.next()? {
+            let name: String = r.get(0)?;
+            if r.get::<_, i32>(1)? != 0 {
+                add(&name, 0, 1, 0);
+            } else {
+                add(&name, 1, 0, r.get::<_, i64>(2)? as u64);
+            }
+        }
+    }
+
+    let mut out: Vec<Usage> = children.into_values().collect();
+    out.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
+    out.truncate(top);
+    Ok((total, out))
+}
+
+/// Total files, directories and bytes under `path` (recursively).
+pub fn dir_usage(conn: &Connection, path: &str) -> Result<Usage> {
+    usage(conn, path, 0).map(|(t, _)| t)
+}
+
+/// The `limit` largest direct children of `path`; see [`usage`].
+pub fn usage_breakdown(conn: &Connection, path: &str, limit: usize) -> Result<Vec<Usage>> {
+    usage(conn, path, limit).map(|(_, c)| c)
+}
+
+/// Largest files (optionally under `under`), biggest first.
+pub fn largest_files_streaming(
+    conn: &Connection,
+    under: Option<&str>,
+    filter: &Filter,
+    limit: Option<usize>,
+    mut on_result: impl FnMut(&Hit) -> bool,
+) -> Result<u64> {
+    let dir = under.map(norm_dir).unwrap_or("");
+    let (lo, hi) = subtree_range(dir);
+    let filter = Filter {
+        is_dir: Some(false),
+        ..*filter
+    };
+    let query = |big_only: bool| {
+        format!(
+            "SELECT {HIT_COLS} FROM {} JOIN dirs d ON d.id = e.dir_id
+             WHERE (d.path = ?1 OR (d.path >= ?2 AND d.path < ?3)){}{}
+             ORDER BY e.size DESC, 1",
+            entries_from(conn, big_only),
+            filter.clause(),
+            if big_only {
+                format!(" AND e.size >= {BIG_FILE}")
+            } else {
+                String::new()
+            },
+        )
+    };
+    // Usually enough files of 1 MiB+ exist: walk the partial index. If
+    // not, fall back to scanning everything.
+    if let Some(n) = limit {
+        let big: i64 = conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM (SELECT 1 FROM {} JOIN dirs d ON d.id = e.dir_id
+                 WHERE (d.path = ?1 OR (d.path >= ?2 AND d.path < ?3)){} AND e.size >= {BIG_FILE} LIMIT ?4)",
+                entries_from(conn, true),
+                filter.clause()
+            ),
+            params![dir, lo, hi, n as i64],
+            |r| r.get(0),
+        )?;
+        if big as usize >= n {
+            return stream_paths(conn, &query(true), &[&dir, &lo, &hi], limit, &mut on_result);
+        }
+    }
+    stream_paths(
+        conn,
+        &query(false),
+        &[&dir, &lo, &hi],
+        limit,
+        &mut on_result,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -628,6 +946,8 @@ pub struct HealthInfo {
     pub monitoring_mode: String,
     pub pending_events: i64,
     pub db_size_bytes: u64,
+    /// Sum of all indexed file sizes.
+    pub total_bytes: u64,
 }
 
 pub fn get_health(conn: &Connection, db_path: &Path) -> Result<HealthInfo> {
@@ -653,6 +973,9 @@ pub fn get_health(conn: &Connection, db_path: &Path) -> Result<HealthInfo> {
         monitoring_mode,
         pending_events,
         db_size_bytes: db_size_bytes(db_path),
+        total_bytes: conn.query_row("SELECT COALESCE(SUM(size), 0) FROM entries", [], |r| {
+            r.get::<_, i64>(0)
+        })? as u64,
     })
 }
 
@@ -905,7 +1228,7 @@ mod tests {
     }
 
     fn add(c: &Connection, p: &str, is_dir: bool, scan_gen: Option<i64>) {
-        insert_entry(c, p, is_dir, 0, 0, scan_gen).unwrap();
+        insert_entry(c, p, is_dir, 0, 0, 0, scan_gen).unwrap();
     }
 
     fn paths(c: &Connection) -> Vec<String> {
@@ -922,8 +1245,8 @@ mod tests {
 
     fn glob(c: &Connection, pat: &str) -> Vec<String> {
         let mut v = Vec::new();
-        search_by_glob_streaming(c, pat, None, None, |p| {
-            v.push(p.to_string());
+        search_by_glob_streaming(c, pat, &Filter::default(), None, |p| {
+            v.push(p.path.to_string());
             true
         })
         .unwrap();
@@ -1011,6 +1334,88 @@ mod tests {
     }
 
     #[test]
+    fn delete_outside_roots_keeps_only_configured_trees() {
+        let c = mem();
+        for p in ["/home/a/x", "/mnt/c/w", "/mnt/cx/y", "/srv/z"] {
+            add(&c, p, false, None);
+        }
+        let n = delete_outside_roots(&c, &["/home".to_string(), "/mnt/c".to_string()]).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(paths(&c), vec!["/home/a/x", "/mnt/c/w"]);
+        // Root "/" keeps everything.
+        assert_eq!(delete_outside_roots(&c, &["/".to_string()]).unwrap(), 0);
+    }
+
+    #[test]
+    fn hits_carry_type_and_mtime() {
+        let c = mem();
+        insert_entry(&c, "/a/dir", true, 42, 0, 0, None).unwrap();
+        let mut got = None;
+        search_by_glob_streaming(&c, "dir", &Filter::default(), None, |h| {
+            got = Some((h.path.to_string(), h.is_dir, h.mtime_sec));
+            true
+        })
+        .unwrap();
+        assert_eq!(got, Some(("/a/dir".to_string(), true, 42)));
+    }
+
+    #[test]
+    fn sizes_roll_up_into_directory_usage() {
+        let c = mem();
+        insert_entry(&c, "/d", true, 0, 0, 999, None).unwrap(); // dir size ignored
+        insert_entry(&c, "/d/a.iso", false, 0, 0, 1000, None).unwrap();
+        insert_entry(&c, "/d/sub", true, 0, 0, 0, None).unwrap();
+        insert_entry(&c, "/d/sub/b.txt", false, 0, 0, 20, None).unwrap();
+        insert_entry(&c, "/d/sub/deep/c.txt", false, 0, 0, 3, None).unwrap();
+        insert_entry(&c, "/dx/other", false, 0, 0, 5, None).unwrap();
+
+        let u = dir_usage(&c, "/d").unwrap();
+        assert_eq!((u.files, u.dirs, u.bytes), (3, 1, 1023));
+        assert_eq!(dir_usage(&c, "/").unwrap().bytes, 1028);
+
+        let b = usage_breakdown(&c, "/d", 10).unwrap();
+        let rows: Vec<_> = b
+            .iter()
+            .map(|u| (u.name.as_str(), u.files, u.bytes))
+            .collect();
+        assert_eq!(rows, vec![("a.iso", 1, 1000), ("sub", 2, 23)]);
+        let top: Vec<_> = usage_breakdown(&c, "/", 10)
+            .unwrap()
+            .into_iter()
+            .map(|u| (u.name, u.bytes))
+            .collect();
+        assert_eq!(top, vec![("d".to_string(), 1023), ("dx".to_string(), 5)]);
+    }
+
+    #[test]
+    fn size_filters_and_largest_files() {
+        let c = mem();
+        for (p, sz) in [("/a/big", 5000u64), ("/a/mid", 500), ("/a/small", 5)] {
+            insert_entry(&c, p, false, 0, 0, sz, None).unwrap();
+        }
+        insert_entry(&c, "/a/dir", true, 0, 0, 0, None).unwrap();
+        let mut v = Vec::new();
+        let f = Filter {
+            min_size: Some(100),
+            max_size: Some(1000),
+            ..Filter::default()
+        };
+        search_under_streaming(&c, "/a", None, &f, None, |h| {
+            v.push(h.path.to_string());
+            true
+        })
+        .unwrap();
+        assert_eq!(v, vec!["/a/mid"]);
+        let mut v = Vec::new();
+        largest_files_streaming(&c, Some("/a"), &Filter::default(), Some(2), |h| {
+            v.push((h.path.to_string(), h.size));
+            true
+        })
+        .unwrap();
+        assert_eq!(v, vec![("/a/big".into(), 5000), ("/a/mid".into(), 500)]);
+    }
+
+    #[test]
     fn live_upsert_keeps_scan_gen() {
         let c = mem();
         add(&c, "/x", false, Some(5));
@@ -1033,15 +1438,15 @@ mod tests {
             add(&c, p, false, None);
         }
         let mut v = Vec::new();
-        search_under_streaming(&c, "/etc", Some("*.conf"), None, None, |p| {
-            v.push(p.to_string());
+        search_under_streaming(&c, "/etc", Some("*.conf"), &Filter::default(), None, |p| {
+            v.push(p.path.to_string());
             true
         })
         .unwrap();
         assert_eq!(v, vec!["/etc/a.conf", "/etc/x/b.conf"]);
         let mut v = Vec::new();
-        search_by_path_glob_streaming(&c, "/etc/*.conf", None, None, |p| {
-            v.push(p.to_string());
+        search_by_path_glob_streaming(&c, "/etc/*.conf", &Filter::default(), None, |p| {
+            v.push(p.path.to_string());
             true
         })
         .unwrap();
@@ -1060,34 +1465,58 @@ mod tests {
             r"^lib.*\.so\.[0-9]+$",
             "basename",
             None,
-            None,
+            &Filter::default(),
             None,
             |p| {
-                v.push(p.to_string());
+                v.push(p.path.to_string());
                 true
             },
         )
         .unwrap();
         assert_eq!(v, vec!["/lib/libz.so.1"]);
         let mut v = Vec::new();
-        search_by_regex_streaming(&c, "^/opt/", "full_path", None, None, None, |p| {
-            v.push(p.to_string());
-            true
-        })
+        search_by_regex_streaming(
+            &c,
+            "^/opt/",
+            "full_path",
+            None,
+            &Filter::default(),
+            None,
+            |p| {
+                v.push(p.path.to_string());
+                true
+            },
+        )
         .unwrap();
         assert_eq!(v, vec!["/opt/lib/x"]);
         // --under restricts the subtree; the regex still applies to names.
         let mut v = Vec::new();
-        search_by_regex_streaming(&c, "^lib", "basename", Some("/opt"), None, None, |p| {
-            v.push(p.to_string());
-            true
-        })
+        search_by_regex_streaming(
+            &c,
+            "^lib",
+            "basename",
+            Some("/opt"),
+            &Filter::default(),
+            None,
+            |p| {
+                v.push(p.path.to_string());
+                true
+            },
+        )
         .unwrap();
         assert!(v.is_empty());
-        search_by_regex_streaming(&c, "^x$", "basename", Some("/opt"), None, None, |p| {
-            v.push(p.to_string());
-            true
-        })
+        search_by_regex_streaming(
+            &c,
+            "^x$",
+            "basename",
+            Some("/opt"),
+            &Filter::default(),
+            None,
+            |p| {
+                v.push(p.path.to_string());
+                true
+            },
+        )
         .unwrap();
         assert_eq!(v, vec!["/opt/lib/x"]);
     }
@@ -1103,6 +1532,30 @@ mod tests {
             (s.largest_dirs[0].path.as_str(), s.largest_dirs[0].count),
             ("/a", 3)
         );
+    }
+
+    #[test]
+    fn readonly_open_refuses_other_versions_and_never_writes() {
+        let path = std::env::temp_dir().join(format!("rfind-ro-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(open_readonly(&path).is_err()); // missing: not created
+        assert!(!path.exists());
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch("CREATE TABLE entries (x); INSERT INTO entries VALUES (1); PRAGMA user_version = 4;")
+                .unwrap();
+        }
+        let err = open_readonly(&path).unwrap_err();
+        assert!(err.contains("v4"), "{err}");
+        // The old table is untouched.
+        let n: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        drop(open(&path).unwrap()); // the daemon's open rebuilds it
+        assert!(open_readonly(&path).is_ok());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
