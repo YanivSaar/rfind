@@ -15,6 +15,64 @@
 
 ---
 
+## 🧭 What this is and why it exists
+
+`rfind` is a Linux filesystem indexer and search tool for the case
+other tools don't quite cover: **answer any question about any file on
+the system in milliseconds, and stay correct as the filesystem changes.**
+
+The daemon (`rfindd`) builds a persistent SQLite index of every file
+and keeps it current by subscribing to kernel filesystem events
+(`fanotify` on 5.9+, `inotify` elsewhere). The CLI (`rfind`) runs search
+queries directly against the index — no daemon round-trip, no re-walk.
+
+### What the usual tools miss
+
+- **`find`** walks the tree every time you ask. On a 10M-entry disk
+  that's seconds-to-minutes per query, and it has nothing to say about
+  "what changed in the last hour" without walking everything with
+  `-newermt`.
+- **`locate` / `mlocate` / `updatedb`** are fast but **stale**: the
+  index is a nightly cron, so files created today are invisible until
+  tomorrow. There's no size filter, no mtime filter, no "largest files
+  under /var", and no notion of freshness or incremental update.
+- **`plocate`** is the fastest of the locate family, but still updates
+  on cron; the database doesn't carry sizes or mtimes, so queries like
+  "biggest files under /usr", "files bigger than 1 GB", or "modified
+  in the last hour" aren't expressible.
+- **GUI indexers** (Baloo, Tracker, Recoll) index content — slow,
+  memory-hungry, often per-user, and not what you want for shell /
+  scripting workflows.
+
+### What `rfind` does differently
+
+- **Live, not nightly.** fanotify / inotify stream events into a
+  durable journal; a change is visible in the next search in ≤ 5 s
+  (the reconcile tick), not next `updatedb`.
+- **The index knows sizes and mtimes.** Queries like `rfind recent
+  --hours 1`, `rfind name "*.iso" --larger-than 1G`, `rfind size /var`,
+  and `rfind largest --under /usr` run against the index with no disk
+  walk.
+- **Scaled for real systems.** 10M entries indexed in ~5 min, kept
+  current with < 100 MB RAM; most searches finish in 1–10 ms.
+- **Correctness built in.** Searches pin a read snapshot (no path
+  stitching across concurrent writes); the daemon holds a pidfile
+  flock so two instances cannot race; the scanner catches worker
+  panics instead of hanging; crash safety is tested with SIGKILL
+  mid-write (SQLite WAL + an append-only, CRC-checked compressed VFS).
+- **Small on disk.** The index is name-interned, directory-trie
+  structured, and zstd page-compressed by default — about 45 bytes
+  per entry on real data (69 MB for 1.54M entries, 400 MB for 10M).
+- **Not a service you have to think about.** One systemd unit, one
+  config file, `rfind` as a drop-in `find`/`locate` replacement for the
+  common questions.
+
+TL;DR: the goal is for `find / -name foo` and `du -sh /home` and
+"what was changed today" to all answer **instantly** on the biggest
+system you own, with the kernel keeping the index honest.
+
+---
+
 ## ⚡ Performance
 
 Measured with `scripts/bench.sh` (release build, WSL2, 4 cores) on a real
