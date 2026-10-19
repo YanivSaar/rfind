@@ -70,27 +70,24 @@ if [ $UNINSTALL -eq 1 ]; then
     # then SIGKILL.
     step "Uninstalling rfind"
     stop_rfindd() {
-        local pid grace
+        local pid
         pid=$(cat /run/rfindd/rfindd.pid 2>/dev/null || true)
         if [ $HAS_SYSTEMD -eq 1 ] && [ -f "$UNIT" ]; then
             systemctl disable rfindd 2>/dev/null || true
             systemctl stop --no-block rfindd 2>/dev/null || true
         fi
-        # Wait up to 10s for the daemon to go.
-        for _ in $(seq 1 100); do
-            [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 0
-            sleep 0.1
-        done
-        [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 0
-        echo "install.sh: rfindd (pid $pid) still running; sending SIGTERM" >&2
-        kill -TERM "$pid" 2>/dev/null || true
-        for _ in $(seq 1 50); do
+        # 30 s grace for systemd's own SIGTERM to run its course. The daemon
+        # may need several seconds to cancel an in-flight scan (notably on
+        # WSL2 /mnt/c). Only after that do we SIGKILL. We do NOT send a
+        # second SIGTERM: systemctl stop already did.
+        [ -z "$pid" ] && return 0
+        for _ in $(seq 1 300); do
             kill -0 "$pid" 2>/dev/null || return 0
             sleep 0.1
         done
-        echo "install.sh: rfindd (pid $pid) did not respond to SIGTERM; sending SIGKILL" >&2
+        echo "install.sh: rfindd (pid $pid) still running 30s after systemctl stop; sending SIGKILL" >&2
         kill -KILL "$pid" 2>/dev/null || true
-        for _ in $(seq 1 20); do
+        for _ in $(seq 1 30); do
             kill -0 "$pid" 2>/dev/null || return 0
             sleep 0.1
         done

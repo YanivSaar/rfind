@@ -90,28 +90,31 @@ fn wait_for_exit(secs: u64) -> bool {
 }
 
 /// Drive the daemon to a stopped state no matter what, so file removal
-/// below never races a live writer. See the ladder documented at the call
-/// site in [`run`].
+/// below never races a live writer.
+///
+/// 30 s grace period for the systemd-sent SIGTERM to run its course.
+/// On WSL2 or network mounts the scanner can need several seconds just
+/// to cancel in-flight work (e.g. a `/mnt/c` walk under indexing), and
+/// 10 s was observed in the wild to SIGKILL rfindd while it was still
+/// finishing a clean shutdown. If 30 s is not enough the daemon is
+/// genuinely wedged — jump straight to SIGKILL. We do not send our own
+/// SIGTERM: `systemctl stop` already sent one; a duplicate just re-enters
+/// the daemon's shutdown handler and makes the log noisier.
 fn stop_daemon_with_escalation() {
-    if wait_for_exit(10) {
+    const GRACE_SECS: u64 = 30;
+    if wait_for_exit(GRACE_SECS) {
         return;
     }
     if let Some(pid) = daemon::rfindd_pid() {
-        eprintln!("rfind: rfindd (pid {pid}) still running after 10s; sending SIGTERM");
-        unsafe {
-            libc::kill(pid, libc::SIGTERM);
-        }
-    }
-    if wait_for_exit(5) {
-        return;
-    }
-    if let Some(pid) = daemon::rfindd_pid() {
-        eprintln!("rfind: rfindd (pid {pid}) did not respond to SIGTERM; sending SIGKILL");
+        eprintln!(
+            "rfind: rfindd (pid {pid}) still running {GRACE_SECS}s after systemctl stop; \
+             sending SIGKILL"
+        );
         unsafe {
             libc::kill(pid, libc::SIGKILL);
         }
     }
-    if wait_for_exit(2) {
+    if wait_for_exit(3) {
         return;
     }
     if let Some(pid) = daemon::rfindd_pid() {
@@ -187,12 +190,17 @@ pub fn run(out: &mut Out, purge: bool, yes: bool) -> CmdResult {
     for p in &files {
         match std::fs::remove_file(p) {
             Ok(()) => removed.push(p.display().to_string()),
+            // Systemd cleans up RuntimeDirectory= on stop, so some paths
+            // we snapshotted at the top can already be gone by the time
+            // we get here — not an error.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => eprintln!("rfind: could not remove {}: {e}", p.display()),
         }
     }
     for d in &dirs {
         match std::fs::remove_dir_all(d) {
             Ok(()) => removed.push(d.display().to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => eprintln!("rfind: could not remove {}: {e}", d.display()),
         }
     }
