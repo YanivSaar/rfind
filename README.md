@@ -198,17 +198,30 @@ and kept current via kernel filesystem notifications. No more waiting for
 curl -fsSL https://raw.githubusercontent.com/YanivSaar/rfind/main/scripts/install.sh | sudo bash
 ```
 
-Downloads a static binary for your architecture (x86_64 or aarch64, checksum
-verified) — or builds from source if there's no release for it — and installs
-`rfind` + `rfindd`, the man pages and bash/zsh/fish completions, and the
-`rfindd` systemd service. On WSL2 a first install configures Windows drives as
+Downloads a static binary for your architecture (x86_64 or aarch64) — or
+builds from source if there's no release for it — and installs `rfind` +
+`rfindd`, the man pages and bash/zsh/fish completions, and the `rfindd`
+systemd service. On WSL2 a first install configures Windows drives as
 periodic roots.
+
+Each release tarball is signed keyless with [sigstore cosign][cosign] via
+GitHub OIDC. If `cosign` is installed, `install.sh` verifies the signature
+against this repo's `release.yml` identity before unpacking; otherwise it
+falls back to the published SHA-256. For the strongest guarantee, install
+cosign first:
+
+```bash
+# Debian/Ubuntu example — see sigstore.dev for other distros.
+sudo apt install -y cosign
+```
+
+[cosign]: https://docs.sigstore.dev/cosign/overview/
 
 | Task | One-liner |
 |------|-----------|
 | Install / update | `curl -fsSL https://raw.githubusercontent.com/YanivSaar/rfind/main/scripts/install.sh \| sudo bash` |
 | From a clone | `git clone https://github.com/YanivSaar/rfind.git && cd rfind && sudo ./scripts/install.sh` |
-| Specific release | `curl -fsSL …/install.sh \| sudo RFIND_VERSION=v1.0.1 bash` |
+| Specific release | `curl -fsSL …/install.sh \| sudo RFIND_VERSION=v1.0.3 bash` |
 | Build from source | `curl -fsSL …/install.sh \| sudo RFIND_FROM_SOURCE=1 bash` |
 | Uninstall (keep index) | `sudo rfind uninstall` |
 | Uninstall + purge | `sudo rfind uninstall --purge` |
@@ -644,7 +657,18 @@ Normalized parent-ID schema avoids storing full paths redundantly.
 
 ## 🔒 Security
 
-- Daemon runs as **root** (required for fanotify/inotify on system directories)
+- Daemon runs as **root** (required for fanotify/inotify on system directories), but the
+  systemd unit confines it: `CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH`,
+  `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp/Devices`,
+  the `Protect*` kernel/clock/hostname set, `LockPersonality`, `MemoryDenyWriteExecute`,
+  `RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any`, `SystemCallFilter=@system-service`
+  plus `fanotify_*`/`*_handle_at` minus `@mount @reboot @swap @module @obsolete`.
+  `systemd-analyze security rfindd`: **2.1 OK** (unconfined would score ~9.5).
+- Release tarballs are signed **keyless with sigstore cosign** via GitHub OIDC;
+  `install.sh` verifies the signature against this repo's `release.yml` identity when
+  `cosign` is installed, falling back to the published SHA-256 otherwise.
+- `RFIND_CONFIG` on the **daemon** must be an absolute path under `/etc/rfindd/`; any
+  other value is logged and ignored. (The CLI stays permissive.)
 - The index is **root-only** (`/var/lib/rfindd` is `0700`, the database `0600`): it lists every
   file name on the system, including other users' files, so `rfind` searches need `sudo`
 - Index at `/var/lib/rfindd/index.db` — root-owned
@@ -652,6 +676,8 @@ Normalized parent-ID schema avoids storing full paths redundantly.
   group can audit the exclude list without needing read on the index itself)
 - Progress file at `/run/rfindd/progress.json` — world-readable (filenames only, no content)
 - Search queries read the index directly — no daemon IPC required
+- The zvfs page store verifies the per-page CRC on **every read**, not only at startup
+  replay — defence-in-depth against on-disk corruption of `index.db-zdata.<gen>`
 - Symlinks are **not followed** during scan (prevents cycles)
 - Excluded paths (default `/proc`, `/sys`, `/dev`, `/run`, `/media`) are never indexed
 - `rfind config edit` uses a private `0700` tmp subdir with `O_CREAT|O_EXCL|O_NOFOLLOW`
@@ -662,6 +688,8 @@ Normalized parent-ID schema avoids storing full paths redundantly.
   misconfigured `index.db_path = /var/foo.db` can no longer take out `/var`
 - The daemon takes `flock(LOCK_EX|LOCK_NB)` on `/run/rfindd/rfindd.pid` at startup, so a
   second instance refuses to run
+- When a filesystem is unmounted the fanotify mark and its cached mount fd are
+  dropped immediately, so a reused `fsid` cannot resolve against the wrong mount
 
 ---
 
