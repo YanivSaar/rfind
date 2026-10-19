@@ -64,10 +64,40 @@ if [ $UNINSTALL -eq 1 ]; then
     if [ -x "$BIN_DIR/rfind" ]; then
         exec "$BIN_DIR/rfind" uninstall --yes $( [ $PURGE -eq 1 ] && echo --purge )
     fi
-    # No rfind binary left: remove what we can by hand.
+    # No rfind binary left: remove what we can by hand. The service-stop
+    # ladder mirrors `rfind uninstall`'s so a wedged daemon can never make
+    # this hang: `systemctl stop --no-block`, poll for exit, then SIGTERM,
+    # then SIGKILL.
     step "Uninstalling rfind"
+    stop_rfindd() {
+        local pid grace
+        pid=$(cat /run/rfindd/rfindd.pid 2>/dev/null || true)
+        if [ $HAS_SYSTEMD -eq 1 ] && [ -f "$UNIT" ]; then
+            systemctl disable rfindd 2>/dev/null || true
+            systemctl stop --no-block rfindd 2>/dev/null || true
+        fi
+        # Wait up to 10s for the daemon to go.
+        for _ in $(seq 1 100); do
+            [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 0
+            sleep 0.1
+        done
+        [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 0
+        echo "install.sh: rfindd (pid $pid) still running; sending SIGTERM" >&2
+        kill -TERM "$pid" 2>/dev/null || true
+        for _ in $(seq 1 50); do
+            kill -0 "$pid" 2>/dev/null || return 0
+            sleep 0.1
+        done
+        echo "install.sh: rfindd (pid $pid) did not respond to SIGTERM; sending SIGKILL" >&2
+        kill -KILL "$pid" 2>/dev/null || true
+        for _ in $(seq 1 20); do
+            kill -0 "$pid" 2>/dev/null || return 0
+            sleep 0.1
+        done
+        echo "install.sh: WARNING: rfindd (pid $pid) survived SIGKILL; continuing anyway" >&2
+    }
+    stop_rfindd
     if [ $HAS_SYSTEMD -eq 1 ] && [ -f "$UNIT" ]; then
-        systemctl disable --now rfindd 2>/dev/null || true
         rm -f "$UNIT"; systemctl daemon-reload
     fi
     rm -f "$BIN_DIR/rfindd" "$SHARE"/man/man1/rfind.1 "$SHARE"/man/man5/rfind.conf.5 "$SHARE"/man/man8/rfindd.8 \

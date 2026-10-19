@@ -76,6 +76,52 @@ fn purge_paths() -> Vec<PathBuf> {
     v
 }
 
+/// Poll /proc for rfindd exit, up to `secs` seconds (100 ms ticks).
+/// Returns true once the daemon is gone.
+fn wait_for_exit(secs: u64) -> bool {
+    let ticks = secs * 10;
+    for _ in 0..ticks {
+        if daemon::rfindd_pid().is_none() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    daemon::rfindd_pid().is_none()
+}
+
+/// Drive the daemon to a stopped state no matter what, so file removal
+/// below never races a live writer. See the ladder documented at the call
+/// site in [`run`].
+fn stop_daemon_with_escalation() {
+    if wait_for_exit(10) {
+        return;
+    }
+    if let Some(pid) = daemon::rfindd_pid() {
+        eprintln!("rfind: rfindd (pid {pid}) still running after 10s; sending SIGTERM");
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
+    if wait_for_exit(5) {
+        return;
+    }
+    if let Some(pid) = daemon::rfindd_pid() {
+        eprintln!("rfind: rfindd (pid {pid}) did not respond to SIGTERM; sending SIGKILL");
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+    if wait_for_exit(2) {
+        return;
+    }
+    if let Some(pid) = daemon::rfindd_pid() {
+        eprintln!(
+            "rfind: WARNING: rfindd (pid {pid}) survived SIGKILL (likely stuck in a kernel \
+             syscall); continuing with uninstall anyway"
+        );
+    }
+}
+
 fn confirm(prompt: &str) -> bool {
     if !io::stdin().is_terminal() {
         return false;
@@ -112,22 +158,30 @@ pub fn run(out: &mut Out, purge: bool, yes: bool) -> CmdResult {
         }
     }
 
-    // Stop the daemon.
+    // Stop the daemon. Escalation ladder (so uninstall never hangs on a
+    // wedged rfindd):
+    //
+    //   1. `systemctl disable` to remove the enablement (fast; does not stop).
+    //   2. `systemctl stop --no-block` so the systemctl command returns
+    //      immediately rather than waiting up to TimeoutStopSec (90s default)
+    //      for the unit to deactivate.
+    //   3. Poll /proc for exit with a 10 s grace period — if systemd (or the
+    //      daemon's own signal handler) brings it down, we're done.
+    //   4. Still alive → send SIGTERM directly, wait 5 s.
+    //   5. Still alive → send SIGKILL directly, wait 2 s.
+    //   6. Still alive after SIGKILL → warn and continue; the kernel can't
+    //      kill it (D-state), which is a kernel-level problem the user needs
+    //      to know about, not something uninstall can fix.
     let systemd = Path::new("/run/systemd/system").is_dir();
     if systemd && Path::new(UNIT).exists() {
         let _ = Command::new("systemctl")
-            .args(["disable", "--now", "rfindd"])
+            .args(["disable", "rfindd"])
+            .status();
+        let _ = Command::new("systemctl")
+            .args(["stop", "--no-block", "rfindd"])
             .status();
     }
-    if daemon::rfindd_pid().is_some() {
-        let _ = daemon::signal(libc::SIGTERM);
-        for _ in 0..50 {
-            if daemon::rfindd_pid().is_none() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-    }
+    stop_daemon_with_escalation();
 
     let mut removed = vec![];
     for p in &files {
