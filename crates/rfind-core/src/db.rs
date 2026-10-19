@@ -806,6 +806,9 @@ pub struct Filter {
     pub min_size: Option<u64>,
     /// Files of at most this many bytes (implies files only).
     pub max_size: Option<u64>,
+    /// Inclusive (from_sec, to_sec) epoch window on mtime. Uses i64::MIN /
+    /// i64::MAX for one-sided bounds. None = no mtime constraint.
+    pub mtime_range: Option<(i64, i64)>,
 }
 
 impl Filter {
@@ -840,6 +843,17 @@ impl Filter {
         }
         if let Some(n) = self.max_size {
             c.push_str(&format!(" AND e.size <= {}", n.min(i64::MAX as u64)));
+        }
+        if let Some((lo, hi)) = self.mtime_range {
+            // Open-ended bounds are inlined as INT64 min/max — SQLite's
+            // BETWEEN handles them without widening, and idx_entries_mtime
+            // still services the range.
+            if lo != i64::MIN {
+                c.push_str(&format!(" AND e.mtime_sec >= {lo}"));
+            }
+            if hi != i64::MAX {
+                c.push_str(&format!(" AND e.mtime_sec <= {hi}"));
+            }
         }
         c
     }

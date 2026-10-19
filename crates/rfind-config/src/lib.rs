@@ -18,6 +18,7 @@ pub struct Config {
     pub scan: ScanConfig,
     pub index: IndexConfig,
     pub monitor: MonitorConfig,
+    pub search: SearchConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +79,34 @@ pub struct MonitorConfig {
     pub watch_new_mounts: bool,
 }
 
+/// Behaviour of `rfind` (the CLI), when it has a choice between querying
+/// the index and walking the filesystem live.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SearchConfig {
+    /// Default resolution strategy. CLI flags (--live/--no-index) win.
+    pub mode: SearchModePref,
+    /// Use io_uring for walk-mode statx batching when the kernel allows it.
+    /// This is separate from `scan.io_uring` (the indexer's own knob).
+    pub io_uring: bool,
+    /// Worker threads for walk mode. 0 = cores × 2 (I/O-bound default).
+    pub threads: usize,
+}
+
+/// User preference for which backend answers a query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchModePref {
+    /// Pick index when the daemon is ready and the filter is index-answerable;
+    /// walk otherwise.
+    #[default]
+    Auto,
+    /// Never walk; fail with a helpful error when the index is unusable.
+    Index,
+    /// Never query the index; always walk.
+    Walk,
+}
+
 impl Default for ScanConfig {
     fn default() -> Self {
         Self {
@@ -114,6 +143,16 @@ impl Default for MonitorConfig {
             prefer_fanotify: true,
             inotify_fallback: true,
             watch_new_mounts: true,
+        }
+    }
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            mode: SearchModePref::Auto,
+            io_uring: true,
+            threads: 0,
         }
     }
 }
@@ -200,6 +239,9 @@ impl Config {
         }
         if self.scan.workers > 1024 {
             err("scan.workers must be at most 1024 (0 = one per CPU)".into());
+        }
+        if self.search.threads > 1024 {
+            err("search.threads must be at most 1024 (0 = cores × 2)".into());
         }
         if self.scan.roots.is_empty() && self.scan.periodic_roots.is_empty() {
             err("nothing to index: add a root or a periodic root".into());
@@ -313,5 +355,40 @@ mod tests {
     fn old_config_without_periodic_roots_still_loads() {
         let cfg: Config = toml::from_str("[scan]\nroots = [\"/\"]\n").unwrap();
         assert!(cfg.scan.periodic_roots.is_empty());
+    }
+
+    #[test]
+    fn search_section_defaults() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.search.mode, SearchModePref::Auto);
+        assert!(cfg.search.io_uring);
+        assert_eq!(cfg.search.threads, 0);
+    }
+
+    #[test]
+    fn search_mode_parses_from_toml() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [search]
+            mode = "walk"
+            threads = 8
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.search.mode, SearchModePref::Walk);
+        assert_eq!(cfg.search.threads, 8);
+    }
+
+    #[test]
+    fn search_mode_rejects_unknown_value() {
+        let r: Result<Config, _> = toml::from_str("[search]\nmode = \"wrong\"\n");
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn search_threads_cap_validates() {
+        let mut c = Config::default();
+        c.search.threads = 2048;
+        assert!(c.validate().iter().any(|p| p.error));
     }
 }

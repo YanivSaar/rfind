@@ -5,13 +5,18 @@
 
 mod config_cmd;
 mod daemon;
+mod mode;
 mod output;
 mod uninstall;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use output::Out;
 use rfind_config::load as load_config;
-use rfind_core::{db, progress_file_path, DaemonPhase, ScanProgress};
+use rfind_core::{
+    db,
+    filters::{parse_size as parse_size_spec, parse_time, SizeFilter, SizeOp, TimeFilter},
+    progress_file_path, DaemonPhase, ScanProgress,
+};
 use std::{
     fs,
     path::Path,
@@ -64,7 +69,8 @@ struct Cli {
 /// Result filters and display options shared by the search commands.
 #[derive(clap::Args, Clone, Default)]
 struct FilterArgs {
-    /// Only files (f) or only directories (d).
+    /// Only files (f), directories (d), symlinks (l), or any (any).
+    /// Symlink and any filtering only applies in walk mode.
     #[arg(long, value_enum)]
     r#type: Option<EntryType>,
     /// Only files of at least SIZE (e.g. 500K, 10M, 1.5G).
@@ -73,19 +79,83 @@ struct FilterArgs {
     /// Only files of at most SIZE.
     #[arg(long, value_name = "SIZE", value_parser = parse_size)]
     smaller_than: Option<u64>,
+    /// Size predicate in daviddl9 form: +N (larger), -N (smaller), N (exact).
+    /// Units: c=byte, k/K=KiB, M=MiB, G=GiB, T=TiB; trailing B/iB accepted.
+    #[arg(long, value_name = "SPEC", allow_hyphen_values = true, value_parser = parse_size_filter)]
+    size: Option<SizeFilter>,
+    /// mtime predicate: +N (older), -N (newer), N (exact). Units: s, m, h, d.
+    #[arg(long, value_name = "SPEC", allow_hyphen_values = true, value_parser = parse_time_filter)]
+    mtime: Option<TimeFilter>,
+    /// atime predicate (walk mode only; not stored in the index).
+    #[arg(long, value_name = "SPEC", allow_hyphen_values = true, value_parser = parse_time_filter)]
+    atime: Option<TimeFilter>,
+    /// ctime predicate (walk mode only; not stored in the index).
+    #[arg(long, value_name = "SPEC", allow_hyphen_values = true, value_parser = parse_time_filter)]
+    ctime: Option<TimeFilter>,
     /// Show size and modification time with each path.
     #[arg(short, long)]
     long: bool,
 }
 
-impl FilterArgs {
-    fn filter(&self) -> db::Filter {
-        db::Filter {
-            is_dir: self.r#type.as_ref().and_then(|t| t.to_is_dir()),
-            min_size: self.larger_than,
-            max_size: self.smaller_than,
+/// Merge legacy `--larger-than` / `--smaller-than` with `--size`:
+/// AND their bounds. Returns an error only when bounds are contradictory
+/// (e.g. min > max).
+fn merge_size_bounds(
+    larger_than: Option<u64>,
+    smaller_than: Option<u64>,
+    size: Option<SizeFilter>,
+) -> Result<(Option<u64>, Option<u64>), Failed> {
+    let (mut lo, mut hi) = (larger_than, smaller_than);
+    if let Some(sf) = size {
+        let (sf_lo, sf_hi) = sf.to_bounds();
+        if let Some(x) = sf_lo {
+            lo = Some(lo.map_or(x, |cur| cur.max(x)));
+        }
+        if let Some(x) = sf_hi {
+            hi = Some(hi.map_or(x, |cur| cur.min(x)));
         }
     }
+    if let (Some(l), Some(h)) = (lo, hi) {
+        if l > h {
+            return Err(fail(format!(
+                "size filters contradict: min {l} > max {h}"
+            )));
+        }
+    }
+    Ok((lo, hi))
+}
+
+impl FilterArgs {
+    /// Build a `db::Filter` honoring both the legacy and new size/time flags.
+    /// Returns an error if size or mtime bounds are contradictory.
+    fn filter(&self, now: i64) -> Result<db::Filter, Failed> {
+        let (min_size, max_size) =
+            merge_size_bounds(self.larger_than, self.smaller_than, self.size)?;
+        let mtime_range = self.mtime.map(|tf| tf.to_range(now));
+        Ok(db::Filter {
+            is_dir: self.r#type.as_ref().and_then(|t| t.to_is_dir()),
+            min_size,
+            max_size,
+            mtime_range,
+        })
+    }
+
+    /// True iff a filter is set that the index can't currently answer
+    /// (atime, ctime, type=l, type=any) — the mode selector routes these
+    /// to walk mode.
+    fn requires_walk(&self) -> bool {
+        self.atime.is_some()
+            || self.ctime.is_some()
+            || matches!(self.r#type, Some(EntryType::Symlink) | Some(EntryType::Any))
+    }
+}
+
+fn parse_size_filter(s: &str) -> Result<SizeFilter, String> {
+    parse_size_spec(s)
+}
+
+fn parse_time_filter(s: &str) -> Result<TimeFilter, String> {
+    parse_time(s)
 }
 
 /// Composable search: pattern + where + sort + top-N + time + filters.
@@ -141,6 +211,29 @@ struct SearchArgs {
     #[arg(long, requires = "from", value_name = "DATE")]
     to: Option<String>,
 
+    /// Walk the filesystem instead of querying the index.
+    #[arg(long, visible_alias = "no-index")]
+    live: bool,
+    /// Terminate records with NUL (`\0`) instead of newline (xargs -0, jq -0).
+    #[arg(long)]
+    print0: bool,
+    /// Walk-mode: maximum directory depth to descend (0 = roots only).
+    #[arg(short = 'm', long, value_name = "N")]
+    max_depth: Option<u32>,
+    /// Walk-mode: worker thread count. 0 = cores × 2.
+    #[arg(short = 'j', long, value_name = "N")]
+    threads: Option<usize>,
+
+    /// Walk-mode: never follow symlinks (default).
+    #[arg(short = 'P', group = "symlinks")]
+    no_follow: bool,
+    /// Walk-mode: follow symlinks given as roots only.
+    #[arg(short = 'H', group = "symlinks")]
+    follow_roots: bool,
+    /// Walk-mode: follow all symlinks (uses a visited set to break cycles).
+    #[arg(short = 'L', group = "symlinks")]
+    follow_all: bool,
+
     #[command(flatten)]
     filter: FilterArgs,
 }
@@ -160,79 +253,108 @@ impl SearchArgs {
             && self.filter.r#type.is_none()
             && self.filter.larger_than.is_none()
             && self.filter.smaller_than.is_none()
+            && self.filter.size.is_none()
+            && self.filter.mtime.is_none()
+            && self.filter.atime.is_none()
+            && self.filter.ctime.is_none()
     }
 
-    /// Was any time constraint given?
+    /// Was any mtime-based time constraint given (legacy or new)?
     fn has_time_filter(&self) -> bool {
         self.minutes.is_some()
             || self.hours.is_some()
             || self.days.is_some()
             || (self.from.is_some() && self.to.is_some())
+            || self.filter.mtime.is_some()
     }
 
-    /// Resolve the time window; None when no time filter is in play.
+    /// Resolve the mtime time window; None when no mtime filter is in play.
+    /// Legacy flags (--minutes/--hours/--days/--from/--to) and the new
+    /// --mtime are AND'd — the result is the intersection of the two
+    /// ranges, with an error on a contradictory window.
     fn time_range(&self) -> Result<Option<(i64, i64)>, Failed> {
         let now = now();
+        let mut window: Option<(i64, i64)> = None;
+        let mut narrow = |next: (i64, i64)| {
+            window = Some(match window {
+                None => next,
+                Some((lo, hi)) => (lo.max(next.0), hi.min(next.1)),
+            });
+        };
         if let (Some(f), Some(t)) = (&self.from, &self.to) {
             match (parse_date(f), parse_date_end(t)) {
-                (Some(fs), Some(ts)) => Ok(Some((fs, ts))),
-                _ => Err(fail("invalid date; use YYYY-MM-DD")),
+                (Some(fs), Some(ts)) => narrow((fs, ts)),
+                _ => return Err(fail("invalid date; use YYYY-MM-DD")),
             }
         } else if let Some(m) = self.minutes {
-            Ok(Some((now - m * 60, now)))
+            narrow((now - m * 60, now));
         } else if let Some(h) = self.hours {
-            Ok(Some((now - h * 3600, now)))
+            narrow((now - h * 3600, now));
         } else if let Some(d) = self.days {
-            Ok(Some((now - d * 86400, now)))
+            narrow((now - d * 86400, now));
         } else if self.recent {
-            Ok(Some((now - 86400, now))) // default: last 24h
+            narrow((now - 86400, now));
+        }
+        if let Some(mt) = self.filter.mtime {
+            narrow(mt.to_range(now));
+        }
+        if let Some((lo, hi)) = window {
+            if lo > hi {
+                return Err(fail("time filters contradict (empty window)"));
+            }
+        }
+        Ok(window)
+    }
+
+    /// Which symlink mode the user picked, or `P` (nofollow) by default.
+    /// Only one of `-P`/`-H`/`-L` can be set thanks to the clap group.
+    fn symlink_mode(&self) -> mode::SymlinkMode {
+        if self.follow_all {
+            mode::SymlinkMode::L
+        } else if self.follow_roots {
+            mode::SymlinkMode::H
         } else {
-            Ok(None)
+            mode::SymlinkMode::P
         }
     }
 }
 
-/// Parse a size like 4096, 500K, 10M, 1.5G, 2T (binary units; a trailing
-/// "B" or "iB" is accepted).
+/// Parse a plain size like 4096, 500K, 10M, 1.5G, 2T (binary units; a
+/// trailing "B"/"iB" is accepted). Delegates to the shared parser and
+/// rejects a leading `+`/`-` — those belong to `--size`, not
+/// `--larger-than` / `--smaller-than`.
 fn parse_size(s: &str) -> Result<u64, String> {
-    let t = s
-        .trim()
-        .trim_end_matches(['B', 'b'])
-        .trim_end_matches(['i', 'I']);
-    let (num, mult) = match t.chars().last().map(|c| c.to_ascii_uppercase()) {
-        Some('K') => (&t[..t.len() - 1], 1u64 << 10),
-        Some('M') => (&t[..t.len() - 1], 1 << 20),
-        Some('G') => (&t[..t.len() - 1], 1 << 30),
-        Some('T') => (&t[..t.len() - 1], 1 << 40),
-        _ => (t, 1),
-    };
-    let n: f64 = num
-        .trim()
-        .parse()
-        .map_err(|_| format!("invalid size '{s}' (try 500K, 10M, 1.5G)"))?;
-    if n < 0.0 {
-        return Err(format!("invalid size '{s}'"));
+    let sf = parse_size_spec(s)?;
+    match sf.op {
+        SizeOp::Exact => Ok(sf.bytes),
+        SizeOp::Larger | SizeOp::Smaller => Err(format!(
+            "'{s}' has a +/- prefix; use --size for that, not --larger-than / --smaller-than"
+        )),
     }
-    let bytes = n * mult as f64;
-    if !bytes.is_finite() || bytes > u64::MAX as f64 {
-        return Err(format!("size '{s}' is too large"));
-    }
-    Ok(bytes as u64)
 }
 
-#[derive(ValueEnum, Clone, Debug)]
+#[derive(ValueEnum, Clone, Debug, PartialEq)]
 enum EntryType {
     #[value(name = "f")]
     File,
     #[value(name = "d")]
     Dir,
+    /// Symlink. Walk-mode only (the index does not store symlink type today).
+    #[value(name = "l")]
+    Symlink,
+    /// Match any entry type. Walk-mode only.
+    #[value(name = "any")]
+    Any,
 }
 
 impl EntryType {
+    /// Map to the index's `is_dir` filter. `Symlink` / `Any` return None and
+    /// require walk mode (handled by the mode selector).
     fn to_is_dir(&self) -> Option<bool> {
         match self {
             EntryType::File => Some(false),
             EntryType::Dir => Some(true),
+            EntryType::Symlink | EntryType::Any => None,
         }
     }
 }
@@ -379,6 +501,13 @@ fn open_db() -> Result<rusqlite::Connection, Failed> {
     db::open_readonly(&config()?.index.db_path).map_err(fail)
 }
 
+/// Same as [`open_db`] but reuses an already-loaded `Config` to skip the
+/// second file read. The index path is still enforced root-only.
+fn open_db_with_cfg(cfg: &rfind_config::Config) -> Result<rusqlite::Connection, Failed> {
+    require_root()?;
+    db::open_readonly(&cfg.index.db_path).map_err(fail)
+}
+
 fn load_progress() -> Option<ScanProgress> {
     let text = fs::read_to_string(progress_file_path()).ok()?;
     serde_json::from_str(&text).ok()
@@ -486,15 +615,45 @@ impl PatternKind {
 ///   pattern does not miss big files past the SQL LIMIT.
 /// - otherwise: the matching glob/regex/path streamer, which already
 ///   honours --under at the SQL level.
+///
+/// A thin shim dispatches between index mode and walk mode via the
+/// mode selector; the walk branch never opens the index.
 fn cmd_search(out: &mut Out, a: &SearchArgs) -> CmdResult {
-    let conn = open_db()?;
-    let filter = a.filter.filter();
-    let kind = PatternKind::build(a)?;
-
     // --long is implied by any sort flag — the sort key is what the user
-    // wants to see.
+    // wants to see. Same with --print0.
     out.long = a.filter.long || a.largest;
+    out.print0 = a.print0;
 
+    let cfg = config()?;
+    let request = mode::Request {
+        live_flag: a.live,
+        walk_only_filter: a.filter.requires_walk(),
+        symlinks: a.symlink_mode(),
+    };
+    let env = mode::Env {
+        caller_is_root: unsafe { libc::geteuid() } == 0,
+        cfg: &cfg,
+        index_available: mode::index_available(&cfg),
+        daemon_ready: daemon::rfindd_pid().is_some(),
+    };
+    let (chosen, warn) = mode::choose_mode(&request, &env).map_err(fail)?;
+    if let Some(msg) = warn {
+        if !out.json {
+            eprintln!("rfind: {msg}");
+        }
+    }
+    match chosen {
+        mode::Mode::Index => cmd_search_index(out, a, &cfg),
+        mode::Mode::Walk => cmd_search_walk(out, a),
+    }
+}
+
+/// Query the SQLite index (requires root). Previously the body of
+/// `cmd_search`; split out so the walk branch can skip `open_db` entirely.
+fn cmd_search_index(out: &mut Out, a: &SearchArgs, cfg: &rfind_config::Config) -> CmdResult {
+    let conn = open_db_with_cfg(cfg)?;
+    let filter = a.filter.filter(now())?;
+    let kind = PatternKind::build(a)?;
     if a.recent || a.has_time_filter() {
         return search_by_time(out, &conn, a, &kind, &filter);
     }
@@ -502,6 +661,199 @@ fn cmd_search(out: &mut Out, a: &SearchArgs) -> CmdResult {
         return search_largest(out, &conn, a, &kind, &filter);
     }
     search_by_pattern(out, &conn, a, &filter)
+}
+
+/// Walk the live filesystem instead of the index. Never opens the index
+/// DB; works for any user. The predicate is composed from the usual
+/// pattern/under/filter inputs plus the walk-only extras (atime, ctime,
+/// --type l/any). `--top N` sets the scanner's cancel after N hits.
+fn cmd_search_walk(out: &mut Out, a: &SearchArgs) -> CmdResult {
+    use rfind_scanner::{
+        run_search, EntryInfo, SearchConfig, STATX_ATIME, STATX_CTIME, STATX_MASK, STATX_MTIME,
+        STATX_SIZE, STATX_TYPE,
+    };
+    use std::sync::{
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        mpsc::sync_channel,
+        Arc,
+    };
+
+    let now_s = now();
+    let filter = a.filter.filter(now_s)?;
+    let time_window = a.time_range()?;
+    let kind = PatternKind::build(a)?;
+    let under = a
+        .under
+        .clone()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let roots = vec![under];
+
+    // Walk-only time bounds (atime/ctime) separate from the mtime window.
+    let atime_range = a.filter.atime.map(|tf| tf.to_range(now_s));
+    let ctime_range = a.filter.ctime.map(|tf| tf.to_range(now_s));
+
+    // Narrow or widen the statx mask to only what the predicate reads.
+    let needs_mtime = time_window.is_some();
+    let needs_size = filter.min_size.is_some() || filter.max_size.is_some();
+    let needs_atime = atime_range.is_some();
+    let needs_ctime = ctime_range.is_some();
+    let mut mask = STATX_TYPE;
+    if needs_mtime {
+        mask |= STATX_MTIME;
+    }
+    if needs_size {
+        mask |= STATX_SIZE;
+    }
+    if needs_atime {
+        mask |= STATX_ATIME;
+    }
+    if needs_ctime {
+        mask |= STATX_CTIME;
+    }
+    // No filter actually needs mtime/size/atime/ctime → pure name query.
+    // STATX_TYPE alone is enough; the scanner's needs_stat fast-path will
+    // skip statx on known-type DT_REG entries.
+    if mask == STATX_TYPE && !needs_mtime && !needs_size {
+        // keep mask = STATX_TYPE
+    } else if mask == STATX_TYPE {
+        // Caller asked only for atime or ctime without mtime/size — unlikely
+        // but fall back to the indexer's wide mask so the scanner always
+        // has valid metadata to hand to the predicate.
+        mask = STATX_MASK;
+    }
+
+    let want_type = a.filter.r#type.clone();
+    let pattern = Arc::new(kind);
+    let under_prefix_str = a.under.clone();
+    let predicate_filter = filter;
+    let predicate = {
+        let pattern = Arc::clone(&pattern);
+        move |e: &EntryInfo| {
+            // --type: files, dirs, symlinks, or anything.
+            if let Some(t) = &want_type {
+                let ok = match t {
+                    EntryType::File => !e.is_dir && !e.is_symlink,
+                    EntryType::Dir => e.is_dir,
+                    EntryType::Symlink => e.is_symlink,
+                    EntryType::Any => true,
+                };
+                if !ok {
+                    return false;
+                }
+            } else if e.is_dir {
+                // Default (no --type): hide directories from walk output;
+                // a pattern query usually means "find files named X". The
+                // predicate still lets the scanner descend — this only
+                // filters what the sink sees.
+                return false;
+            }
+            // --under keeps paths within the subtree even after -L jumps.
+            if let Some(u) = &under_prefix_str {
+                if !under_prefix(e.path.to_string_lossy().as_ref(), u) {
+                    return false;
+                }
+            }
+            if !pattern.matches(&e.path.to_string_lossy()) {
+                return false;
+            }
+            if !e.is_dir {
+                if let Some(min) = predicate_filter.min_size {
+                    if e.size < min {
+                        return false;
+                    }
+                }
+                if let Some(max) = predicate_filter.max_size {
+                    if e.size > max {
+                        return false;
+                    }
+                }
+            }
+            if let Some((lo, hi)) = time_window {
+                if e.mtime_sec < lo || e.mtime_sec > hi {
+                    return false;
+                }
+            }
+            if let Some((lo, hi)) = atime_range {
+                if e.atime_sec < lo || e.atime_sec > hi {
+                    return false;
+                }
+            }
+            if let Some((lo, hi)) = ctime_range {
+                if e.ctime_sec < lo || e.ctime_sec > hi {
+                    return false;
+                }
+            }
+            true
+        }
+    };
+
+    out.long = a.filter.long || a.largest;
+    out.print0 = a.print0;
+
+    // Streaming producer/consumer:
+    //   workers → mpsc::sync_channel → main thread (owns `out`)
+    // Bounded buffer gives backpressure if printing lags.
+    let (tx, rx) = sync_channel::<EntryInfo>(1024);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let hit_sink = move |e: EntryInfo| {
+        let _ = tx.send(e);
+    };
+
+    let workers_opt = a.threads.unwrap_or(0);
+    let workers = if workers_opt > 0 {
+        workers_opt
+    } else {
+        num_cpus_default()
+    };
+    let cfg = SearchConfig {
+        workers,
+        max_depth: a.max_depth,
+        symlinks: match a.symlink_mode() {
+            mode::SymlinkMode::P => rfind_scanner::SymlinkMode::P,
+            mode::SymlinkMode::H => rfind_scanner::SymlinkMode::H,
+            mode::SymlinkMode::L => rfind_scanner::SymlinkMode::L,
+        },
+        statx_mask: mask,
+        cancel: Arc::clone(&cancel),
+        ..SearchConfig::new(roots, predicate, hit_sink)
+    };
+
+    // Scanner runs on a dedicated thread so the main thread can own `out`
+    // and drain the receiver without lifetime acrobatics.
+    let scan_handle = std::thread::spawn(move || run_search(cfg));
+
+    let want = a.top.unwrap_or(usize::MAX);
+    let mut n: u64 = 0;
+    while let Ok(e) = rx.recv() {
+        let path_str = e.path.to_string_lossy();
+        let hit = db::Hit {
+            path: path_str.as_ref(),
+            is_dir: e.is_dir,
+            mtime_sec: e.mtime_sec,
+            size: e.size,
+        };
+        let keep = out.hit(&hit);
+        n += 1;
+        if !keep || n as usize >= want {
+            cancel.store(true, AtomicOrdering::Relaxed);
+            break;
+        }
+    }
+    // Keep draining until the senders close (post-cancel). Discarded; the
+    // sink still ran their predicate work but we don't print them.
+    while rx.recv().is_ok() {}
+    let _ = scan_handle.join();
+
+    out.count(n);
+    found(n)
+}
+
+/// Walk-mode default: cores × 2 (I/O-bound).
+fn num_cpus_default() -> usize {
+    std::thread::available_parallelism()
+        .map(|p| p.get() * 2)
+        .unwrap_or(4)
 }
 
 fn search_by_time(

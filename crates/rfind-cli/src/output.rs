@@ -16,6 +16,9 @@ pub struct Out {
     pub json: bool,
     /// Text mode: show size and modification time with each path.
     pub long: bool,
+    /// Separate records with `\0` instead of `\n` (xargs -0, jq -0).
+    /// Applies to text, long, and JSON hit lines.
+    pub print0: bool,
     stdout: BufWriter<io::Stdout>,
 }
 
@@ -104,6 +107,7 @@ impl Out {
         Self {
             json,
             long: false,
+            print0: false,
             stdout: BufWriter::new(io::stdout()),
         }
     }
@@ -114,7 +118,10 @@ impl Out {
     /// surfaces as soon as the reader goes away — otherwise `rfind … | head`
     /// would keep running SQL for every row until the buffer finally flushed.
     fn line(&mut self, s: &str) -> bool {
-        writeln!(self.stdout, "{s}").is_ok() && self.stdout.flush().is_ok()
+        let sep: &[u8] = if self.print0 { b"\0" } else { b"\n" };
+        self.stdout.write_all(s.as_bytes()).is_ok()
+            && self.stdout.write_all(sep).is_ok()
+            && self.stdout.flush().is_ok()
     }
 
     fn object(&mut self, v: &Value) {

@@ -30,7 +30,7 @@ pub enum EditError {
     #[error("'{key}' expects {expected}, got '{got}'")]
     BadValue {
         key: String,
-        expected: &'static str,
+        expected: String,
         got: String,
     },
     #[error("'{0}' must be an absolute path")]
@@ -43,6 +43,8 @@ pub enum Kind {
     Bool,
     Int,
     Path,
+    /// Enum: one of the given lowercase strings.
+    Enum(&'static [&'static str]),
 }
 
 /// Scalar settings changeable with `rfind config set`, with descriptions.
@@ -93,6 +95,21 @@ pub const KEYS: &[(&str, Kind, &str)] = &[
         "monitor.watch_new_mounts",
         Kind::Bool,
         "index filesystems mounted under live roots after startup",
+    ),
+    (
+        "search.mode",
+        Kind::Enum(&["auto", "index", "walk"]),
+        "which backend to prefer: auto (default), index, or walk",
+    ),
+    (
+        "search.io_uring",
+        Kind::Bool,
+        "use io_uring for walk-mode statx batching when available",
+    ),
+    (
+        "search.threads",
+        Kind::Int,
+        "walk-mode worker threads; 0 = cores × 2",
     ),
 ];
 
@@ -255,7 +272,7 @@ impl ConfigFile {
     /// Set a scalar setting from its string form.
     pub fn set(&mut self, key: &str, raw: &str) -> Result<(), EditError> {
         let kind = key_kind(key).ok_or_else(|| EditError::UnknownKey(key.to_string()))?;
-        let bad = |expected| EditError::BadValue {
+        let bad = |expected: String| EditError::BadValue {
             key: key.to_string(),
             expected,
             got: raw.to_string(),
@@ -264,13 +281,21 @@ impl ConfigFile {
             Kind::Bool => match raw.to_ascii_lowercase().as_str() {
                 "true" | "yes" | "on" | "1" => value(true),
                 "false" | "no" | "off" | "0" => value(false),
-                _ => return Err(bad("true or false")),
+                _ => return Err(bad("true or false".into())),
             },
             Kind::Int => value(
                 raw.parse::<u32>()
-                    .map_err(|_| bad("a non-negative integer"))? as i64,
+                    .map_err(|_| bad("a non-negative integer".into()))?
+                    as i64,
             ),
             Kind::Path => value(normalize_path(raw)?.to_string_lossy().to_string()),
+            Kind::Enum(allowed) => {
+                let lo = raw.to_ascii_lowercase();
+                if !allowed.contains(&lo.as_str()) {
+                    return Err(bad(format!("one of {}", allowed.join(", "))));
+                }
+                value(lo)
+            }
         };
         let (section, field) = key.split_once('.').unwrap();
         self.table(section)[field] = v;

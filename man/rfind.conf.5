@@ -1,4 +1,4 @@
-.TH RFIND.CONF 5 "2026-10-14" "rfind 1.0.1" "File Formats"
+.TH RFIND.CONF 5 "2026-10-20" "rfind 1.1.0" "File Formats"
 .SH NAME
 rfind.conf \- configuration of the rfindd indexing daemon
 .SH SYNOPSIS
@@ -95,6 +95,36 @@ hours.
 .BR watch_new_mounts " (boolean; default " true )
 Index and watch filesystems mounted under a live root after startup.
 Overlay and pseudo filesystems and bind mounts of indexed files are ignored.
+.SH [search]
+Preferences for the
+.BR rfind (1)
+CLI when it can choose between querying the index and walking the live
+filesystem.
+.TP
+.BR mode " (one of " auto ", " index ", " walk "; default " auto )
+.B auto
+prefers the index when the daemon is ready and the filter is one the
+index can answer; otherwise falls back to a live walk. (The caller gets a
+one\-line warning on stderr when it falls back because the daemon is not
+ready or the DB is missing.)
+.B index
+never walks and errors if the index is unusable.
+.B walk
+never consults the index.
+Command\-line
+.BR \-\-live / \-\-no\-index
+always wins over this setting.
+.TP
+.BR io_uring " (boolean; default " true )
+Use io_uring for walk\-mode statx batching when the kernel allows it.
+Independent of
+.B scan.io_uring
+(the indexer's own knob).
+.TP
+.BR threads " (integer; default " 0 )
+Walk\-mode worker threads. 0 = cores\ \(mu\ 2 (I/O\-bound default). The CLI's
+.B \-j
+flag overrides this per invocation.
 .SH EXAMPLE
 .nf
 # Index the whole system; Windows drives are rescanned twice a day.
@@ -126,6 +156,11 @@ compress = true
 prefer_fanotify = true
 inotify_fallback = true
 watch_new_mounts = true
+
+[search]
+mode = "auto"
+io_uring = true
+threads = 0
 .fi
 .SH NOTES
 Under WSL2, put Windows drives

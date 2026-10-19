@@ -23,7 +23,7 @@ use libc::{
 use rfind_core::{DaemonPhase, ScanProgress};
 use std::os::unix::ffi::OsStrExt;
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     ffi::{CStr, CString},
     mem,
     os::unix::io::RawFd,
@@ -52,6 +52,7 @@ struct LinuxDirent64 {
 
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
+const DT_LNK: u8 = 10;
 const DT_UNKNOWN: u8 = 0;
 
 // ---------------------------------------------------------------------------
@@ -93,35 +94,55 @@ struct Statx {
     _pad2: [u64; 13],
 }
 
-const STATX_TYPE: u32 = 0x1;
-const STATX_MTIME: u32 = 0x40;
-const STATX_SIZE: u32 = 0x200;
-const STATX_MASK: u32 = STATX_TYPE | STATX_MTIME | STATX_SIZE;
+pub const STATX_TYPE: u32 = 0x1;
+pub const STATX_MTIME: u32 = 0x40;
+pub const STATX_SIZE: u32 = 0x200;
+pub const STATX_ATIME: u32 = 0x20;
+pub const STATX_CTIME: u32 = 0x80;
+/// The indexer's statx mask: type + mtime + size. Kept intact so the
+/// indexer sees exactly the same stat shape as before.
+pub const STATX_MASK: u32 = STATX_TYPE | STATX_MTIME | STATX_SIZE;
 const S_IFMT: u16 = 0o170000;
 const S_IFDIR: u16 = 0o040000;
+const S_IFLNK: u16 = 0o120000;
 
-/// What the scanner needs from statx: file type, mtime and size.
+/// What the scanner needs from statx. `atime`/`ctime` are populated only
+/// when the caller requests them via a wider mask; otherwise they are 0.
+/// `(dev, ino)` identify an inode uniquely across bind mounts — used by
+/// the `-L` symlink mode to break traversal cycles.
 #[derive(Clone, Copy)]
 struct Stat {
     is_dir: bool,
+    is_symlink: bool,
     mtime_sec: i64,
     mtime_nsec: i64,
+    atime_sec: i64,
+    ctime_sec: i64,
     size: u64,
+    dev: u64,
+    ino: u64,
 }
 
 impl Stat {
     fn from_statx(stx: &Statx) -> Self {
+        let mode = stx.stx_mode & S_IFMT;
         Self {
-            is_dir: stx.stx_mode & S_IFMT == S_IFDIR,
+            is_dir: mode == S_IFDIR,
+            is_symlink: mode == S_IFLNK,
             mtime_sec: stx.stx_mtime.tv_sec,
             mtime_nsec: stx.stx_mtime.tv_nsec as i64,
+            atime_sec: stx.stx_atime.tv_sec,
+            ctime_sec: stx.stx_ctime.tv_sec,
             size: stx.stx_size,
+            dev: ((stx.stx_dev_major as u64) << 32) | stx.stx_dev_minor as u64,
+            ino: stx.stx_ino,
         }
     }
 }
 
-/// statx(dirfd, name, AT_SYMLINK_NOFOLLOW, TYPE|MTIME|SIZE) as a plain syscall.
-fn statx_one(dirfd: RawFd, name: &CStr) -> Option<Stat> {
+/// statx(dirfd, name, flags, mask) as a plain syscall. `flags` typically
+/// includes `AT_SYMLINK_NOFOLLOW`; omit it to follow a symlink target.
+fn statx_one(dirfd: RawFd, name: &CStr, mask: u32, flags: i32) -> Option<Stat> {
     let mut stx = Statx::default();
     loop {
         let ret = unsafe {
@@ -129,8 +150,8 @@ fn statx_one(dirfd: RawFd, name: &CStr) -> Option<Stat> {
                 libc::SYS_statx, // per-architecture number (332 on x86_64, 291 on aarch64)
                 dirfd as libc::c_long,
                 name.as_ptr() as libc::c_long,
-                AT_SYMLINK_NOFOLLOW as libc::c_long,
-                STATX_MASK as libc::c_long,
+                flags as libc::c_long,
+                mask as libc::c_long,
                 &mut stx as *mut Statx as libc::c_long,
             )
         };
@@ -181,9 +202,14 @@ fn statx_batch(
     ring: &mut Option<io_uring::IoUring>,
     dirfd: RawFd,
     names: &[&CStr],
+    mask: u32,
+    flags: i32,
 ) -> Vec<Option<Stat>> {
     let Some(r) = ring.as_mut() else {
-        return names.iter().map(|n| statx_one(dirfd, n)).collect();
+        return names
+            .iter()
+            .map(|n| statx_one(dirfd, n, mask, flags))
+            .collect();
     };
     let mut out = vec![None; names.len()];
     let mut bufs: Vec<Statx> = (0..names.len()).map(|_| Statx::default()).collect();
@@ -196,8 +222,8 @@ fn statx_batch(
                 name.as_ptr(),
                 &mut bufs[base + i] as *mut Statx as *mut io_uring::types::statx,
             )
-            .flags(AT_SYMLINK_NOFOLLOW)
-            .mask(STATX_MASK)
+            .flags(flags)
+            .mask(mask)
             .build()
             .user_data((base + i) as u64);
             // The ring has URING_ENTRIES slots and the chunk is no larger,
@@ -220,7 +246,7 @@ fn statx_batch(
                 // Fill the rest (and any later chunks) with plain statx.
                 for (i, name) in names.iter().enumerate() {
                     if out[i].is_none() {
-                        out[i] = statx_one(dirfd, name);
+                        out[i] = statx_one(dirfd, name, mask, flags);
                     }
                 }
                 return out;
@@ -257,11 +283,17 @@ fn statx_batch(
                         }
                         std::mem::forget(bufs);
                         URING_UNAVAILABLE.store(true, Ordering::Relaxed);
-                        return names.iter().map(|n| statx_one(dirfd, n)).collect();
+                        return names
+                            .iter()
+                            .map(|n| statx_one(dirfd, n, mask, flags))
+                            .collect();
                     }
                     URING_UNAVAILABLE.store(true, Ordering::Relaxed);
                     *ring = None;
-                    return names.iter().map(|n| statx_one(dirfd, n)).collect();
+                    return names
+                        .iter()
+                        .map(|n| statx_one(dirfd, n, mask, flags))
+                        .collect();
                 }
             }
             for cqe in r.completion() {
@@ -287,6 +319,9 @@ fn statx_batch(
 struct WorkItem {
     /// Absolute path of this directory.
     path: PathBuf,
+    /// Depth from the originating root (root itself = 0). Used by the
+    /// `--max-depth` cutoff in walk-mode search.
+    depth: u32,
 }
 
 struct WorkQueue {
@@ -338,19 +373,45 @@ struct Counters {
 // ---------------------------------------------------------------------------
 
 /// Metadata collected for each entry.
+///
+/// `is_symlink` reflects whether the dirent itself is a symlink (not its
+/// target). `atime_sec` / `ctime_sec` are 0 unless the scan was configured
+/// with a mask that requested them (see [`ScanConfig::with_statx_mask`]).
 pub struct EntryInfo {
     pub path: PathBuf,
     pub is_dir: bool,
+    pub is_symlink: bool,
     pub mtime_sec: i64,
     pub mtime_nsec: i64,
+    pub atime_sec: i64,
+    pub ctime_sec: i64,
     /// Size in bytes (0 for directories).
     pub size: u64,
+    /// Depth from the scan's originating root (root itself = 0).
+    pub depth: u32,
 }
 
 pub type ProgressFn = Box<dyn Fn(ScanProgress) + Send + Sync + 'static>;
 pub type EntryFn = Box<dyn Fn(EntryInfo) + Send + Sync + 'static>;
 pub type ErrorFn = Box<dyn Fn(&PathBuf, &str) + Send + Sync + 'static>;
 pub type SkipDirFn = Box<dyn Fn(&PathBuf) -> bool + Send + Sync + 'static>;
+
+/// Symlink traversal mode. Matches `find(1)`'s `-P` / `-H` / `-L`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymlinkMode {
+    /// Never follow symlinks. The indexer's behaviour; the scanner's
+    /// historical default.
+    P,
+    /// Follow symlinks only when they appear as a scan root.
+    H,
+    /// Follow symlinks everywhere; a visited `(dev, ino)` set breaks cycles.
+    L,
+}
+
+/// Shared "seen inodes" set for the `-L` traversal mode. Keyed by
+/// `(dev, ino)` so a symlink into a bind-mounted copy of the same tree is
+/// still detected as a cycle. Used only when `symlinks = SymlinkMode::L`.
+type VisitedSet = Arc<Mutex<HashSet<(u64, u64)>>>;
 
 pub struct ScanConfig {
     pub roots: Vec<PathBuf>,
@@ -365,6 +426,17 @@ pub struct ScanConfig {
     pub on_entry: EntryFn,
     pub on_error: ErrorFn,
     pub skip_dir: SkipDirFn,
+    /// Maximum directory depth to descend; roots are depth 0. `None` =
+    /// no cap (the indexer never sets this).
+    pub max_depth: Option<u32>,
+    /// How to treat symlinks. The indexer always uses `P`.
+    pub symlinks: SymlinkMode,
+    /// statx mask applied to every statx call. Walk-mode search can narrow
+    /// this to [`STATX_TYPE`] alone, or widen it with `STATX_ATIME`/
+    /// `STATX_CTIME` when `--atime`/`--ctime` is in use.
+    pub statx_mask: u32,
+    /// Visited-inode set for `SymlinkMode::L`. `None` otherwise.
+    pub visited: Option<VisitedSet>,
 }
 
 impl ScanConfig {
@@ -385,7 +457,29 @@ impl ScanConfig {
             on_entry: Box::new(on_entry),
             on_error: Box::new(|p, e| eprintln!("SCAN ERROR {}: {}", p.display(), e)),
             skip_dir: Box::new(|_| false),
+            max_depth: None,
+            symlinks: SymlinkMode::P,
+            statx_mask: STATX_MASK,
+            visited: None,
         }
+    }
+
+    pub fn with_max_depth(mut self, depth: Option<u32>) -> Self {
+        self.max_depth = depth;
+        self
+    }
+
+    pub fn with_symlinks(mut self, mode: SymlinkMode) -> Self {
+        self.symlinks = mode;
+        if matches!(mode, SymlinkMode::L) && self.visited.is_none() {
+            self.visited = Some(Arc::new(Mutex::new(HashSet::new())));
+        }
+        self
+    }
+
+    pub fn with_statx_mask(mut self, mask: u32) -> Self {
+        self.statx_mask = mask;
+        self
     }
 
     pub fn with_workers(mut self, n: usize) -> Self {
@@ -433,6 +527,88 @@ pub struct ScanResult {
     pub elapsed: Duration,
 }
 
+pub type PredicateFn = Arc<dyn Fn(&EntryInfo) -> bool + Send + Sync + 'static>;
+pub type HitFn = Arc<dyn Fn(EntryInfo) + Send + Sync + 'static>;
+
+/// Walk-mode search configuration. A thin wrapper around [`ScanConfig`]
+/// that bakes the predicate+sink into a `on_entry` closure. The indexer
+/// path (`run_scan`) is unaffected.
+pub struct SearchConfig {
+    pub roots: Vec<PathBuf>,
+    pub workers: usize,
+    pub max_depth: Option<u32>,
+    pub symlinks: SymlinkMode,
+    pub io_uring: bool,
+    /// Base statx mask; narrows to `STATX_TYPE` for pure name queries,
+    /// widens with `STATX_ATIME` / `STATX_CTIME` on demand. Caller is
+    /// responsible for picking the mask that matches its predicate.
+    pub statx_mask: u32,
+    pub cancel: Arc<AtomicBool>,
+    pub predicate: PredicateFn,
+    pub on_hit: HitFn,
+    pub on_error: ErrorFn,
+}
+
+impl SearchConfig {
+    pub fn new(
+        roots: Vec<PathBuf>,
+        predicate: impl Fn(&EntryInfo) -> bool + Send + Sync + 'static,
+        on_hit: impl Fn(EntryInfo) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            roots,
+            // Walk search is I/O-bound; double the usual compute default.
+            workers: (num_cpus::get() * 2).max(4),
+            max_depth: None,
+            symlinks: SymlinkMode::P,
+            io_uring: true,
+            statx_mask: STATX_MASK,
+            cancel: Arc::new(AtomicBool::new(false)),
+            predicate: Arc::new(predicate),
+            on_hit: Arc::new(on_hit),
+            on_error: Box::new(|p, e| eprintln!("WALK ERROR {}: {}", p.display(), e)),
+        }
+    }
+}
+
+/// Walk the filesystem live, applying `predicate` to each entry and
+/// routing matches to `on_hit`. The underlying machinery is `run_scan`;
+/// the predicate runs in-worker so non-matching entries never cross the
+/// callback boundary.
+pub fn run_search(cfg: SearchConfig) -> ScanResult {
+    let predicate = cfg.predicate;
+    let on_hit = cfg.on_hit;
+    let scan = ScanConfig {
+        roots: cfg.roots,
+        workers: cfg.workers,
+        progress_interval: Duration::from_secs(60),
+        // Metadata is driven by `statx_mask`; the indexer's own
+        // "collect mtime for every file" flag is irrelevant here. We keep
+        // it `true` so the existing `wants_stat` path pulls the metadata
+        // the mask asks for.
+        collect_mtime: true,
+        io_uring: cfg.io_uring,
+        cancel: cfg.cancel,
+        on_progress: Box::new(|_| {}),
+        on_entry: Box::new(move |e| {
+            if predicate(&e) {
+                on_hit(e);
+            }
+        }),
+        on_error: cfg.on_error,
+        skip_dir: Box::new(|_| false),
+        max_depth: cfg.max_depth,
+        symlinks: cfg.symlinks,
+        statx_mask: cfg.statx_mask,
+        visited: if matches!(cfg.symlinks, SymlinkMode::L) {
+            Some(Arc::new(Mutex::new(HashSet::new())))
+        } else {
+            None
+        },
+    };
+    run_scan(scan)
+}
+
 pub fn run_scan(config: ScanConfig) -> ScanResult {
     let wq = Arc::new(WorkQueue::new());
     let counters = Arc::new(Counters::default());
@@ -447,10 +623,19 @@ pub fn run_scan(config: ScanConfig) -> ScanResult {
             continue;
         }
         counters.in_flight.fetch_add(1, Ordering::Release);
-        wq.push(WorkItem { path: root.clone() });
+        wq.push(WorkItem {
+            path: root.clone(),
+            depth: 0,
+        });
     }
 
     let mut handles = Vec::with_capacity(config.workers);
+    let shared = Arc::new(WorkerShared {
+        max_depth: config.max_depth,
+        symlinks: config.symlinks,
+        statx_mask: config.statx_mask,
+        visited: config.visited.clone(),
+    });
     for _ in 0..config.workers {
         let wq = Arc::clone(&wq);
         let counters = Arc::clone(&counters);
@@ -458,6 +643,7 @@ pub fn run_scan(config: ScanConfig) -> ScanResult {
         let on_error = Arc::clone(&on_error);
         let skip_dir = Arc::clone(&skip_dir);
         let cancel = Arc::clone(&config.cancel);
+        let shared = Arc::clone(&shared);
         let (collect_mtime, io_uring) = (config.collect_mtime, config.io_uring);
 
         handles.push(thread::spawn(move || {
@@ -478,6 +664,7 @@ pub fn run_scan(config: ScanConfig) -> ScanResult {
                     &cancel,
                     collect_mtime,
                     ring,
+                    &shared,
                 );
             }));
             if result.is_err() {
@@ -601,6 +788,17 @@ fn finish_item(wq: &WorkQueue, counters: &Counters) {
     }
 }
 
+/// Immutable configuration shared with every worker thread. Split out of
+/// `ScanConfig` because the `on_*` closures need `Arc` wrapping but these
+/// knobs are plain data; one `Arc` for the whole bundle keeps the worker
+/// signature readable.
+struct WorkerShared {
+    max_depth: Option<u32>,
+    symlinks: SymlinkMode,
+    statx_mask: u32,
+    visited: Option<VisitedSet>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn worker_loop(
     wq: Arc<WorkQueue>,
@@ -611,6 +809,7 @@ fn worker_loop(
     cancel: &AtomicBool,
     collect_mtime: bool,
     mut ring: Option<io_uring::IoUring>,
+    shared: &WorkerShared,
 ) {
     const BUF_SIZE: usize = 65536;
     let mut buf = vec![0u8; BUF_SIZE];
@@ -632,6 +831,7 @@ fn worker_loop(
         }
 
         let dir_path = item.path;
+        let item_depth = item.depth;
         let dir_fd = open_dir_fd(&dir_path);
         if dir_fd < 0 {
             let err = std::io::Error::last_os_error();
@@ -686,18 +886,51 @@ fn worker_loop(
                 }
             }
 
-            // statx when we want mtimes, or when getdents didn't say
-            // whether the entry is a directory (DT_UNKNOWN on some network
-            // and FUSE filesystems) — otherwise those would never be scanned.
+            // statx when we need the metadata the caller asked for
+            // (mtime/size/atime/ctime), or when getdents didn't say whether
+            // the entry is a directory (DT_UNKNOWN on some network and
+            // FUSE filesystems) — otherwise those would never be scanned.
+            // In `-L` mode we always statx so we can check the (dev, ino)
+            // of the resolved target for the visited set.
+            let follow_descent = matches!(shared.symlinks, SymlinkMode::L);
+            let want_meta =
+                collect_mtime || (shared.statx_mask & !STATX_TYPE) != 0 || follow_descent;
             let wants_stat = |d_type: u8| {
-                d_type == DT_UNKNOWN || (collect_mtime && (d_type == DT_REG || d_type == DT_DIR))
+                d_type == DT_UNKNOWN
+                    || (want_meta && (d_type == DT_REG || d_type == DT_DIR))
+                    || (follow_descent && d_type == DT_LNK)
+            };
+            // `-L` resolves the symlink target; every other mode holds the
+            // nofollow invariant used throughout the indexer.
+            let statx_flags = if follow_descent {
+                0
+            } else {
+                AT_SYMLINK_NOFOLLOW
             };
             let to_stat: Vec<&CStr> = batch
                 .iter()
                 .filter(|(_, t)| wants_stat(*t))
                 .map(|(n, _)| n.as_c_str())
                 .collect();
-            let mut stats = statx_batch(&mut ring, dir_fd, &to_stat).into_iter();
+            let mut stats = statx_batch(
+                &mut ring,
+                dir_fd,
+                &to_stat,
+                shared.statx_mask,
+                statx_flags,
+            )
+            .into_iter();
+
+            let child_depth = item_depth + 1;
+            // find(1) semantics for `--max-depth N`:
+            //   emit when child_depth <= N (child is at or above the cap)
+            //   push when child_depth < N  (do not descend past the cap)
+            // None = unbounded on both.
+            let emit_allowed = shared.max_depth.is_none_or(|m| child_depth <= m);
+            let push_allowed = shared.max_depth.is_none_or(|m| child_depth < m);
+            if !emit_allowed {
+                continue;
+            }
 
             for (name, d_type) in &batch {
                 let st = if wants_stat(*d_type) {
@@ -705,32 +938,60 @@ fn worker_loop(
                 } else {
                     None
                 };
-                let is_dir =
-                    *d_type == DT_DIR || (*d_type == DT_UNKNOWN && st.is_some_and(|s| s.is_dir));
+                // `is_dir` after symlink resolution in `-L` mode (statx
+                // without NOFOLLOW); otherwise it's the dirent's own type.
+                let is_dir = match (follow_descent, *d_type, st) {
+                    (true, _, Some(s)) => s.is_dir,
+                    (_, DT_DIR, _) => true,
+                    (_, DT_UNKNOWN, Some(s)) => s.is_dir,
+                    _ => false,
+                };
+                let is_symlink = *d_type == DT_LNK
+                    || (*d_type == DT_UNKNOWN && st.is_some_and(|s| s.is_symlink));
                 // Keep the raw bytes: a lossy name could not be reopened.
                 let child_path = dir_path.join(std::ffi::OsStr::from_bytes(name.to_bytes()));
                 if is_dir && skip_dir(&child_path) {
                     continue;
                 }
-                let (mtime_sec, mtime_nsec, size) = match st {
+                let (mtime_sec, mtime_nsec, size, atime_sec, ctime_sec) = match st {
                     // Directory sizes are derived from their files at query time.
-                    Some(s) if collect_mtime => {
-                        (s.mtime_sec, s.mtime_nsec, if is_dir { 0 } else { s.size })
-                    }
-                    _ => (0, 0, 0),
+                    Some(s) => (
+                        s.mtime_sec,
+                        s.mtime_nsec,
+                        if is_dir { 0 } else { s.size },
+                        s.atime_sec,
+                        s.ctime_sec,
+                    ),
+                    None => (0, 0, 0, 0, 0),
                 };
                 on_entry(EntryInfo {
                     path: child_path.clone(),
                     is_dir,
+                    is_symlink,
                     mtime_sec,
                     mtime_nsec,
+                    atime_sec,
+                    ctime_sec,
                     size,
+                    depth: child_depth,
                 });
                 local_count += 1;
 
-                if is_dir {
+                if is_dir && push_allowed {
+                    // `-L`: break cycles via (dev, ino) visited set.
+                    if follow_descent {
+                        if let (Some(set), Some(s)) = (&shared.visited, st) {
+                            let mut g = set.lock().unwrap();
+                            if !g.insert((s.dev, s.ino)) {
+                                continue;
+                            }
+                        }
+                    }
                     counters.in_flight.fetch_add(1, Ordering::Release);
-                    wq.push(WorkItem { path: child_path });
+                    wq.push(WorkItem {
+                        path: child_path,
+                        depth: child_depth,
+                    });
                 }
             }
         }
@@ -741,5 +1002,217 @@ fn worker_loop(
             .fetch_add(local_count, Ordering::Relaxed);
         counters.dirs_completed.fetch_add(1, Ordering::Relaxed);
         finish_item(&wq, &counters);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::os::unix::fs::symlink;
+    use std::path::Path;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    /// Build a temp tree:
+    ///   root/
+    ///     a.txt
+    ///     sub/
+    ///       b.txt
+    ///       deep/c.txt
+    ///     link_rel -> sub           (symlink to directory)
+    ///     link_dangling -> nope     (dangling symlink)
+    fn fixture() -> TempDir {
+        let d = TempDir::new().unwrap();
+        let r = d.path();
+        std::fs::write(r.join("a.txt"), b"a").unwrap();
+        std::fs::create_dir(r.join("sub")).unwrap();
+        std::fs::write(r.join("sub/b.txt"), b"b").unwrap();
+        std::fs::create_dir(r.join("sub/deep")).unwrap();
+        std::fs::write(r.join("sub/deep/c.txt"), b"c").unwrap();
+        symlink("sub", r.join("link_rel")).unwrap();
+        symlink("nope", r.join("link_dangling")).unwrap();
+        d
+    }
+
+    fn collect(cfg: SearchConfig) -> (Vec<EntryInfo>, ScanResult) {
+        let hits: Arc<Mutex<Vec<EntryInfo>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let h = Arc::clone(&hits);
+            move |e: EntryInfo| h.lock().unwrap().push(e)
+        };
+        let on_hit: HitFn = Arc::new(sink);
+        let cfg = SearchConfig { on_hit, ..cfg };
+        let r = run_search(cfg);
+        let v = std::mem::take(&mut *hits.lock().unwrap());
+        (v, r)
+    }
+
+    fn names(entries: &[EntryInfo]) -> HashSet<String> {
+        entries
+            .iter()
+            .map(|e| {
+                e.path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    fn under(root: &Path, matcher: impl Fn(&EntryInfo) -> bool + Send + Sync + 'static) -> SearchConfig {
+        SearchConfig::new(vec![root.to_path_buf()], matcher, |_| {})
+            // Deterministic worker count for test stability.
+            .with_workers_opt(2)
+    }
+
+    impl SearchConfig {
+        fn with_workers_opt(mut self, n: usize) -> Self {
+            self.workers = n.max(1);
+            self
+        }
+    }
+
+    #[test]
+    fn walks_regular_tree_and_matches_all() {
+        let d = fixture();
+        let (hits, r) = collect(under(d.path(), |_| true));
+        let n = names(&hits);
+        assert!(n.contains("a.txt"));
+        assert!(n.contains("sub"));
+        assert!(n.contains("b.txt"));
+        assert!(n.contains("deep"));
+        assert!(n.contains("c.txt"));
+        assert!(!r.cancelled);
+    }
+
+    #[test]
+    fn max_depth_zero_emits_nothing() {
+        let d = fixture();
+        // find(1): maxdepth 0 = roots only, and the scanner does not
+        // emit roots themselves.
+        let (hits, _) = collect(SearchConfig {
+            max_depth: Some(0),
+            ..under(d.path(), |_| true)
+        });
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn max_depth_one_emits_direct_children_only() {
+        let d = fixture();
+        let (hits, _) = collect(SearchConfig {
+            max_depth: Some(1),
+            ..under(d.path(), |_| true)
+        });
+        let n = names(&hits);
+        assert!(n.contains("a.txt"));
+        assert!(n.contains("sub"));
+        // sub's own children must not be emitted.
+        assert!(!n.contains("b.txt"));
+    }
+
+    #[test]
+    fn max_depth_two_descends_one_level_into_each_root_child() {
+        let d = fixture();
+        let (hits, _) = collect(SearchConfig {
+            max_depth: Some(2),
+            ..under(d.path(), |_| true)
+        });
+        let n = names(&hits);
+        assert!(n.contains("b.txt")); // depth 2
+        assert!(n.contains("deep")); // depth 2
+        // deep's contents sit at depth 3; still past the cap.
+        assert!(!n.contains("c.txt"));
+    }
+
+    #[test]
+    fn symlinks_detected_but_not_followed_in_mode_p() {
+        let d = fixture();
+        let (hits, _) = collect(under(d.path(), |_| true));
+        let link = hits
+            .iter()
+            .find(|e| e.path.file_name().unwrap() == "link_rel")
+            .expect("symlink entry present");
+        assert!(link.is_symlink);
+        assert!(!link.is_dir);
+        // Default `-P`: no second traversal of `sub` via the symlink.
+        let b_hits = hits
+            .iter()
+            .filter(|e| e.path.file_name().unwrap() == "b.txt")
+            .count();
+        assert_eq!(b_hits, 1);
+    }
+
+    #[test]
+    fn mode_l_follows_symlinked_dirs_without_cycling() {
+        let d = fixture();
+        // Add a self-cycle: sub/cycle -> ..
+        symlink("..", d.path().join("sub/cycle")).unwrap();
+        let (hits, _) = collect(SearchConfig {
+            symlinks: SymlinkMode::L,
+            ..under(d.path(), |_| true)
+        });
+        let n = names(&hits);
+        // `-L` resolves `link_rel` to `sub`, so we should hit `b.txt`
+        // through both routes without the cycle looping forever.
+        assert!(n.contains("b.txt"));
+        // (dev, ino) visited set must dedupe the sub directory itself.
+        let sub_dirs: Vec<_> = hits
+            .iter()
+            .filter(|e| e.is_dir && e.path.file_name().unwrap() == "sub")
+            .collect();
+        // One real sub + up to one followed symlink; critically, finite.
+        assert!(sub_dirs.len() <= 2);
+    }
+
+    #[test]
+    fn depth_field_tracks_distance_from_root() {
+        let d = fixture();
+        let (hits, _) = collect(under(d.path(), |_| true));
+        let a = hits.iter().find(|e| e.path.file_name().unwrap() == "a.txt").unwrap();
+        let b = hits.iter().find(|e| e.path.file_name().unwrap() == "b.txt").unwrap();
+        let c = hits.iter().find(|e| e.path.file_name().unwrap() == "c.txt").unwrap();
+        assert_eq!(a.depth, 1);
+        assert_eq!(b.depth, 2);
+        assert_eq!(c.depth, 3);
+    }
+
+    #[test]
+    fn predicate_filters_before_sink_sees_the_entry() {
+        let d = fixture();
+        let (hits, _) = collect(under(d.path(), |e| {
+            e.path
+                .file_name()
+                .is_some_and(|s| s.to_string_lossy().ends_with(".txt"))
+        }));
+        let n = names(&hits);
+        assert!(n.contains("a.txt"));
+        assert!(n.contains("b.txt"));
+        assert!(n.contains("c.txt"));
+        // Directories must have been filtered out.
+        assert!(!n.contains("sub"));
+        assert!(!n.contains("deep"));
+    }
+
+    #[test]
+    fn cancel_stops_further_hits_quickly() {
+        let d = fixture();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let s = Arc::clone(&seen);
+        let c = Arc::clone(&cancel);
+        let predicate = move |_: &EntryInfo| {
+            s.fetch_add(1, Ordering::Relaxed);
+            c.store(true, Ordering::Relaxed);
+            true
+        };
+        let cfg = SearchConfig {
+            cancel: Arc::clone(&cancel),
+            ..SearchConfig::new(vec![d.path().to_path_buf()], predicate, |_| {})
+                .with_workers_opt(1)
+        };
+        let (_hits, r) = collect(cfg);
+        assert!(r.cancelled);
     }
 }

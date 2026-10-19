@@ -281,7 +281,14 @@ sudo ./scripts/install.sh
 
 ## 🔍 Usage
 
-Searching needs root (`sudo`): the index lists every file on the system.
+Index searches need root (`sudo`): the index lists every file on the
+system. When the index is not reachable — the caller is not root, the
+daemon is not running, or the filter asks for information the index does
+not store (atime, ctime, symlink type) — `rfind` falls back to a live
+parallel walk that needs no privileges. The walk never opens the index,
+and the mode is picked automatically; pass `--live` (or `--no-index`) to
+force it. See [Walk mode](#walk-mode) below.
+
 Every command has `--help`, and `man rfind` documents all of them.
 
 ### Search commands
@@ -320,6 +327,23 @@ rfind --largest --under /var --top 10   # biggest files in a tree
 # All of the above compose freely:
 rfind "*.log" --under /var --recent --hours 6 --larger-than 100K --top 5
 ```
+
+### `find`-style predicates (daviddl9 syntax)
+
+The usual CLI accepts the same `+N`/`-N` prefix syntax `find(1)` uses, so
+scripts that already target `daviddl9/rfind` run unmodified:
+
+```bash
+rfind "*.log" --mtime +7d --size +100M --print0 | xargs -0 ls -lh
+rfind "*.py"  --mtime -1h                             # changed in the last hour
+rfind "core.*" --size -1k --top 20                    # tiny core files
+rfind "*.conf" --under /etc --ctime -1d               # metadata changed today
+```
+
+Both syntaxes are accepted everywhere, and overlapping ones (`--larger-than`
+with `--size`, `--hours` with `--mtime`, etc.) are AND-ed by intersection;
+a contradictory combination (e.g. `--larger-than 10M --size -1M`) is
+reported as a clean error rather than silently returning nothing.
 
 ### Disk usage — from the index, no disk walk
 
@@ -381,6 +405,45 @@ rfind reload                         # re-read the config (SIGHUP)
 rfind uninstall [--purge]            # remove everything (--purge: index + config too)
 ```
 
+### <a name="walk-mode"></a>Walk mode (live, non-root)
+
+`rfind` falls back to a live parallel walk when the index isn't the right
+answer:
+
+- Caller isn't root (walk silently).
+- Daemon isn't running or the DB file is missing (one-line stderr warning).
+- Filter needs data the index doesn't store: `--atime`, `--ctime`,
+  `--type l`, `--type any`, or `-L`/`-H` symlink following.
+- `--live` (alias `--no-index`) is passed explicitly.
+
+The walk uses the same parallel scanner the daemon uses to build the
+index (getdents64 + statx batched through io_uring where available), so
+it's competitive with `find(1)` on cold caches and faster on repeated
+runs.
+
+```bash
+# Non-root user, no daemon required:
+rfind "*.log" --live --mtime +7d --size +100M --print0 | xargs -0 ls -lh
+
+# Follow all symlinks (visited-set breaks cycles automatically):
+rfind -L "*.conf" --under /etc
+
+# Depth-limited:
+rfind --live --under ~/src -m 2 --type d        # project dirs, two deep
+
+# Walk symlink listing (index can't do this):
+rfind --live --type l --under ~/.local
+```
+
+Make the choice sticky across invocations via `/etc/rfindd/config.toml`:
+
+```toml
+[search]
+mode = "auto"       # or "index" (never walk) or "walk" (never query DB)
+io_uring = true
+threads = 0         # 0 = cores × 2
+```
+
 ### Shell completions
 
 Installed for bash, zsh and fish by the installer; for other shells:
@@ -419,6 +482,11 @@ compress = true                # zstd-compressed pages (~3× smaller); changing 
 prefer_fanotify = true         # one mark per filesystem (kernel 5.9+, root)
 inotify_fallback = true        # per-directory watches if fanotify is unavailable
 watch_new_mounts = true        # index filesystems mounted under a live root later
+
+[search]
+mode = "auto"                  # auto | index (never walk) | walk (never query DB)
+io_uring = true                # io_uring for walk-mode statx batching
+threads = 0                    # 0 = cores × 2 for walk mode
 ```
 
 ### Periodic roots (WSL2 Windows drives, network mounts)

@@ -1,9 +1,10 @@
-.TH RFIND 1 "2026-10-14" "rfind 1.0.1" "User Commands"
+.TH RFIND 1 "2026-10-20" "rfind 1.1.0" "User Commands"
 .SH NAME
-rfind \- search the filesystem instantly using the rfindd index
+rfind \- search the filesystem instantly using the rfindd index, or live
 .SH SYNOPSIS
 .B rfind
 .RB [ \-\-json ]
+.RB [ \-\-live | \-\-no\-index ]
 .RI [ PATTERN ]
 .RB [ \-\-regex | \-\-path ]
 .RB [ \-\-under
@@ -18,7 +19,15 @@ rfind \- search the filesystem instantly using the rfindd index
 .I DATE
 .B \-\-to
 .IR DATE ]
+.RB [ \-\-mtime | \-\-atime | \-\-ctime
+.IR SPEC ]
 .RI [ FILTERS ]
+.RB [ \-\-print0 ]
+.RB [ \-P | \-H | \-L ]
+.RB [ \-m
+.IR N ]
+.RB [ \-j
+.IR N ]
 .br
 .B rfind
 .RB [ \-\-json ]
@@ -53,9 +62,51 @@ as a fallback), so new, renamed and deleted files are reflected within
 seconds.
 .PP
 The index lists every file name on the system, so it is readable by root only:
-searches must be run with
+index searches must be run with
 .BR sudo (8).
+When
+.B rfind
+cannot use the index \(em the caller is not root, the daemon is not running,
+the index DB is missing, or the query asks for information the index does not
+store (symbolic\-link type, atime, ctime) \(em it falls back to a parallel
+walk of the live filesystem. The walk never opens the index. See
+.B WALK MODE
+below.
 Searching never modifies the index.
+.SH WALK MODE
+Walk mode is a live parallel filesystem walk (getdents64 + statx, batched
+through io_uring when available). It needs no daemon and no privileges
+beyond read access to the directories it visits.
+.PP
+Walk mode is used when any of the following is true:
+.IP \(bu 2
+.B \-\-live
+(or its alias
+.BR \-\-no\-index )
+is given on the command line.
+.IP \(bu 2
+The query uses a filter that the index does not store:
+.BR \-\-atime ,
+.BR \-\-ctime ,
+.B \-\-type l
+or
+.BR "\-\-type any" ,
+or a symbolic\-link mode other than
+.BR \-P .
+.IP \(bu 2
+The caller is not root. (As root, the index is preferred when it is ready;
+without root, walk mode is used silently.)
+.IP \(bu 2
+The configured mode in
+.I /etc/rfindd/config.toml
+.RB ( [search] " " "mode = \(dqwalk\(dq" )
+is set to always walk; conversely
+.B mode = \(dqindex\(dq
+forces index mode and errors when it cannot be used.
+.PP
+Walk mode is also what makes daviddl9\-style one\-liners (such as
+.B rfind '*.log' \-\-mtime +7d \-\-size +100M \-\-print0
+run as a non\-root user) work in the same binary.
 .SH SEARCH
 .B rfind
 takes an optional pattern plus any mix of selection, scope, sort and
@@ -110,6 +161,42 @@ minutes/hours/days.
 .B \-\-to
 .I YYYY-MM-DD
 Date range in local time, inclusive.
+.TP
+.BI \-\-mtime " SPEC"
+mtime predicate in
+.BR find (1)
+form:
+.B +N
+= strictly older than
+.IR N ,
+.B -N
+= strictly newer than
+.IR N ,
+bare
+.I N
+= exactly
+.I N
+ago (\(+-1 s window).
+.I N
+has a unit:
+.B s
+seconds,
+.B m
+minutes,
+.B h
+hours,
+.B d
+days. Combines with
+.BR \-\-minutes / \-\-hours / \-\-days / \-\-from / \-\-to
+by intersection (both bounds must hold); a contradictory combination is
+reported as an error.
+.TP
+.BI \-\-atime " SPEC"
+.TQ
+.BI \-\-ctime " SPEC"
+Same grammar as
+.BR \-\-mtime .
+The index does not store atime or ctime, so these filters force walk mode.
 .PP
 Legacy subcommands
 .RB ( "rfind name" " PATTERN,"
@@ -133,8 +220,12 @@ is an alias.
 Sizes are apparent sizes (file length), not allocated blocks.
 .SS Filters
 .TP
-.BR \-\-type " " f | d
-Only files or only directories.
+.BR \-\-type " " f | d | l | any
+Only files, directories, symlinks or anything.
+.B l
+and
+.B any
+force walk mode (the index does not currently flag symlinks).
 .TP
 .BI \-\-larger\-than " SIZE"
 Only files of at least
@@ -144,24 +235,93 @@ Only files of at least
 Only files of at most
 .IR SIZE .
 .TP
+.BI \-\-size " SPEC"
+Size predicate in
+.BR find (1)
+form:
+.B +SIZE
+= at least
+.IR SIZE ,
+.B \-SIZE
+= at most
+.IR SIZE ,
+bare
+.I SIZE
+= exactly
+.IR SIZE .
+Also accepts daviddl9's byte suffix
+.B c
+(1 byte, e.g.
+.BR 1024c ).
+Combined with
+.BR \-\-larger\-than / \-\-smaller\-than
+by intersection; contradictory combinations are reported as an error.
+.TP
 .BR \-l ", " \-\-long
 Print size and modification time before each path.
 .PP
 .I SIZE
-is a number of bytes with an optional binary suffix:
-.BR K ,
-.BR M ,
-.B G
-or
-.B T
-(powers of 1024), e.g.
+is a number of bytes with an optional unit:
+.B c
+(byte),
+.BR k ,
+.BR m ,
+.BR g ,
+.B t
+(powers of 1024, case\-insensitive), e.g.
 .BR 500K ,
-.BR 1.5G .
+.BR 1.5G ,
+.BR 1024c .
 A trailing
 .B B
 or
 .B iB
-is accepted.
+is accepted (so
+.BR 10MB ,
+.B 10MiB
+and
+.B 10M
+all mean the same).
+.SS Walk\-mode options
+.TP
+.BR \-\-live ", " \-\-no\-index
+Walk the live filesystem instead of consulting the index. Does not require
+root. The walk starts at
+.I DIR
+when
+.B \-\-under
+is given, otherwise at the current working directory.
+.TP
+.B \-\-print0
+Terminate each result with a NUL (\(dq\\0\(dq) instead of a newline, for
+.B xargs \-0
+and
+.BR "jq \-0" .
+Works in both modes.
+.TP
+.BR \-m ", " \-\-max\-depth " " N
+Walk at most
+.I N
+directory levels past the roots. The scan root is depth 0;
+.B \-m 1
+yields its direct children only.
+.TP
+.BR \-j ", " \-\-threads " " N
+Walk\-mode worker threads. 0 = cores\ \(mu\ 2 (I/O\-bound default).
+.TP
+.BR \-P ", " \-H ", " \-L
+How walk mode treats symbolic links:
+.B \-P
+never follows them (the indexer's behaviour and the default);
+.B \-H
+follows symlinks given as scan roots only;
+.B \-L
+follows all symlinks \(em a per\-inode visited set based on
+.B (dev,\ ino)
+breaks cycles so a bind\-mount or self\-pointing link cannot loop forever.
+Only one of
+.BR \-P / \-H / \-L
+may be given.
 .SH DAEMON COMMANDS
 .TP
 .B status
@@ -317,6 +477,8 @@ by size for
 The result count goes to standard error, so output can be piped.
 Paths containing newlines are printed as-is; use
 .B \-\-json
+or
+.B \-\-print0
 for unambiguous parsing.
 .SH EXIT STATUS
 .TP
@@ -387,11 +549,27 @@ The ten biggest files under /var.
 .B sudo rfind '*.log' \-\-json | jq \-r 'select(.size > 1e8) | .path'
 Logs over 100 MB, via jq.
 .TP
+.B rfind '*.log' \-\-mtime +7d \-\-size +100M \-\-print0
+Walk mode (no root required): large week\-old logs, NUL\-terminated for
+.BR "xargs \-0" .
+.TP
+.B rfind \-\-live \-\-type l \-\-under ~/projects
+Every symbolic link in a project tree.
+.TP
+.B rfind \-L '*.conf' \-\-under /etc \-m 3
+Walk /etc following every symlink, three levels deep.
+.TP
+.B rfind \-\-live \-\-ctime \-1h \-\-under /var/log
+Files whose metadata changed in the last hour (atime/ctime are walk\-only).
+.TP
 .B sudo rfind config exclude add /home/moshe
 Stop indexing a directory; its entries are removed right away.
 .TP
 .B sudo rfind config periodic add /mnt/nas \-\-every 24
 Index a network share once a day.
+.TP
+.B sudo rfind config set search.mode walk
+Always walk, even as root (useful on hosts that choose not to run rfindd).
 .SH SEE ALSO
 .BR rfindd (8),
 .BR rfind.conf (5),
