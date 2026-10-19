@@ -319,6 +319,12 @@ impl Store {
 
     /// Read page `pgno` (1-based) into `buf` (page_size bytes). Returns
     /// false if the page doesn't exist (buf zeroed).
+    ///
+    /// Verifies the stored CRC and the record header on every read.
+    /// Replaying the log at startup already CRC-checks each record, but
+    /// steady-state reads originally trusted the index — defense-in-depth
+    /// against on-disk corruption or an attacker with a write primitive on
+    /// `<db>-zdata.<gen>`. The CRC cost is noise next to zstd decompress.
     pub fn read_page(&mut self, pgno: u32, buf: &mut [u8]) -> io::Result<bool> {
         let loc = self.map.get(pgno as usize - 1).copied().unwrap_or_default();
         let (Some(f), true) = (&self.data, loc.clen > 0) else {
@@ -327,6 +333,28 @@ impl Store {
         };
         self.scratch.resize(REC_HDR + loc.clen as usize, 0);
         f.read_exact_at(&mut self.scratch, loc.off)?;
+        let field = |i: usize| {
+            u32::from_le_bytes(self.scratch[i * 4..i * 4 + 4].try_into().unwrap())
+        };
+        let (magic, hdr_pgno, hdr_clen, hdr_rawlen, hdr_crc) =
+            (field(0), field(1), field(2), field(3), field(4));
+        if magic != REC_MAGIC
+            || hdr_pgno != pgno
+            || hdr_clen != loc.clen
+            || hdr_rawlen as usize != buf.len()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "zvfs: record header mismatch",
+            ));
+        }
+        let payload = &self.scratch[REC_HDR..];
+        if crc(hdr_pgno, hdr_rawlen, payload) != hdr_crc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "zvfs: page CRC mismatch",
+            ));
+        }
         if self.dctx.is_none() {
             self.dctx = Some(zstd::bulk::Decompressor::new()?);
         }
@@ -334,7 +362,7 @@ impl Store {
             .dctx
             .as_mut()
             .unwrap()
-            .decompress_to_buffer(&self.scratch[REC_HDR..], buf)?;
+            .decompress_to_buffer(payload, buf)?;
         if n != buf.len() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "short page"));
         }
@@ -649,5 +677,43 @@ mod tests {
         w.truncate(4 * 1024).unwrap();
         w.sync().unwrap(); // publishes a snapshot: replay must not resurrect pages
         assert_eq!(Store::open(&base, true).unwrap().size(), 4 * 1024);
+    }
+
+    #[test]
+    fn read_page_rejects_corrupted_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("db");
+        let mut w = Store::open(&base, false).unwrap();
+        w.write_page(1, &page(1, 4096)).unwrap();
+        w.write_page(2, &page(2, 4096)).unwrap();
+        w.sync().unwrap();
+        // Publish a snapshot so that the next reopen does not rebuild the
+        // page map by replaying the log (which already CRC-checks each
+        // record). We want the CRC check inside `read_page` to be what
+        // catches the corruption.
+        w.write_snapshot().unwrap();
+        drop(w);
+
+        // Flip one byte of record 1's compressed payload (just past the
+        // 20-byte header). The CRC stored in the header still describes
+        // the original payload, so `read_page` must notice.
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(data_path(&base, 0))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        f.read_exact_at(&mut byte, (REC_HDR as u64) + 1).unwrap();
+        byte[0] ^= 0xff;
+        f.write_all_at(&byte, (REC_HDR as u64) + 1).unwrap();
+        drop(f);
+
+        let mut r = Store::open(&base, true).unwrap();
+        let mut buf = vec![0u8; 4096];
+        let err = r.read_page(1, &mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // Page 2 is still intact.
+        assert!(r.read_page(2, &mut buf).unwrap());
+        assert_eq!(buf, page(2, 4096));
     }
 }

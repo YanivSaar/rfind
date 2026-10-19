@@ -106,9 +106,36 @@ download() {
     curl -fsSL "$base/$asset" -o "$WORK/$asset" 2>/dev/null || return 1
     curl -fsSL "$base/$asset.sha256" -o "$WORK/$asset.sha256" 2>/dev/null || return 1
     (cd "$WORK" && sha256sum -c --quiet "$asset.sha256") || die "checksum mismatch for $asset"
+
+    # Sigstore (cosign) verification: tarballs tagged v* carry .sig + .pem
+    # issued by the Release workflow via GitHub OIDC. The sha256 above only
+    # proves the two files were fetched together; cosign proves the tarball
+    # was built by *our* workflow on *our* repo. Use it when available.
+    local verified_by="sha256"
+    if command -v cosign >/dev/null 2>&1; then
+        if curl -fsSL "$base/$asset.sig" -o "$WORK/$asset.sig" 2>/dev/null \
+           && curl -fsSL "$base/$asset.pem" -o "$WORK/$asset.pem" 2>/dev/null; then
+            if cosign verify-blob \
+                --certificate "$WORK/$asset.pem" \
+                --signature "$WORK/$asset.sig" \
+                --certificate-identity-regexp \
+                    "^https://github.com/$GITHUB/.github/workflows/release.yml@refs/tags/" \
+                --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+                "$WORK/$asset" >/dev/null 2>&1; then
+                verified_by="cosign + sha256"
+            else
+                die "cosign signature check failed for $asset"
+            fi
+        else
+            warn "cosign installed but no signature published for this release"
+        fi
+    else
+        warn "cosign not installed; falling back to sha256 only (install cosign for provenance)"
+    fi
+
     tar xzf "$WORK/$asset" -C "$WORK"
     PKG=$WORK/rfind-$arch-linux
-    ok "verified $asset"
+    ok "verified $asset ($verified_by)"
 }
 
 build_from_source() {

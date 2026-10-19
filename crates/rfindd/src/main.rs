@@ -78,11 +78,35 @@ fn lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// Config path: `RFIND_CONFIG` overrides the default (rfind honors it too).
+/// Config path: `RFIND_CONFIG` overrides the default.
+///
+/// The daemon runs as root, so whoever can set its environment can also
+/// swap its config. `systemctl edit` and malicious unit drop-ins both do
+/// this. Restrict the override to absolute paths under `/etc/rfindd/`:
+/// the config dir is already 0640 and only root-writable, so anything an
+/// attacker places there needs root first. Anything else logs a warning
+/// and falls back to the default. The CLI (`rfind-cli`) stays permissive
+/// — it runs as the user and reads a config they already own.
 fn config_path() -> PathBuf {
-    std::env::var_os("RFIND_CONFIG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH))
+    let default = PathBuf::from(DEFAULT_CONFIG_PATH);
+    let Some(v) = std::env::var_os("RFIND_CONFIG") else {
+        return default;
+    };
+    let p = PathBuf::from(&v);
+    let ok = p.is_absolute()
+        && p.starts_with("/etc/rfindd/")
+        // reject traversal: /etc/rfindd/../foo would still start_with the dir
+        && !p.components().any(|c| matches!(c, std::path::Component::ParentDir));
+    if ok {
+        p
+    } else {
+        warn!(
+            "RFIND_CONFIG={} rejected: must be an absolute path under /etc/rfindd/; using {}",
+            p.display(),
+            default.display()
+        );
+        default
+    }
 }
 
 /// Warn about Windows drives (WSL2 drvfs) that would be monitored live:
@@ -120,6 +144,96 @@ fn restrict_index_permissions(db_file: &Path) {
         p.push(suffix);
         let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o600));
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode(p: &Path) -> u32 {
+        fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn restrict_index_permissions_locks_down_dir_and_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        for suffix in ["", "-wal", "-shm"] {
+            let p = PathBuf::from(format!("{}{}", db.display(), suffix));
+            fs::write(&p, b"x").unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+
+        restrict_index_permissions(&db);
+
+        assert_eq!(mode(dir.path()), 0o700, "parent dir");
+        for suffix in ["", "-wal", "-shm"] {
+            let p = PathBuf::from(format!("{}{}", db.display(), suffix));
+            assert_eq!(mode(&p), 0o600, "{}", p.display());
+        }
+
+        // Idempotent: a second call must not widen or error on already-tight modes.
+        restrict_index_permissions(&db);
+        assert_eq!(mode(dir.path()), 0o700);
+        for suffix in ["", "-wal", "-shm"] {
+            let p = PathBuf::from(format!("{}{}", db.display(), suffix));
+            assert_eq!(mode(&p), 0o600);
+        }
+    }
+
+    #[test]
+    fn restrict_index_permissions_tolerates_missing_wal_shm() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        fs::write(&db, b"x").unwrap();
+        fs::set_permissions(&db, fs::Permissions::from_mode(0o644)).unwrap();
+        // No -wal, no -shm. Must still tighten what exists.
+        restrict_index_permissions(&db);
+        assert_eq!(mode(dir.path()), 0o700);
+        assert_eq!(mode(&db), 0o600);
+    }
+
+    #[test]
+    fn config_path_rejects_paths_outside_etc_rfindd() {
+        // SAFETY: single-threaded test; cargo test runs module tests sequentially
+        // within a `mod tests` unless `test-threads` is overridden. The two config
+        // tests touch the same env var and must not run concurrently; we serialise
+        // via a mutex to make that explicit.
+        let _g = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var_os("RFIND_CONFIG");
+
+        unsafe { std::env::set_var("RFIND_CONFIG", "/tmp/evil.toml") };
+        assert_eq!(config_path(), PathBuf::from(DEFAULT_CONFIG_PATH));
+
+        unsafe { std::env::set_var("RFIND_CONFIG", "/etc/rfindd/../tmp/evil.toml") };
+        assert_eq!(config_path(), PathBuf::from(DEFAULT_CONFIG_PATH));
+
+        unsafe { std::env::set_var("RFIND_CONFIG", "relative.toml") };
+        assert_eq!(config_path(), PathBuf::from(DEFAULT_CONFIG_PATH));
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("RFIND_CONFIG", v) },
+            None => unsafe { std::env::remove_var("RFIND_CONFIG") },
+        }
+    }
+
+    #[test]
+    fn config_path_accepts_paths_under_etc_rfindd() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var_os("RFIND_CONFIG");
+
+        unsafe { std::env::set_var("RFIND_CONFIG", "/etc/rfindd/alt.toml") };
+        assert_eq!(config_path(), PathBuf::from("/etc/rfindd/alt.toml"));
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("RFIND_CONFIG", v) },
+            None => unsafe { std::env::remove_var("RFIND_CONFIG") },
+        }
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
 
 /// Load the config, write the default on first start, and exclude
@@ -260,6 +374,17 @@ fn on_mount_change(
         .iter()
         .filter(|m| relevant(m) || m.point.is_dir())
     {
+        // Drop the fanotify mark and its cached mount fd before anything
+        // else: otherwise the fd pins the (now-dead) mount and a later
+        // event whose fsid gets reused resolves against the wrong mount.
+        // Call this for every removed mount, including ones under
+        // excludes or periodic roots — the mark was taken when they went
+        // in, so it must go when they leave.
+        if let Some(mon) = monitor {
+            if mon.remove_filesystem(&m.point) {
+                info!("Unmounted {}: dropped fanotify mark", m.point.display());
+            }
+        }
         if !ctx.cfg.scan.roots.iter().any(|r| m.point.starts_with(r))
             || index::is_excluded(&ctx.cfg, &m.point)
             || periodic.iter().any(|p| m.point.starts_with(p))

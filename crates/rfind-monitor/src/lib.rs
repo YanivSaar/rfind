@@ -108,6 +108,20 @@ impl Monitor {
         }
     }
 
+    /// Stop watching the filesystem that was mounted at `point` after it
+    /// disappeared from `/proc/self/mounts`. fanotify drops the mark and
+    /// closes the cached mount fd (otherwise the fd pins the mount and a
+    /// later event with a reused fsid may resolve against the wrong
+    /// mount). inotify has nothing to do: per-directory watches evaporate
+    /// when their directories are destroyed. Returns true if the backend
+    /// had an entry to remove.
+    pub fn remove_filesystem(&self, point: &Path) -> bool {
+        match self {
+            Monitor::Fanotify(m) => m.remove_filesystem(point),
+            Monitor::Inotify(_) => false,
+        }
+    }
+
     /// True (once) if events were lost since the last call: kernel
     /// queue overflow OR the in-process sink filling up (writer thread
     /// fell behind). The index must be rescanned to recover.

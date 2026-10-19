@@ -26,5 +26,53 @@ UMask=0077
 StateDirectory=rfindd
 StateDirectoryMode=0700
 
+# ── Hardening ────────────────────────────────────────────────────────────
+# rfindd must stay root (fanotify filesystem marks need CAP_SYS_ADMIN,
+# open_by_handle_at needs CAP_DAC_READ_SEARCH), but there is no reason to
+# grant any other capability or ambient privilege. See `secondopinion.md`
+# for the review that motivated this unit's hardening.
+
+# Capabilities: only what fanotify + handle resolution require.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
+AmbientCapabilities=
+NoNewPrivileges=yes
+
+# Filesystem: read-only root, writable state dir only. ProtectHome=read-only
+# so indexing /home still works but a compromised daemon cannot write there.
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+
+# Kernel: no module load / sysctl writes / log reads / cgroup edits.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# Namespaces, suid, realtime, personality: deny.
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+# Network: rfindd talks only via files on disk — never opens a socket to
+# anywhere. Keep AF_UNIX available for journal/log sockets.
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+# Syscall surface: standard service baseline, plus the four fanotify /
+# handle-resolution calls (which systemd puts in @privileged and so
+# excludes from @system-service), minus the classes we clearly do not
+# need. CapabilityBoundingSet above still caps what any of these calls
+# can actually accomplish.
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=fanotify_init fanotify_mark name_to_handle_at open_by_handle_at
+SystemCallFilter=~@mount @reboot @swap @module @obsolete
+
 [Install]
 WantedBy=multi-user.target

@@ -1,7 +1,9 @@
 name: Release
 
-# Push a tag like v0.6.0 to build static binaries for x86_64 and aarch64
-# and publish them as a GitHub release. scripts/install.sh downloads these.
+# Push a tag like v0.6.0 to build static binaries for x86_64 and aarch64,
+# sign them keyless with sigstore/cosign (GitHub OIDC), and publish them as
+# a GitHub release. scripts/install.sh prefers the cosign signature when
+# cosign is available, and falls back to the SHA-256 checksum otherwise.
 
 on:
   push:
@@ -10,6 +12,8 @@ on:
 
 permissions:
   contents: write
+  # Required for sigstore keyless signing (cosign sign-blob --yes).
+  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -51,10 +55,27 @@ jobs:
           tar czf $name.tar.gz $name
           sha256sum $name.tar.gz > $name.tar.gz.sha256
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign tarball with cosign (keyless, sigstore)
+        env:
+          COSIGN_YES: "true"
+        run: |
+          name=rfind-${{ matrix.arch }}-linux
+          cosign sign-blob --yes \
+            --output-signature "$name.tar.gz.sig" \
+            --output-certificate "$name.tar.gz.pem" \
+            "$name.tar.gz"
+
       - uses: actions/upload-artifact@v4
         with:
           name: rfind-${{ matrix.arch }}
-          path: rfind-${{ matrix.arch }}-linux.tar.gz*
+          path: |
+            rfind-${{ matrix.arch }}-linux.tar.gz
+            rfind-${{ matrix.arch }}-linux.tar.gz.sha256
+            rfind-${{ matrix.arch }}-linux.tar.gz.sig
+            rfind-${{ matrix.arch }}-linux.tar.gz.pem
 
   release:
     name: Publish release
@@ -69,5 +90,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" rfind-*-linux.tar.gz* \
-            --repo "${{ github.repository }}" --title "${{ github.ref_name }}" --generate-notes
+          gh release create "${{ github.ref_name }}" \
+            rfind-*-linux.tar.gz \
+            rfind-*-linux.tar.gz.sha256 \
+            rfind-*-linux.tar.gz.sig \
+            rfind-*-linux.tar.gz.pem \
+            --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes

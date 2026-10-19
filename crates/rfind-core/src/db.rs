@@ -623,27 +623,38 @@ pub fn rename_entry(conn: &Connection, old: &str, new: &str) -> Result<usize> {
 /// and delete every other dir in one shot. Previously this looped on full
 /// anti-joins, which was quadratic in the number of orphan chains and
 /// ran >100 ms per pass on a 10M-entry index.
+///
+/// A panic here (e.g. a rusqlite bug on an unusual row) must not take the
+/// daemon down: GC is best-effort and the next pass picks up any work this
+/// one dropped. Wrap the body in `catch_unwind` and convert a panic to a
+/// soft error that `with_savepoint` can roll back.
 fn collect_garbage(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "
-        DROP TABLE IF EXISTS _reachable;
-        CREATE TEMP TABLE _reachable (id INTEGER PRIMARY KEY);
-        WITH RECURSIVE anc(id) AS (
-            SELECT DISTINCT dir_id FROM entries
-            UNION
-            SELECT d.parent FROM dirs d JOIN anc ON d.id = anc.id
-                WHERE d.parent IS NOT NULL
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        conn.execute_batch(
+            "
+            DROP TABLE IF EXISTS _reachable;
+            CREATE TEMP TABLE _reachable (id INTEGER PRIMARY KEY);
+            WITH RECURSIVE anc(id) AS (
+                SELECT DISTINCT dir_id FROM entries
+                UNION
+                SELECT d.parent FROM dirs d JOIN anc ON d.id = anc.id
+                    WHERE d.parent IS NOT NULL
+            )
+            INSERT INTO _reachable (id) SELECT id FROM anc;
+            INSERT OR IGNORE INTO _reachable (id) VALUES (1);
+            DELETE FROM dirs WHERE id NOT IN (SELECT id FROM _reachable);
+            DROP TABLE _reachable;
+            DELETE FROM names
+              WHERE id NOT IN (SELECT name_id FROM entries)
+                AND id NOT IN (SELECT name_id FROM dirs WHERE name_id IS NOT NULL);
+            ",
         )
-        INSERT INTO _reachable (id) SELECT id FROM anc;
-        INSERT OR IGNORE INTO _reachable (id) VALUES (1);
-        DELETE FROM dirs WHERE id NOT IN (SELECT id FROM _reachable);
-        DROP TABLE _reachable;
-        DELETE FROM names
-          WHERE id NOT IN (SELECT name_id FROM entries)
-            AND id NOT IN (SELECT name_id FROM dirs WHERE name_id IS NOT NULL);
-        ",
-    )?;
-    Ok(())
+    }));
+    match r {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(rusqlite::Error::ExecuteReturnedResults),
+    }
 }
 
 /// Integer list for an SQL `IN (...)`, from typed ids (injection-safe).

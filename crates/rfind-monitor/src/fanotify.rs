@@ -22,10 +22,10 @@ use libc::{
     c_uint, close, fanotify_event_metadata, fanotify_init, fanotify_mark, fstatfs, open,
     open_by_handle_at, read, FAN_CLASS_NOTIF, FAN_CLOEXEC, FAN_CLOSE_WRITE, FAN_CREATE, FAN_DELETE,
     FAN_EVENT_INFO_TYPE_DFID_NAME, FAN_EVENT_INFO_TYPE_NEW_DFID_NAME,
-    FAN_EVENT_INFO_TYPE_OLD_DFID_NAME, FAN_MARK_ADD, FAN_MARK_FILESYSTEM, FAN_MOVED_FROM,
-    FAN_MOVED_TO, FAN_NONBLOCK, FAN_ONDIR, FAN_Q_OVERFLOW, FAN_RENAME, FAN_REPORT_DFID_NAME,
-    FAN_REPORT_DFID_NAME_TARGET, FAN_REPORT_FID, O_CLOEXEC, O_DIRECTORY, O_LARGEFILE, O_PATH,
-    O_RDONLY,
+    FAN_EVENT_INFO_TYPE_OLD_DFID_NAME, FAN_MARK_ADD, FAN_MARK_FILESYSTEM, FAN_MARK_REMOVE,
+    FAN_MOVED_FROM, FAN_MOVED_TO, FAN_NONBLOCK, FAN_ONDIR, FAN_Q_OVERFLOW, FAN_RENAME,
+    FAN_REPORT_DFID_NAME, FAN_REPORT_DFID_NAME_TARGET, FAN_REPORT_FID, O_CLOEXEC, O_DIRECTORY,
+    O_LARGEFILE, O_PATH, O_RDONLY,
 };
 use rfind_core::db::EventType;
 use std::{
@@ -104,6 +104,37 @@ impl FanState {
         }
         marked.push(m);
         Ok(true)
+    }
+
+    /// Drop the mark on the filesystem that was mounted at `point`, close
+    /// its cached mount fd and forget the fsid. Called by the daemon when
+    /// a mount disappears from `/proc/self/mounts`; keeping the stale
+    /// entry pins a (possibly dangling) fd and lets a later event with a
+    /// reused fsid resolve against the wrong mount.
+    ///
+    /// The kernel-side `fanotify_mark(FAN_MARK_REMOVE)` is best-effort: if
+    /// the mount is already gone it returns ENOENT, which we ignore. The
+    /// cache entry is removed in all cases. Returns true if an entry was
+    /// found and removed.
+    fn remove(&self, point: &Path) -> bool {
+        let mut marked = self.marked.write().unwrap();
+        let Some(idx) = marked.iter().position(|m| m.point == point) else {
+            return false;
+        };
+        if let Ok(c) = CString::new(point.as_os_str().as_encoded_bytes()) {
+            unsafe {
+                fanotify_mark(
+                    self.fd,
+                    FAN_MARK_REMOVE | FAN_MARK_FILESYSTEM,
+                    self.mask,
+                    libc::AT_FDCWD,
+                    c.as_ptr(),
+                );
+            }
+        }
+        // Dropping the MarkedFs closes any cached mount fd.
+        marked.swap_remove(idx);
+        true
     }
 }
 
@@ -230,6 +261,12 @@ impl FanotifyMonitor {
     /// Returns false if it was already watched.
     pub fn add_filesystem(&self, point: &Path) -> Result<bool, FanotifyError> {
         self.state.add(point)
+    }
+
+    /// Stop watching the filesystem that was mounted at `point` and release
+    /// its cached mount fd. Called when the mount disappeared.
+    pub fn remove_filesystem(&self, point: &Path) -> bool {
+        self.state.remove(point)
     }
 
     /// True (once) if events were lost since the last call: kernel queue
