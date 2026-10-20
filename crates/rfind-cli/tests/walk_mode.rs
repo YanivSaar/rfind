@@ -75,7 +75,10 @@ fn print0_separates_hits_with_nul() {
     // No newlines, trailing NUL on every record.
     assert!(!stdout.contains(&b'\n'));
     assert!(stdout.ends_with(b"\0"));
-    let records: Vec<&[u8]> = stdout.split(|&b| b == 0).filter(|s| !s.is_empty()).collect();
+    let records: Vec<&[u8]> = stdout
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .collect();
     assert!(records
         .iter()
         .any(|r| std::str::from_utf8(r).unwrap().ends_with("notes.log")));

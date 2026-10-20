@@ -62,3 +62,25 @@ jobs:
           sudo apt-get install -y build-essential
       - name: Release build
         run: cargo build --release --all-targets
+      - name: Release-mode tests
+        run: cargo test --release --all-targets
+
+  audit:
+    name: cargo-audit (advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Run cargo audit
+        run: cargo audit --deny warnings
+
+  deny:
+    name: cargo-deny (bans / licenses / sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans licenses sources

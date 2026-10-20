@@ -117,9 +117,7 @@ fn merge_size_bounds(
     }
     if let (Some(l), Some(h)) = (lo, hi) {
         if l > h {
-            return Err(fail(format!(
-                "size filters contradict: min {l} > max {h}"
-            )));
+            return Err(fail(format!("size filters contradict: min {l} > max {h}")));
         }
     }
     Ok((lo, hi))
@@ -930,11 +928,7 @@ fn search_largest_dirs(
     // When a pattern is given we rank first (cheap), then take the top
     // `want` matches by walking the ranked list.
     let matches_everything = matches!(kind, PatternKind::None);
-    let sql_limit = if matches_everything {
-        Some(want)
-    } else {
-        None
-    };
+    let sql_limit = if matches_everything { Some(want) } else { None };
     let mut matched = 0u64;
     db::largest_dirs_streaming(conn, a.under.as_deref(), filter, sql_limit, |h| {
         if !kind.matches(h.path) {
@@ -976,9 +970,7 @@ fn search_by_pattern(
         }
         (Some(p), false, true) => db::search_by_path_glob_streaming(conn, p, filter, limit, emit),
         (Some(p), false, false) => match under {
-            Some(prefix) => {
-                db::search_under_streaming(conn, prefix, Some(p), filter, limit, emit)
-            }
+            Some(prefix) => db::search_under_streaming(conn, prefix, Some(p), filter, limit, emit),
             None => db::search_by_glob_streaming(conn, p, filter, limit, emit),
         },
     }

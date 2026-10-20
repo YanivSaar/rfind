@@ -139,6 +139,53 @@ fn warn_drvfs_under_live_roots(cfg: &Config, mounts: &[mounts::MountEntry]) {
 /// follows symlinks, so a pre-seeded symlink at an admin-chosen db path
 /// would have its target chmod'd by the daemon. Default db path is
 /// `/var/lib/rfindd` (root-only), so this is defense in depth.
+/// Path of the clean-shutdown marker alongside `index.db`. Written on
+/// orderly exit (SIGTERM) and before `exec`-reload (SIGHUP), removed on
+/// startup. If absent at boot, the prior run exited abnormally
+/// (SIGKILL, OOM, kernel crash, power loss) and the index is opened with
+/// an `integrity_check` before serving reads.
+fn clean_marker_path(db_file: &Path) -> PathBuf {
+    let mut p = db_file.to_path_buf();
+    let name = db_file
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "index.db".to_string());
+    p.set_file_name(format!(".{name}.clean"));
+    p
+}
+
+/// Returns true iff the marker existed and was removed. The directory is
+/// 0700 root-only, so the marker inherits those permissions.
+fn take_clean_marker(path: &Path) -> bool {
+    match fs::remove_file(path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            warn!(
+                "clean-shutdown marker {} present but unreadable: {e}",
+                path.display()
+            );
+            // Treat as absent: forces integrity_check, which is the safe side.
+            false
+        }
+    }
+}
+
+/// Best-effort: a failure to write the marker does not block shutdown,
+/// it only forces an integrity_check on the next boot.
+fn write_clean_marker(path: &Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Err(e) = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+    {
+        warn!("cannot write clean-shutdown marker {}: {e}", path.display());
+    }
+}
+
 fn restrict_index_permissions(db_file: &Path) {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
@@ -176,6 +223,7 @@ fn restrict_index_permissions(db_file: &Path) {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
@@ -263,6 +311,31 @@ mod tests {
     }
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn clean_marker_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        let m = clean_marker_path(&db);
+        // Absent on a fresh dir.
+        assert!(!take_clean_marker(&m));
+        // Written then taken exactly once.
+        write_clean_marker(&m);
+        assert!(m.exists());
+        assert_eq!(mode(&m), 0o600);
+        assert!(take_clean_marker(&m));
+        assert!(!m.exists());
+        assert!(!take_clean_marker(&m));
+    }
+
+    #[test]
+    fn clean_marker_lives_next_to_the_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        let m = clean_marker_path(&db);
+        assert_eq!(m.parent(), db.parent());
+        assert_eq!(m.file_name().unwrap(), ".index.db.clean");
+    }
 }
 
 /// Load the config, write the default on first start, and exclude
@@ -548,6 +621,8 @@ fn main() {
         error!("cannot create {}: {e}", db_parent.display());
         std::process::exit(1);
     }
+    let marker = clean_marker_path(&db_file);
+    let prior_was_clean = take_clean_marker(&marker);
     let conn = match db::open_with(&db_file, cfg.index.compress) {
         Ok(c) => Arc::new(Mutex::new(c)),
         Err(e) => {
@@ -556,6 +631,37 @@ fn main() {
         }
     };
     restrict_index_permissions(&db_file);
+
+    // After an abnormal exit (SIGKILL, OOM, power loss) run SQLite's
+    // integrity_check. On failure the index is unlinked so the next
+    // open path rebuilds via a full scan; we do not try to serve reads
+    // from a corrupt database.
+    if !prior_was_clean {
+        info!("No clean-shutdown marker; running index integrity_check");
+        let bad = {
+            let c = lock(&conn);
+            match db::integrity_check(&c) {
+                Ok(()) => {
+                    info!("integrity_check: ok");
+                    false
+                }
+                Err(msg) => {
+                    error!("integrity_check failed: {msg}; dropping index for rebuild");
+                    true
+                }
+            }
+        };
+        if bad {
+            // Drop the open handle before unlinking so SQLite's -wal/-shm
+            // files are released. The re-exec restarts rfindd with no
+            // index, triggering a full scan via the normal path.
+            drop(conn);
+            db::remove_index_files(&db_file);
+            write_clean_marker(&marker);
+            info!("Re-executing after index wipe to rebuild via full scan");
+            reexec();
+        }
+    }
 
     // ── Signal handling ──────────────────────────────────────────────────────
     let force_reindex = Arc::new(AtomicBool::new(false));
@@ -768,6 +874,7 @@ fn main() {
             }
             drop(ctx);
             drop(conn);
+            write_clean_marker(&marker);
             if stopping {
                 info!("Stopped");
                 return;
@@ -789,6 +896,7 @@ fn main() {
         // re-exec so a fresh monitor comes up; systemd keeps the pid.
         if monitor.as_ref().is_some_and(|m| m.is_dead()) {
             error!("Monitor event thread exited; re-executing to restart it");
+            write_clean_marker(&marker);
             reexec();
         }
 

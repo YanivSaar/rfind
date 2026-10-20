@@ -91,9 +91,7 @@ struct Watches {
 /// (e.g. inside watch_new_tree) must not take every subsequent operation
 /// down with it. The map's invariants are "best-effort cache of watch
 /// state"; a poisoned view is still safe to read and write.
-fn lock_map(
-    m: &Mutex<HashMap<i32, PathBuf>>,
-) -> std::sync::MutexGuard<'_, HashMap<i32, PathBuf>> {
+fn lock_map(m: &Mutex<HashMap<i32, PathBuf>>) -> std::sync::MutexGuard<'_, HashMap<i32, PathBuf>> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
@@ -125,7 +123,7 @@ impl Watches {
             self.overflow.store(true, Ordering::Relaxed);
             const WARN_INTERVAL: Duration = Duration::from_secs(300);
             let mut last = self.last_warn.lock().unwrap_or_else(|p| p.into_inner());
-            let should_warn = last.map_or(true, |t| t.elapsed() >= WARN_INTERVAL);
+            let should_warn = last.is_none_or(|t| t.elapsed() >= WARN_INTERVAL);
             if should_warn {
                 *last = Some(Instant::now());
                 drop(last);

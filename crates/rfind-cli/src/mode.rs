@@ -84,9 +84,7 @@ pub fn choose_mode<'a>(req: &Request, env: &Env<'a>) -> Result<(Mode, Option<Str
     }
 
     // 4. Auto. Walk-only filters win first.
-    if req.walk_only_filter
-        || matches!(req.symlinks, SymlinkMode::H | SymlinkMode::L)
-    {
+    if req.walk_only_filter || matches!(req.symlinks, SymlinkMode::H | SymlinkMode::L) {
         return Ok((Mode::Walk, None));
     }
     if !env.caller_is_root {
@@ -145,9 +143,11 @@ mod tests {
     #[test]
     fn live_flag_forces_walk() {
         let cfg = Config::default();
-        let (m, _) =
-            choose_mode(&req(true, false, SymlinkMode::P), &env(&cfg, true, true, true))
-                .unwrap();
+        let (m, _) = choose_mode(
+            &req(true, false, SymlinkMode::P),
+            &env(&cfg, true, true, true),
+        )
+        .unwrap();
         assert_eq!(m, Mode::Walk);
     }
 

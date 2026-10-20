@@ -1,12 +1,7 @@
 //! The progress file read by `rfind status`.
 
 use rfind_core::{progress_file_path, DaemonPhase, ScanProgress};
-use std::{
-    fs,
-    io::Write,
-    os::unix::fs::OpenOptionsExt,
-    time::SystemTime,
-};
+use std::{fs, io::Write, os::unix::fs::OpenOptionsExt, time::SystemTime};
 
 /// Write atomically (temp file + rename) so readers never see half a file.
 ///

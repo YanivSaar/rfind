@@ -1018,14 +1018,9 @@ fn worker_loop(
                 .filter(|(_, t)| wants_stat(*t))
                 .map(|(n, _)| n.as_c_str())
                 .collect();
-            let mut stats = statx_batch(
-                &mut ring,
-                dir_fd,
-                &to_stat,
-                shared.statx_mask,
-                statx_flags,
-            )
-            .into_iter();
+            let mut stats =
+                statx_batch(&mut ring, dir_fd, &to_stat, shared.statx_mask, statx_flags)
+                    .into_iter();
 
             let child_depth = item_depth + 1;
             // find(1) semantics for `--max-depth N`:
@@ -1171,7 +1166,10 @@ mod tests {
             .collect()
     }
 
-    fn under(root: &Path, matcher: impl Fn(&EntryInfo) -> bool + Send + Sync + 'static) -> SearchConfig {
+    fn under(
+        root: &Path,
+        matcher: impl Fn(&EntryInfo) -> bool + Send + Sync + 'static,
+    ) -> SearchConfig {
         SearchConfig::new(vec![root.to_path_buf()], matcher, |_| {})
             // Deterministic worker count for test stability.
             .with_workers_opt(2)
@@ -1233,7 +1231,7 @@ mod tests {
         let n = names(&hits);
         assert!(n.contains("b.txt")); // depth 2
         assert!(n.contains("deep")); // depth 2
-        // deep's contents sit at depth 3; still past the cap.
+                                     // deep's contents sit at depth 3; still past the cap.
         assert!(!n.contains("c.txt"));
     }
 
@@ -1281,9 +1279,18 @@ mod tests {
     fn depth_field_tracks_distance_from_root() {
         let d = fixture();
         let (hits, _) = collect(under(d.path(), |_| true));
-        let a = hits.iter().find(|e| e.path.file_name().unwrap() == "a.txt").unwrap();
-        let b = hits.iter().find(|e| e.path.file_name().unwrap() == "b.txt").unwrap();
-        let c = hits.iter().find(|e| e.path.file_name().unwrap() == "c.txt").unwrap();
+        let a = hits
+            .iter()
+            .find(|e| e.path.file_name().unwrap() == "a.txt")
+            .unwrap();
+        let b = hits
+            .iter()
+            .find(|e| e.path.file_name().unwrap() == "b.txt")
+            .unwrap();
+        let c = hits
+            .iter()
+            .find(|e| e.path.file_name().unwrap() == "c.txt")
+            .unwrap();
         assert_eq!(a.depth, 1);
         assert_eq!(b.depth, 2);
         assert_eq!(c.depth, 3);
@@ -1320,8 +1327,7 @@ mod tests {
         };
         let cfg = SearchConfig {
             cancel: Arc::clone(&cancel),
-            ..SearchConfig::new(vec![d.path().to_path_buf()], predicate, |_| {})
-                .with_workers_opt(1)
+            ..SearchConfig::new(vec![d.path().to_path_buf()], predicate, |_| {}).with_workers_opt(1)
         };
         let (_hits, r) = collect(cfg);
         assert!(r.cancelled);
@@ -1400,9 +1406,7 @@ mod tests {
         let wq_t = Arc::clone(&wq);
         let counters_t = Arc::clone(&counters);
         let cancel_t = Arc::clone(&cancel);
-        let h = std::thread::spawn(move || {
-            wq_t.pop_or_done(&counters_t.in_flight, &cancel_t)
-        });
+        let h = std::thread::spawn(move || wq_t.pop_or_done(&counters_t.in_flight, &cancel_t));
         // Give the thread a moment to park.
         std::thread::sleep(std::time::Duration::from_millis(30));
         cancel.store(true, Ordering::Relaxed);

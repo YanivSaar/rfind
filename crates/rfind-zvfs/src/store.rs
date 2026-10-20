@@ -224,10 +224,7 @@ impl Store {
             return;
         }
         let n = n as usize;
-        let Some(need) = n
-            .checked_mul(12)
-            .and_then(|v| v.checked_add(44))
-        else {
+        let Some(need) = n.checked_mul(12).and_then(|v| v.checked_add(44)) else {
             return;
         };
         if need != b.len() {
@@ -357,9 +354,8 @@ impl Store {
         };
         self.scratch.resize(REC_HDR + loc.clen as usize, 0);
         f.read_exact_at(&mut self.scratch, loc.off)?;
-        let field = |i: usize| {
-            u32::from_le_bytes(self.scratch[i * 4..i * 4 + 4].try_into().unwrap())
-        };
+        let field =
+            |i: usize| u32::from_le_bytes(self.scratch[i * 4..i * 4 + 4].try_into().unwrap());
         let (magic, hdr_pgno, hdr_clen, hdr_rawlen, hdr_crc) =
             (field(0), field(1), field(2), field(3), field(4));
         if magic != REC_MAGIC

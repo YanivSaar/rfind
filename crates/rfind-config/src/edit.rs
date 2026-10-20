@@ -290,8 +290,7 @@ impl ConfigFile {
             },
             Kind::Int => value(
                 raw.parse::<u32>()
-                    .map_err(|_| bad("a non-negative integer".into()))?
-                    as i64,
+                    .map_err(|_| bad("a non-negative integer".into()))? as i64,
             ),
             Kind::Path => value(normalize_path(raw)?.to_string_lossy().to_string()),
             Kind::Enum(allowed) => {

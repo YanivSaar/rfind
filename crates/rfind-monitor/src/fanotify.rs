@@ -333,9 +333,7 @@ fn init_fanotify() -> Result<(RawFd, bool), FanotifyError> {
 }
 
 fn mark_filesystem(fd: RawFd, point: &Path, mask: u64) -> Result<MarkedFs, FanotifyError> {
-    let err = |e: i32| {
-        FanotifyError::Mark(rfind_core::log::sanitize_path(point), e, strerror(e))
-    };
+    let err = |e: i32| FanotifyError::Mark(rfind_core::log::sanitize_path(point), e, strerror(e));
     let c = CString::new(point.as_os_str().as_encoded_bytes()).map_err(|_| err(libc::EINVAL))?;
     if unsafe {
         fanotify_mark(
@@ -514,11 +512,11 @@ fn resolve(rec: &[u8], marked: &RwLock<Vec<MarkedFs>>) -> Option<PathBuf> {
     if dfd < 0 {
         return None;
     } // directory already gone (ESTALE)
-    // Was the dentry unlinked while the fd is open? The old check for
-    // " (deleted)" suffix on the proc readlink also dropped events on
-    // real files named "foo (deleted)". Use fstat + nlink instead:
-    // nlink becomes 0 the moment the last dentry is unlinked, and no
-    // legitimate on-disk file can have nlink==0.
+      // Was the dentry unlinked while the fd is open? The old check for
+      // " (deleted)" suffix on the proc readlink also dropped events on
+      // real files named "foo (deleted)". Use fstat + nlink instead:
+      // nlink becomes 0 the moment the last dentry is unlinked, and no
+      // legitimate on-disk file can have nlink==0.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     let st_err = unsafe { libc::fstat(dfd, &mut st) };
     let dir = fs::read_link(format!("/proc/self/fd/{dfd}"));

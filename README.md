@@ -277,6 +277,29 @@ cargo build --release
 sudo ./scripts/install.sh
 ```
 
+### Pinned-toolchain / offline build
+
+For air-gapped or policy-restricted hosts that cannot pipe `rustup` into
+a shell:
+
+```bash
+# On a build host with network:
+rustup toolchain install $(cat rust-toolchain.toml | grep channel | cut -d'"' -f2)
+cargo vendor > .cargo/config.toml.vendor      # vendor deps
+tar czf rfind-vendored.tar.gz . .cargo/config.toml.vendor vendor/
+
+# On the target host (no network):
+tar xzf rfind-vendored.tar.gz
+mv .cargo/config.toml.vendor .cargo/config.toml
+cargo build --release --offline
+sudo ./scripts/install.sh
+```
+
+The toolchain pin in `rust-toolchain.toml` is the one CI builds with;
+match it on offline hosts to reproduce bits for bits. The installer
+itself does not fetch anything when invoked against a locally built
+`target/release/` tree.
+
 ---
 
 ## 🔍 Usage
@@ -742,7 +765,9 @@ Normalized parent-ID schema avoids storing full paths redundantly.
 - Index at `/var/lib/rfindd/index.db` — root-owned
 - Config at `/etc/rfindd/config.toml` — `0640` (root-owned; group-readable so a `wheel`-style
   group can audit the exclude list without needing read on the index itself)
-- Progress file at `/run/rfindd/progress.json` — world-readable (filenames only, no content)
+- Progress file at `/run/rfindd/progress.json` — root-only; the systemd unit sets
+  `RuntimeDirectoryMode=0700`, so the sanitized path list and scan timings are not
+  readable by unprivileged users
 - Search queries read the index directly — no daemon IPC required
 - The zvfs page store verifies the per-page CRC on **every read**, not only at startup
   replay — defence-in-depth against on-disk corruption of `index.db-zdata.<gen>`

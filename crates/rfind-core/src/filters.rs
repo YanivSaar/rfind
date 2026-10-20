@@ -192,9 +192,7 @@ fn unit_byte(c: char) -> u64 {
 /// absent, or an error if a different non-digit prefix appears.
 fn split_prefix<'a>(s: &'a str, label: &str) -> Result<(Option<char>, &'a str), String> {
     let mut chars = s.chars();
-    let first = chars
-        .next()
-        .ok_or_else(|| format!("empty {}", label))?;
+    let first = chars.next().ok_or_else(|| format!("empty {}", label))?;
     match first {
         '+' | '-' => Ok((Some(first), &s[1..])),
         c if c.is_ascii_digit() || c == '.' => Ok((None, s)),
