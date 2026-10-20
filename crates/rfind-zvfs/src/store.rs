@@ -340,7 +340,17 @@ impl Store {
     /// against on-disk corruption or an attacker with a write primitive on
     /// `<db>-zdata.<gen>`. The CRC cost is noise next to zstd decompress.
     pub fn read_page(&mut self, pgno: u32, buf: &mut [u8]) -> io::Result<bool> {
-        let loc = self.map.get(pgno as usize - 1).copied().unwrap_or_default();
+        // SQLite's API contract guarantees pgno >= 1, but a bad caller
+        // would panic in debug and wrap in release via `pgno as usize - 1`.
+        // Hard-reject with InvalidInput so a future regression gets a
+        // clear error rather than an OOB read.
+        let Some(idx) = (pgno as usize).checked_sub(1) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "zvfs: pgno must be >= 1",
+            ));
+        };
+        let loc = self.map.get(idx).copied().unwrap_or_default();
         let (Some(f), true) = (&self.data, loc.clen > 0) else {
             buf.fill(0);
             return Ok(false);

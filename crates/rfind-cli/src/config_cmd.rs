@@ -15,7 +15,7 @@ use rfind_config::{
 use serde_json::{json, Value};
 use std::{
     io::{self, BufRead, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -501,16 +501,15 @@ fn periodic_cmd(out: &mut Out, cmd: PeriodicCmd) -> CmdResult {
 fn edit_cmd(out: &mut Out, path: &Path, reload: ReloadOpt) -> CmdResult {
     let original = std::fs::read_to_string(path).unwrap_or_else(|_| rfind_config::default_toml());
 
-    // Private 0700 subdir in TMPDIR, so an attacker can't win a symlink race
-    // on the editor's working file. The dir name includes the pid; we remove
-    // it on exit. create_dir fails if it exists, so we also try a fresh name
-    // if a stale one is in the way.
-    let base = std::env::temp_dir();
-    let dir = base.join(format!("rfind-edit-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup of a stale leftover we own
-    std::fs::create_dir(&dir).map_err(|e| fail(format!("cannot create {}: {e}", dir.display())))?;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| fail(format!("cannot chmod {}: {e}", dir.display())))?;
+    // Random-name 0700 subdir in TMPDIR — mkdtemp atomic + unpredictable
+    // so an unprivileged attacker can neither pre-create our dir (DoS)
+    // nor win a symlink race on the editor's working file. tempdir
+    // defaults to 0o700. Dropped on scope exit (deleted via Drop).
+    let dir_guard = tempfile::Builder::new()
+        .prefix("rfind-edit-")
+        .tempdir()
+        .map_err(|e| fail(format!("cannot create tempdir: {e}")))?;
+    let dir = dir_guard.path().to_path_buf();
     let tmp = dir.join("config.toml");
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -574,6 +573,6 @@ fn edit_cmd(out: &mut Out, path: &Path, reload: ReloadOpt) -> CmdResult {
             }
         }
     };
-    let _ = std::fs::remove_dir_all(&dir);
+    drop(dir_guard); // explicit for clarity; TempDir drops the whole subtree
     result
 }

@@ -388,11 +388,15 @@ fn event_loop(
         while off + hdr <= len as usize {
             let ev: InotifyEvent =
                 unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off) as *const InotifyEvent) };
+            // Bound the name scan to `ev.len`. The kernel NUL-terminates
+            // names and ev.len is reliable in practice, but relying on
+            // CStr::from_ptr means a bad kernel event or seccomp replay
+            // could read past the buffer. Slice first, NUL-scan inside.
             let name = if ev.len > 0 {
-                let s = unsafe {
-                    std::ffi::CStr::from_ptr(buf.as_ptr().add(off + hdr) as *const libc::c_char)
-                };
-                s.to_string_lossy().to_string()
+                let region_end = off + hdr + ev.len as usize;
+                let region = buf.get(off + hdr..region_end).unwrap_or(&[]);
+                let nul = region.iter().position(|&b| b == 0).unwrap_or(region.len());
+                String::from_utf8_lossy(&region[..nul]).into_owned()
             } else {
                 String::new()
             };

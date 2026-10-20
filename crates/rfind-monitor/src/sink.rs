@@ -6,7 +6,7 @@
 //! push onto an unbounded channel and a writer thread journals events in
 //! batched transactions.
 
-use rfind_core::db::{insert_pending_event, EventType};
+use rfind_core::db::{insert_pending_event, pending_event_count, EventType};
 use rusqlite::Connection;
 use std::{
     sync::{
@@ -24,6 +24,11 @@ const MAX_BATCH: usize = 5000;
 /// draining the kernel queue promptly. On overflow we drop the event and
 /// set a flag the daemon turns into a rescan, mirroring FAN_Q_OVERFLOW.
 const SINK_CAPACITY: usize = MAX_BATCH * 2;
+/// Hard cap on `pending_events` rows. Rapid rename churn can beat the
+/// reconciler (1000-per-5s) and grow the journal without bound,
+/// eventually filling /var. On hit we set overflow (a full rescan will
+/// subsume the lost events), truncate the journal, and keep draining.
+const PENDING_ROW_CAP: i64 = 1_000_000;
 
 struct RawEvent {
     et: EventType,
@@ -72,14 +77,10 @@ impl EventSink {
 
 pub fn spawn_writer(db: Arc<Mutex<Connection>>) -> (EventSink, thread::JoinHandle<()>) {
     let (tx, rx) = sync_channel(SINK_CAPACITY);
-    let handle = thread::spawn(move || writer_loop(db, rx));
-    (
-        EventSink {
-            tx,
-            overflow: Arc::new(AtomicBool::new(false)),
-        },
-        handle,
-    )
+    let overflow = Arc::new(AtomicBool::new(false));
+    let overflow_for_writer = Arc::clone(&overflow);
+    let handle = thread::spawn(move || writer_loop(db, rx, overflow_for_writer));
+    (EventSink { tx, overflow }, handle)
 }
 
 /// Lock the shared connection, ignoring poisoning. The scanner's panic
@@ -90,7 +91,7 @@ fn lock_db(db: &Mutex<Connection>) -> std::sync::MutexGuard<'_, Connection> {
     db.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-fn writer_loop(db: Arc<Mutex<Connection>>, rx: Receiver<RawEvent>) {
+fn writer_loop(db: Arc<Mutex<Connection>>, rx: Receiver<RawEvent>, overflow: Arc<AtomicBool>) {
     let mut batch = Vec::with_capacity(MAX_BATCH);
     while let Ok(first) = rx.recv() {
         batch.push(first);
@@ -101,6 +102,25 @@ fn writer_loop(db: Arc<Mutex<Connection>>, rx: Receiver<RawEvent>) {
             }
         }
         let c = lock_db(&db);
+        // Cap the journal size: sustained rename churn can beat the
+        // reconciler and grow pending_events without bound. On hit, set
+        // overflow (a full rescan subsumes the discarded events) and
+        // truncate what's there so we don't fill /var.
+        if let Ok(count) = pending_event_count(&c) {
+            if count >= PENDING_ROW_CAP {
+                if !overflow.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        "pending_events hit the {} row cap; truncating and scheduling a rescan",
+                        PENDING_ROW_CAP
+                    );
+                }
+                if let Err(e) = c.execute("DELETE FROM pending_events", []) {
+                    error!("truncating pending_events: {e}");
+                }
+                batch.clear();
+                continue;
+            }
+        }
         let tx = match c.unchecked_transaction() {
             Ok(t) => t,
             Err(e) => {

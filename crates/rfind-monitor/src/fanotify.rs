@@ -458,12 +458,19 @@ fn resolve(rec: &[u8], marked: &RwLock<Vec<MarkedFs>>) -> Option<PathBuf> {
     if dfd < 0 {
         return None;
     } // directory already gone (ESTALE)
+    // Was the dentry unlinked while the fd is open? The old check for
+    // " (deleted)" suffix on the proc readlink also dropped events on
+    // real files named "foo (deleted)". Use fstat + nlink instead:
+    // nlink becomes 0 the moment the last dentry is unlinked, and no
+    // legitimate on-disk file can have nlink==0.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let st_err = unsafe { libc::fstat(dfd, &mut st) };
     let dir = fs::read_link(format!("/proc/self/fd/{dfd}"));
     unsafe { close(dfd) };
-    let dir = dir.ok()?;
-    if dir.as_os_str().as_encoded_bytes().ends_with(b" (deleted)") {
+    if st_err != 0 || st.st_nlink == 0 {
         return None;
     }
+    let dir = dir.ok()?;
 
     let name = &rec[handle_end..];
     let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];

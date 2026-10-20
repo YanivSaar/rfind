@@ -134,15 +134,44 @@ fn warn_drvfs_under_live_roots(cfg: &Config, mounts: &[mounts::MountEntry]) {
 
 /// Make the index directory and files readable by root only: the index
 /// lists every file name on the system.
+///
+/// Chmod via an O_NOFOLLOW fd (`fchmod`), not by path: `set_permissions`
+/// follows symlinks, so a pre-seeded symlink at an admin-chosen db path
+/// would have its target chmod'd by the daemon. Default db path is
+/// `/var/lib/rfindd` (root-only), so this is defense in depth.
 fn restrict_index_permissions(db_file: &Path) {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let chmod_fd = |fd: i32, mode: u32| {
+        if unsafe { libc::fchmod(fd, mode as libc::mode_t) } != 0 {
+            let e = std::io::Error::last_os_error();
+            warn!("fchmod {mode:04o}: {e}");
+        }
+    };
     if let Some(dir) = db_file.parent() {
-        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(dir)
+        {
+            Ok(f) => chmod_fd(f.as_raw_fd(), 0o700),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!("open index dir {}: {e}", sanitize_path(dir)),
+        }
     }
     for suffix in ["", "-wal", "-shm"] {
         let mut p = db_file.as_os_str().to_owned();
         p.push(suffix);
-        let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o600));
+        let p = Path::new(&p);
+        match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(p)
+        {
+            Ok(f) => chmod_fd(f.as_raw_fd(), 0o600),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!("open index file {}: {e}", sanitize_path(p)),
+        }
     }
 }
 
