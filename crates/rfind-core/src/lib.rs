@@ -1,5 +1,6 @@
 pub mod db;
 pub mod filters;
+pub mod log;
 pub mod mounts;
 
 use serde::{Deserialize, Serialize};

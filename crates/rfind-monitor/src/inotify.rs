@@ -26,7 +26,7 @@ use rfind_core::db::EventType;
 use std::{
     collections::HashMap,
     ffi::CString,
-    fs, mem,
+    mem,
     os::unix::io::RawFd,
     path::{Path, PathBuf},
     sync::{
@@ -73,6 +73,16 @@ struct Watches {
     limit_warned: AtomicBool,
 }
 
+/// Poison-tolerant lock on the wd→path map: a transient panic in a holder
+/// (e.g. inside watch_new_tree) must not take every subsequent operation
+/// down with it. The map's invariants are "best-effort cache of watch
+/// state"; a poisoned view is still safe to read and write.
+fn lock_map(
+    m: &Mutex<HashMap<i32, PathBuf>>,
+) -> std::sync::MutexGuard<'_, HashMap<i32, PathBuf>> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 impl Watches {
     fn is_excluded(&self, path: &Path) -> bool {
         self.excludes.iter().any(|ex| path.starts_with(ex))
@@ -94,7 +104,7 @@ impl Watches {
         };
         let wd = unsafe { inotify_add_watch(self.fd, c.as_ptr(), WATCH_MASK) };
         if wd >= 0 {
-            self.map.lock().unwrap().insert(wd, path.to_path_buf());
+            lock_map(&self.map).insert(wd, path.to_path_buf());
             return;
         }
         let err = std::io::Error::last_os_error();
@@ -105,23 +115,23 @@ impl Watches {
                 "inotify watch limit reached at {} watches — changes in unwatched \
                  directories will be missed. Raise fs.inotify.max_user_watches, or \
                  move large trees to scan.periodic_roots.",
-                self.map.lock().unwrap().len()
+                lock_map(&self.map).len()
             );
         }
     }
 
     fn get(&self, wd: i32) -> Option<PathBuf> {
-        self.map.lock().unwrap().get(&wd).cloned()
+        lock_map(&self.map).get(&wd).cloned()
     }
 
     fn forget(&self, wd: i32) {
-        self.map.lock().unwrap().remove(&wd);
+        lock_map(&self.map).remove(&wd);
     }
 
     /// A watched directory was renamed: rewrite its path and its
     /// descendants' paths.
     fn rename_under(&self, old: &Path, new: &Path) {
-        let mut m = self.map.lock().unwrap();
+        let mut m = lock_map(&self.map);
         for p in m.values_mut() {
             if let Ok(rest) = p.strip_prefix(old) {
                 *p = if rest.as_os_str().is_empty() {
@@ -136,7 +146,7 @@ impl Watches {
     /// A directory left the watched tree: drop its watches. The kernel
     /// would otherwise keep reporting events for it under a stale path.
     fn remove_under(&self, path: &Path) {
-        let mut m = self.map.lock().unwrap();
+        let mut m = lock_map(&self.map);
         let wds: Vec<i32> = m
             .iter()
             .filter(|(_, p)| p.starts_with(path))
@@ -313,9 +323,27 @@ fn event_loop(
     let walker = {
         let w = Arc::clone(&watches);
         let s = sink.clone();
+        let overflow_for_walker = Arc::clone(&overflow);
         thread::spawn(move || {
             while let Ok(root) = walk_rx.recv() {
-                watch_new_tree(&w, &s, &root);
+                // The walker is the only thing keeping newly-created subtrees
+                // in the index. Without this guard, a single panic (easiest
+                // via a poisoned Watches::map lock after a transient event
+                // thread panic) silently kills the walker: the event thread
+                // keeps running and `is_dead()` stays false, but every
+                // IN_CREATE|IN_ISDIR afterwards queues forever and the index
+                // diverges from the filesystem. Promote to overflow instead;
+                // the next periodic rescan will reconcile.
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    watch_new_tree(&w, &s, &root);
+                }));
+                if r.is_err() {
+                    error!(
+                        "inotify walker panicked on {}; scheduling rescan",
+                        rfind_core::log::sanitize_path(&root)
+                    );
+                    overflow_for_walker.store(true, Ordering::Relaxed);
+                }
             }
         })
     };
@@ -454,13 +482,24 @@ fn expire_moves(watches: &Watches, sink: &EventSink, moves: &mut HashMap<u32, Pe
 
 /// Watch a directory that just appeared, then journal what is already in
 /// it. Watch-before-read means nothing created in between is missed.
+///
+/// Uses symlink-safe reads: an unprivileged attacker who created the dir
+/// (we just received an IN_CREATE|IN_ISDIR for) could race and swap it
+/// for a symlink to an out-of-scope target like `/root/` before we
+/// descend. `read_dir_safe` fails that `openat2` and we skip the subtree.
 fn watch_new_tree(watches: &Watches, sink: &EventSink, root: &Path) {
+    use crate::safewalk::read_dir_safe;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         watches.add(&dir);
-        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        let Ok(rd) = read_dir_safe(&dir) else {
+            continue;
+        };
         for entry in rd.flatten() {
-            let path = entry.path();
+            // `read_dir_safe` reads via /proc/self/fd/<n>, so
+            // `entry.path()` would be `/proc/self/fd/n/<name>` —
+            // meaningless downstream. Reconstruct from the real dir.
+            let path = dir.join(entry.file_name());
             if watches.is_excluded(&path) {
                 continue;
             }

@@ -731,7 +731,11 @@ pub fn delete_outside_roots(conn: &Connection, roots: &[String]) -> Result<usize
             ids.push(d);
         }
     }
-    if ids.is_empty() {
+    // Partial resolution is dangerous: with roots=["/home","/mnt/data"] and
+    // /home temporarily unresolved (NFS unmount race, mid-rename, startup
+    // lag), pruning against only /mnt/data wipes the entire /home subtree.
+    // Skip the tick rather than lose data; the next pass picks it up.
+    if ids.len() != roots.len() {
         return Ok(0);
     }
     with_savepoint(conn, "del_outside", |c| {
@@ -2114,6 +2118,25 @@ mod tests {
         assert_eq!(paths(&c), vec!["/home/a/x", "/mnt/c/w"]);
         // Root "/" keeps everything.
         assert_eq!(delete_outside_roots(&c, &["/".to_string()]).unwrap(), 0);
+    }
+
+    #[test]
+    fn delete_outside_roots_skips_when_a_root_is_unresolved() {
+        // If one of two configured roots has no `dirs` row yet (NFS unmount
+        // race, mid-rename, startup lag), the old code would prune everything
+        // under the missing root using only the resolved root as the keep-set.
+        let c = mem();
+        for p in ["/home/a/x", "/mnt/c/w"] {
+            add(&c, p, false, None);
+        }
+        // "/mnt/data" never resolves; must not wipe /home.
+        let n = delete_outside_roots(
+            &c,
+            &["/home".to_string(), "/mnt/data".to_string()],
+        )
+        .unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(paths(&c), vec!["/home/a/x", "/mnt/c/w"]);
     }
 
     #[test]

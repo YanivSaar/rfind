@@ -2,7 +2,7 @@
 
 use crate::{index, lock, progress};
 use rfind_config::Config;
-use rfind_core::{db, DaemonPhase};
+use rfind_core::{db, log::sanitize_path, DaemonPhase};
 use rfind_monitor::DirWatcher;
 use rfind_scanner::{run_scan, EntryInfo, ScanConfig, ScanResult};
 use rusqlite::Connection;
@@ -141,8 +141,13 @@ pub fn scan_root(ctx: &Ctx, root: &Path, report: bool) -> ScanResult {
     .with_workers(cfg.scan.workers)
     .with_io_uring(cfg.scan.io_uring)
     .with_cancel(Arc::clone(&ctx.cancel))
-    .with_error_handler(|p, e| warn!("scan error {}: {}", p.display(), e))
-    .with_skip_dir(move |p| skip.iter().any(|ex| p.starts_with(ex)));
+    .with_error_handler(|p, e| warn!("scan error {}: {}", sanitize_path(p), e))
+    .with_skip_dir(move |p| skip.iter().any(|ex| p.starts_with(ex)))
+    .with_max_depth(if cfg.scan.max_depth == 0 {
+        None
+    } else {
+        Some(cfg.scan.max_depth)
+    });
 
     let result = run_scan(scan_cfg);
 
@@ -154,7 +159,7 @@ pub fn scan_root(ctx: &Ctx, root: &Path, report: bool) -> ScanResult {
     if result.cancelled {
         info!(
             "Scan of {} cancelled after {} entries",
-            root.display(),
+            sanitize_path(root),
             result.entries
         );
         return result;
@@ -165,9 +170,9 @@ pub fn scan_root(ctx: &Ctx, root: &Path, report: bool) -> ScanResult {
         .map(|p| p.to_string_lossy().to_string())
         .collect();
     match db::sweep_stale(&c, &root.to_string_lossy(), &keep, scan_gen) {
-        Ok(n) if n > 0 => info!("Removed {n} stale entries under {}", root.display()),
+        Ok(n) if n > 0 => info!("Removed {n} stale entries under {}", sanitize_path(root)),
         Ok(_) => {}
-        Err(e) => error!("sweep {}: {e}", root.display()),
+        Err(e) => error!("sweep {}: {e}", sanitize_path(root)),
     }
     let _ = db::set_metadata(&c, &root_scan_key(root), &now_secs().to_string());
     if !report && !ctx.cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -188,7 +193,7 @@ pub fn scan_root(ctx: &Ctx, root: &Path, report: bool) -> ScanResult {
     );
     info!(
         "Scanned {}: {} entries, {} dirs, {} errors in {:.1}s{}",
-        root.display(),
+        sanitize_path(root),
         result.entries,
         result.dirs,
         result.errors,
@@ -202,7 +207,7 @@ pub fn scan_root(ctx: &Ctx, root: &Path, report: bool) -> ScanResult {
 /// Returns false if cancelled.
 pub fn live_reindex(ctx: &Ctx) -> bool {
     for root in &ctx.cfg.scan.roots {
-        info!("Scanning live root {}", root.display());
+        info!("Scanning live root {}", sanitize_path(root));
         if scan_root(ctx, root, true).cancelled {
             return false;
         }

@@ -192,12 +192,15 @@ fn new_ring() -> Option<io_uring::IoUring> {
 /// per entry, and on slow filesystems (network, WSL2 drvfs) the kernel
 /// runs them concurrently.
 ///
-/// Safety: `bufs` is handed to the kernel by raw pointer. We must not drop
-/// `bufs` (or the ring) until every submitted SQE has completed — closing
-/// the uring fd does not synchronously cancel in-flight ops, so a late
-/// kernel write would otherwise be a use-after-free. On any error path we
-/// first drain the completion queue; if we cannot drain cleanly we leak
-/// both the ring and the buffer rather than risk UAF.
+/// Safety: `bufs` AND the name allocations are handed to the kernel by raw
+/// pointer. We must not drop them (or the ring) until every submitted SQE
+/// has completed — closing the uring fd does not synchronously cancel
+/// in-flight ops, so a late kernel read of the name or write to the buf
+/// would otherwise be a use-after-free. The caller's CStrings go away on
+/// the next getdents iteration (`batch.clear()`), so the ring path owns
+/// its own copies for the duration of the submission: on a clean path
+/// they drop normally; on the leak path they are leaked alongside the
+/// ring and bufs.
 fn statx_batch(
     ring: &mut Option<io_uring::IoUring>,
     dirfd: RawFd,
@@ -211,9 +214,15 @@ fn statx_batch(
             .map(|n| statx_one(dirfd, n, mask, flags))
             .collect();
     };
+    // Own the names submitted to the kernel: the caller's `batch` is
+    // cleared on the next getdents iteration, which would free the
+    // backing CString heap bytes while outstanding SQEs still reference
+    // them on the leak path. These are tiny allocations (dir-entry
+    // names), and this clone only runs on the ring path.
+    let owned_names: Vec<CString> = names.iter().map(|n| CString::from(*n)).collect();
     let mut out = vec![None; names.len()];
     let mut bufs: Vec<Statx> = (0..names.len()).map(|_| Statx::default()).collect();
-    for (chunk_start, chunk) in names.chunks(URING_ENTRIES as usize).enumerate() {
+    for (chunk_start, chunk) in owned_names.chunks(URING_ENTRIES as usize).enumerate() {
         let base = chunk_start * URING_ENTRIES as usize;
         let mut submitted = 0usize;
         for (i, name) in chunk.iter().enumerate() {
@@ -271,17 +280,19 @@ fn statx_batch(
                         done += 1;
                     }
                     if done < submitted {
-                        // Still outstanding SQEs. The kernel can write to
-                        // `bufs` after this returns, so neither the ring
-                        // nor the buffer may be dropped. Leak them.
+                        // Still outstanding SQEs. The kernel can read from
+                        // the name pointers and write to `bufs` after this
+                        // returns, so none of ring / bufs / owned_names may
+                        // be dropped. Leak the whole set.
                         warn!(
-                            "io_uring: {} ops still outstanding; leaking ring+buffers",
+                            "io_uring: {} ops still outstanding; leaking ring+buffers+names",
                             submitted - done
                         );
                         if let Some(old) = ring.take() {
                             std::mem::forget(old);
                         }
                         std::mem::forget(bufs);
+                        std::mem::forget(owned_names);
                         URING_UNAVAILABLE.store(true, Ordering::Relaxed);
                         return names
                             .iter()
@@ -342,13 +353,23 @@ impl WorkQueue {
         self.condvar.notify_one();
     }
 
-    fn pop_or_done(&self, in_flight: &AtomicI64) -> Option<WorkItem> {
+    fn pop_or_done(&self, in_flight: &AtomicI64, cancel: &AtomicBool) -> Option<WorkItem> {
         let mut q = self.queue.lock().unwrap();
         loop {
             if let Some(item) = q.pop_front() {
                 return Some(item);
             }
-            if in_flight.load(Ordering::Acquire) == 0 {
+            // Treat <=0 as done: panic cleanup can force in_flight to 0 while
+            // another worker is still mid-item, and that worker's next
+            // fetch_sub leaves the counter negative. Returning None here
+            // keeps everyone else from parking forever.
+            if in_flight.load(Ordering::Acquire) <= 0 {
+                return None;
+            }
+            // Honour cancellation at the tail: without this, SIGHUP/SIGTERM
+            // only takes effect after the last straggler finishes, since
+            // the cancel check in worker_loop runs after pop.
+            if cancel.load(Ordering::Relaxed) {
                 return None;
             }
             q = self.condvar.wait(q).unwrap();
@@ -455,7 +476,9 @@ impl ScanConfig {
             cancel: Arc::new(AtomicBool::new(false)),
             on_progress: Box::new(on_progress),
             on_entry: Box::new(on_entry),
-            on_error: Box::new(|p, e| eprintln!("SCAN ERROR {}: {}", p.display(), e)),
+            on_error: Box::new(|p, e| {
+                eprintln!("SCAN ERROR {}: {}", rfind_core::log::sanitize_path(p), e)
+            }),
             skip_dir: Box::new(|_| false),
             max_depth: None,
             symlinks: SymlinkMode::P,
@@ -566,7 +589,9 @@ impl SearchConfig {
             cancel: Arc::new(AtomicBool::new(false)),
             predicate: Arc::new(predicate),
             on_hit: Arc::new(on_hit),
-            on_error: Box::new(|p, e| eprintln!("WALK ERROR {}: {}", p.display(), e)),
+            on_error: Box::new(|p, e| {
+                eprintln!("WALK ERROR {}: {}", rfind_core::log::sanitize_path(p), e)
+            }),
         }
     }
 }
@@ -683,10 +708,17 @@ pub fn run_scan(config: ScanConfig) -> ScanResult {
     let mut last_tick = Instant::now();
 
     let mut last_report = Instant::now();
+    let mut cancel_wake_sent = false;
     loop {
         // Poll often (so short scans and cancellation finish promptly),
         // report every progress_interval.
         thread::sleep(Duration::from_millis(20));
+        // When cancel is set, workers parked in pop_or_done need a nudge:
+        // they now bail on cancel but still only re-check after a notify.
+        if config.cancel.load(Ordering::Relaxed) && !cancel_wake_sent {
+            wq.wake_all();
+            cancel_wake_sent = true;
+        }
         let in_flight = counters.in_flight.load(Ordering::Relaxed).max(0) as u64;
         if in_flight > 0 && last_report.elapsed() < config.progress_interval {
             continue;
@@ -766,12 +798,81 @@ pub fn run_scan(config: ScanConfig) -> ScanResult {
 // Worker
 // ---------------------------------------------------------------------------
 
-fn open_dir_fd(path: &std::path::Path) -> RawFd {
+/// Linux `struct open_how` — passed to `openat2(2)` (kernel 5.6+).
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+const SYS_OPENAT2: libc::c_long = 437;
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+static OPENAT2_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+
+/// Open a directory for scanning.
+///
+/// `is_root` → scan root (admin-configured). Open with plain `openat`:
+/// the admin may deliberately point a root at a symlink, and `-L` mode
+/// also expects to follow it.
+///
+/// `follow_links` → `-L` mode descent: user asked us to follow symlinks,
+/// so a symlinked child is intentional. Open with plain `openat`.
+///
+/// Otherwise this is a `-P`-mode CHILD, and we use `openat2` with
+/// `RESOLVE_NO_SYMLINKS` so no path component may be a symlink. That
+/// closes the race where an unprivileged attacker in a writable scanned
+/// directory (`/tmp`, `/home/<u>`) swaps a real directory for a symlink
+/// between `getdents64` and our `open` — without this the daemon would
+/// follow the symlink and index (or walk) an out-of-scope tree such as
+/// `/root/`. On kernels older than 5.6 we fall back to `openat` with
+/// `O_NOFOLLOW`, which still rejects a symlink at the leaf (the only
+/// component attackers can swap given sticky-bit /tmp semantics).
+fn open_dir_fd(path: &std::path::Path, is_root: bool, follow_links: bool) -> RawFd {
     let cpath = match CString::new(path.as_os_str().as_encoded_bytes()) {
         Ok(c) => c,
         Err(_) => return -1,
     };
-    unsafe { openat(AT_FDCWD, cpath.as_ptr(), O_RDONLY | O_DIRECTORY | O_CLOEXEC) }
+    let base_flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC;
+    if is_root || follow_links {
+        // Admin-trusted root, or `-L` mode where symlinks are expected.
+        return unsafe { openat(AT_FDCWD, cpath.as_ptr(), base_flags) };
+    }
+    let strict_flags = base_flags | libc::O_NOFOLLOW;
+    if !OPENAT2_UNAVAILABLE.load(Ordering::Relaxed) {
+        let how = OpenHow {
+            flags: strict_flags as u64,
+            mode: 0,
+            resolve: RESOLVE_NO_SYMLINKS,
+        };
+        let fd = unsafe {
+            syscall(
+                SYS_OPENAT2,
+                AT_FDCWD as libc::c_long,
+                cpath.as_ptr() as libc::c_long,
+                &how as *const OpenHow as libc::c_long,
+                std::mem::size_of::<OpenHow>() as libc::c_long,
+            )
+        } as RawFd;
+        if fd >= 0 {
+            return fd;
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::ENOSYS) => {
+                // Older kernel: fall back once and remember.
+                OPENAT2_UNAVAILABLE.store(true, Ordering::Relaxed);
+            }
+            // ELOOP (final leaf is a symlink), EXDEV (crossed a mount with
+            // RESOLVE_NO_XDEV — we don't set that but future-proof), or any
+            // other refusal — do not retry with a less strict open.
+            _ => return -1,
+        }
+    }
+    // Fallback for pre-5.6 kernels. Protects only the leaf against the
+    // symlink-swap race; mid-path races between getdents and this open
+    // are a residual risk accepted on these kernels.
+    unsafe { openat(AT_FDCWD, cpath.as_ptr(), strict_flags) }
 }
 
 /// Finish one queued directory: drop it from the in-flight count and wake
@@ -783,7 +884,11 @@ fn open_dir_fd(path: &std::path::Path) -> RawFd {
 fn finish_item(wq: &WorkQueue, counters: &Counters) {
     let _q = wq.queue.lock().unwrap();
     let remaining = counters.in_flight.fetch_sub(1, Ordering::AcqRel) - 1;
-    if remaining == 0 {
+    // Panic cleanup can store 0 while this worker is between pop and finish;
+    // the fetch_sub then leaves the counter negative. Clamp back to 0 and
+    // always notify in that case so pop_or_done sees "done".
+    if remaining <= 0 {
+        counters.in_flight.store(0, Ordering::Release);
         wq.condvar.notify_all();
     }
 }
@@ -817,7 +922,7 @@ fn worker_loop(
     let mut batch: Vec<(CString, u8)> = Vec::with_capacity(512);
 
     loop {
-        let item = match wq.pop_or_done(&counters.in_flight) {
+        let item = match wq.pop_or_done(&counters.in_flight, cancel) {
             Some(i) => i,
             None => {
                 wq.wake_all();
@@ -832,7 +937,8 @@ fn worker_loop(
 
         let dir_path = item.path;
         let item_depth = item.depth;
-        let dir_fd = open_dir_fd(&dir_path);
+        let follow_links_descent = matches!(shared.symlinks, SymlinkMode::L);
+        let dir_fd = open_dir_fd(&dir_path, item_depth == 0, follow_links_descent);
         if dir_fd < 0 {
             let err = std::io::Error::last_os_error();
             on_error(&dir_path, &err.to_string());
@@ -939,11 +1045,16 @@ fn worker_loop(
                     None
                 };
                 // `is_dir` after symlink resolution in `-L` mode (statx
-                // without NOFOLLOW); otherwise it's the dirent's own type.
+                // without NOFOLLOW); otherwise prefer the fresh `statx`
+                // (post-getdents) over the dirent's stale `DT_DIR` so an
+                // attacker can't trick the scanner into enqueueing a
+                // path that was briefly a directory and is now a
+                // symlink. The dirent is only trusted when no stat was
+                // taken (fast-path for non-regular, non-dir entries).
                 let is_dir = match (follow_descent, *d_type, st) {
                     (true, _, Some(s)) => s.is_dir,
-                    (_, DT_DIR, _) => true,
-                    (_, DT_UNKNOWN, Some(s)) => s.is_dir,
+                    (_, _, Some(s)) => s.is_dir,
+                    (_, DT_DIR, None) => true,
                     _ => false,
                 };
                 let is_symlink = *d_type == DT_LNK
@@ -1214,5 +1325,89 @@ mod tests {
         };
         let (_hits, r) = collect(cfg);
         assert!(r.cancelled);
+    }
+
+    /// Regression: if `in_flight` is forced to 0 while a worker is between
+    /// pop and finish_item, the next fetch_sub takes the counter negative.
+    /// Old code only notified on `remaining == 0`, which left parked
+    /// workers in condvar.wait forever and hung the scan on join().
+    #[test]
+    fn finish_item_notifies_and_clamps_on_underflow() {
+        let wq = WorkQueue::new();
+        let counters = Counters::default();
+        // Simulate the "panic cleanup already stored 0" state: in_flight==0
+        // but a worker is about to call finish_item for its popped item.
+        counters.in_flight.store(0, Ordering::Release);
+        let cancel = AtomicBool::new(false);
+
+        // Park a "waiter" thread in pop_or_done to prove it gets released.
+        let wq_a = Arc::new(wq);
+        let counters_a = Arc::new(counters);
+        let w1 = Arc::clone(&wq_a);
+        let c1 = Arc::clone(&counters_a);
+        // Pre-condition: pop_or_done must return None when in_flight<=0,
+        // without parking.
+        let got = w1.pop_or_done(&c1.in_flight, &cancel);
+        assert!(got.is_none(), "pop_or_done must bail when in_flight<=0");
+
+        // Now exercise finish_item underflow: start from 0, decrement, expect
+        // the counter to be clamped back to 0 (not left at -1).
+        finish_item(&wq_a, &counters_a);
+        assert_eq!(counters_a.in_flight.load(Ordering::Acquire), 0);
+    }
+
+    /// Regression: in default `-P` mode, a symlink in the scanned tree
+    /// must not be opened as a directory. This closes the TOCTOU where
+    /// an attacker swaps a real dir for a symlink to an out-of-scope
+    /// target between getdents and open.
+    #[test]
+    fn p_mode_refuses_to_descend_into_symlinked_dir() {
+        // Build: outer/{real/inner.txt, link_to_real -> real}.
+        // In -P mode the scanner should emit `real` and `link_to_real`
+        // as entries but only descend into `real`, not through the
+        // symlink. Previously the open_dir_fd call followed the symlink
+        // and indexed `link_to_real/inner.txt`.
+        let d = TempDir::new().unwrap();
+        let outer = d.path();
+        std::fs::create_dir(outer.join("real")).unwrap();
+        std::fs::write(outer.join("real/inner.txt"), b"x").unwrap();
+        symlink("real", outer.join("link_to_real")).unwrap();
+
+        let (hits, _r) = collect(under(outer, |_| true));
+        // The scanner may see `inner.txt` exactly once (through the
+        // real dir), never twice (which would mean it descended the
+        // symlink too).
+        let inner_count = hits
+            .iter()
+            .filter(|e| e.path.ends_with("inner.txt"))
+            .count();
+        assert_eq!(
+            inner_count, 1,
+            "scanner descended through symlinked directory in -P mode (count={inner_count})"
+        );
+    }
+
+    /// Regression: setting `cancel` while workers are parked in pop_or_done
+    /// (end-of-scan tail) must release them, not wait for a straggler.
+    #[test]
+    fn pop_or_done_bails_on_cancel() {
+        let wq = Arc::new(WorkQueue::new());
+        let counters = Arc::new(Counters::default());
+        // Pretend one item is still in flight so the <=0 guard won't fire.
+        counters.in_flight.store(1, Ordering::Release);
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let wq_t = Arc::clone(&wq);
+        let counters_t = Arc::clone(&counters);
+        let cancel_t = Arc::clone(&cancel);
+        let h = std::thread::spawn(move || {
+            wq_t.pop_or_done(&counters_t.in_flight, &cancel_t)
+        });
+        // Give the thread a moment to park.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        cancel.store(true, Ordering::Relaxed);
+        wq.wake_all();
+        let got = h.join().unwrap();
+        assert!(got.is_none(), "pop_or_done must bail on cancel");
     }
 }

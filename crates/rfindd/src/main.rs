@@ -48,7 +48,7 @@ mod progress;
 mod scan;
 
 use rfind_config::{load as load_config, write_default, Config, DEFAULT_CONFIG_PATH};
-use rfind_core::{db, mounts, BackgroundScan, ScanProgress};
+use rfind_core::{db, log::sanitize_path, mounts, BackgroundScan, ScanProgress};
 use rfind_monitor::Monitor;
 use scan::{now_secs, periodic_paths, Ctx};
 use signal_hook::{
@@ -126,7 +126,7 @@ fn warn_drvfs_under_live_roots(cfg: &Config, mounts: &[mounts::MountEntry]) {
             warn!(
                 "{} is a Windows drive under a live root: inotify cannot see changes \
                  made from Windows. Add it to scan.periodic_roots (or scan.exclude).",
-                m.point.display()
+                sanitize_path(&m.point)
             );
         }
     }
@@ -305,6 +305,23 @@ fn acquire_pidfile(path: &Path) -> Result<std::fs::File, String> {
             path.display()
         ));
     }
+    // Verify the dentry still names the inode we locked. If an earlier
+    // instance's pidfile was unlinked (reinstall, admin `rm`, tmpfiles.d
+    // reap) and then re-created at the same path, our flock is on a dead
+    // inode and the next rfindd would flock the new one — two writers
+    // against a shared SQLite WAL and zvfs snapshot. Refuse to start.
+    use std::os::unix::fs::MetadataExt;
+    let on_disk = std::fs::metadata(path)
+        .map_err(|e| format!("cannot stat pidfile {} after flock: {e}", path.display()))?;
+    let locked = f
+        .metadata()
+        .map_err(|e| format!("cannot fstat pidfile {} after flock: {e}", path.display()))?;
+    if on_disk.ino() != locked.ino() || on_disk.dev() != locked.dev() {
+        return Err(format!(
+            "pidfile {} was unlinked/replaced after lock; refusing to start",
+            path.display()
+        ));
+    }
     // Overwrite with our pid.
     if let Err(e) = f.set_len(0) {
         return Err(format!("cannot truncate pidfile {}: {e}", path.display()));
@@ -340,27 +357,31 @@ fn on_mount_change(
         if aliases.contains(&m.point) {
             info!(
                 "New mount {} is a bind mount of indexed files; skipping",
-                m.point.display()
+                sanitize_path(&m.point)
             );
             continue;
         }
         if m.is_unmonitorable() {
             info!(
                 "New mount {} ({}): indexing once; not monitored live (consider scan.periodic_roots)",
-                m.point.display(),
+                sanitize_path(&m.point),
                 m.fstype
             );
         } else if let Some(mon) = monitor {
             match mon.add_filesystem(&m.point) {
                 Ok(true) => info!(
                     "New mount {} ({}): watching and indexing",
-                    m.point.display(),
+                    sanitize_path(&m.point),
                     m.fstype
                 ),
-                Ok(false) => info!("New mount {} ({}): indexing", m.point.display(), m.fstype),
+                Ok(false) => info!(
+                    "New mount {} ({}): indexing",
+                    sanitize_path(&m.point),
+                    m.fstype
+                ),
                 Err(e) => warn!(
                     "New mount {}: {e}; indexing without live updates",
-                    m.point.display()
+                    sanitize_path(&m.point)
                 ),
             }
         }
@@ -382,7 +403,10 @@ fn on_mount_change(
         // in, so it must go when they leave.
         if let Some(mon) = monitor {
             if mon.remove_filesystem(&m.point) {
-                info!("Unmounted {}: dropped fanotify mark", m.point.display());
+                info!(
+                    "Unmounted {}: dropped fanotify mark",
+                    sanitize_path(&m.point)
+                );
             }
         }
         if !ctx.cfg.scan.roots.iter().any(|r| m.point.starts_with(r))
@@ -393,7 +417,7 @@ fn on_mount_change(
         }
         info!(
             "Unmounted {}: rescanning the mount point",
-            m.point.display()
+            sanitize_path(&m.point)
         );
         if !queue.contains(&m.point) && !in_flight_match(&m.point) {
             queue.push_back(m.point.clone());
@@ -591,7 +615,7 @@ fn main() {
         if !m.is_drvfs() && m.point.is_dir() {
             info!(
                 "{} ({}) is indexed but not monitored live; consider scan.periodic_roots",
-                m.point.display(),
+                sanitize_path(&m.point),
                 m.fstype
             );
         }
@@ -674,6 +698,13 @@ fn main() {
     let mut mount_watch = mountwatch::MountWatch::new(&mount_table);
     let mut last_tick = Instant::now();
     let mut tick = 0u64;
+    // Debounce overflow-triggered re-indexes: a local attacker can fill the
+    // monitor sink or trigger FAN_Q_OVERFLOW with sustained touch/rm churn
+    // under any writable scanned path, which without this guard pins root
+    // I/O in a re-index loop. SIGUSR1 (forced) is admin-initiated and is
+    // never debounced.
+    const OVERFLOW_REINDEX_DEBOUNCE: Duration = Duration::from_secs(60);
+    let mut last_overflow_reindex: Option<Instant> = None;
     loop {
         // Short sleeps so shutdown and reload are prompt; work runs every 5s.
         thread::sleep(Duration::from_millis(200));
@@ -721,8 +752,21 @@ fn main() {
             reexec();
         }
 
-        let overflowed = monitor.as_ref().is_some_and(|m| m.take_overflow());
+        let overflowed_raw = monitor.as_ref().is_some_and(|m| m.take_overflow());
         let forced = force_reindex.swap(false, Ordering::Relaxed);
+        // Suppress overflow-only triggers that arrive within the debounce
+        // window; a forced trigger always wins.
+        let overflow_debounced = overflowed_raw
+            && !forced
+            && last_overflow_reindex
+                .is_some_and(|t| t.elapsed() < OVERFLOW_REINDEX_DEBOUNCE);
+        if overflow_debounced {
+            warn!(
+                "Event overflow during debounce window ({}s); dropping and will reconcile at next tick",
+                OVERFLOW_REINDEX_DEBOUNCE.as_secs()
+            );
+        }
+        let overflowed = overflowed_raw && !overflow_debounced;
         if forced {
             // Mark every periodic root due; the background queue picks
             // them up after the live re-index.
@@ -736,6 +780,9 @@ fn main() {
                 "Re-index triggered by {}",
                 if forced { "SIGUSR1" } else { "event overflow" }
             );
+            if overflowed {
+                last_overflow_reindex = Some(Instant::now());
+            }
             scan::live_reindex(&ctx);
             // This re-index already covers any SIGUSR1 that arrived while it ran.
             force_reindex.store(false, Ordering::Relaxed);
@@ -788,13 +835,16 @@ fn main() {
                     &conn,
                     &ctx.mode,
                     Some(BackgroundScan {
-                        path: root_clone.display().to_string(),
+                        // World-readable (0644), so any attacker-created
+                        // mount point's bytes land in `rfind status` output
+                        // and admin terminals. Sanitize before serializing.
+                        path: sanitize_path(&root_clone),
                         entries: 0,
                         started_at: now_secs() as u64,
                     }),
                 );
                 let handle = thread::spawn(move || {
-                    info!("Background scan of {}", root_clone.display());
+                    info!("Background scan of {}", sanitize_path(&root_clone));
                     scan::scan_root(&ctx, &root_clone, false);
                 });
                 bg = Some((root, handle));

@@ -201,7 +201,10 @@ impl FanotifyMonitor {
         });
         for (i, point) in mark_points.iter().enumerate() {
             match state.add(point) {
-                Ok(_) => info!("fanotify: watching filesystem at {}", point.display()),
+                Ok(_) => info!(
+                    "fanotify: watching filesystem at {}",
+                    rfind_core::log::sanitize_path(point)
+                ),
                 // Dropping `state` closes the fanotify fd.
                 Err(e) if i == 0 => return Err(e),
                 Err(e) => {
@@ -238,7 +241,7 @@ impl FanotifyMonitor {
                 // full re-index + restart on the next tick.
                 let _guard = AliveGuard(&a);
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    event_loop(&st, scope, &sink, &s, &o)
+                    event_loop(&st, scope, &sink, &s, o)
                 }));
                 if r.is_err() {
                     error!("fanotify event loop panicked; marking monitor dead");
@@ -330,7 +333,9 @@ fn init_fanotify() -> Result<(RawFd, bool), FanotifyError> {
 }
 
 fn mark_filesystem(fd: RawFd, point: &Path, mask: u64) -> Result<MarkedFs, FanotifyError> {
-    let err = |e: i32| FanotifyError::Mark(point.display().to_string(), e, strerror(e));
+    let err = |e: i32| {
+        FanotifyError::Mark(rfind_core::log::sanitize_path(point), e, strerror(e))
+    };
     let c = CString::new(point.as_os_str().as_encoded_bytes()).map_err(|_| err(libc::EINVAL))?;
     if unsafe {
         fanotify_mark(
@@ -469,7 +474,7 @@ fn event_loop(
     scope: Arc<Scope>,
     sink: &EventSink,
     stop: &AtomicBool,
-    overflow: &AtomicBool,
+    overflow: Arc<AtomicBool>,
 ) {
     const BUF: usize = 65536;
     let mut buf = vec![0u8; BUF];
@@ -489,9 +494,27 @@ fn event_loop(
     let walker = {
         let sc = Arc::clone(&scope);
         let sk = sink.clone();
+        let overflow_for_walker = Arc::clone(&overflow);
         thread::spawn(move || {
             while let Ok((path, is_dir)) = walk_rx.recv() {
-                moved_in(&sk, &sc, &path, is_dir);
+                // Without this guard, a single panic in moved_in (e.g. a
+                // transient scope lock poison, or an OS error inside
+                // read_dir that panics on an older libstd) silently kills
+                // the walker. The event thread would keep running — and
+                // every FAN_CREATE|FAN_ONDIR afterwards would queue
+                // forever in the unbounded channel while the index drifts
+                // behind the filesystem. Promote to overflow instead; the
+                // next tick forces a reconcile.
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    moved_in(&sk, &sc, &path, is_dir);
+                }));
+                if r.is_err() {
+                    error!(
+                        "fanotify walker panicked on {}; scheduling rescan",
+                        rfind_core::log::sanitize_path(&path)
+                    );
+                    overflow_for_walker.store(true, Ordering::Relaxed);
+                }
             }
         })
     };
@@ -598,7 +621,13 @@ fn event_loop(
 
 /// An entry appeared by moving: journal it and, for a directory, its
 /// contents (they were indexed under the old path, or not at all).
+///
+/// Uses symlink-safe reads: between FAN_CREATE|FAN_ONDIR and this
+/// descent, an attacker who owns the parent could swap the new entry
+/// for a symlink to an out-of-scope target. `read_dir_safe` rejects
+/// any symlinked component.
 fn moved_in(sink: &EventSink, scope: &Scope, path: &Path, is_dir: bool) {
+    use crate::safewalk::read_dir_safe;
     let lossy = |p: &Path| p.to_string_lossy().to_string();
     sink.send(EventType::Create, lossy(path), None, is_dir);
     if !is_dir {
@@ -606,9 +635,12 @@ fn moved_in(sink: &EventSink, scope: &Scope, path: &Path, is_dir: bool) {
     }
     let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        let Ok(rd) = read_dir_safe(&dir) else {
+            continue;
+        };
         for entry in rd.flatten() {
-            let p = entry.path();
+            // Reconstruct from the real dir — see watch_new_tree.
+            let p = dir.join(entry.file_name());
             if !scope.contains(&p) {
                 continue;
             }

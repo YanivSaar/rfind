@@ -70,6 +70,11 @@ pub const KEYS: &[(&str, Kind, &str)] = &[
         Kind::Bool,
         "batch statx calls through io_uring when available",
     ),
+    (
+        "scan.max_depth",
+        Kind::Int,
+        "max directory depth to descend; 0 = unbounded",
+    ),
     ("index.db_path", Kind::Path, "index database location"),
     (
         "index.batch_size",

@@ -42,6 +42,11 @@ pub struct ScanConfig {
     /// Batch the scanner's statx calls through io_uring when the kernel
     /// allows it (falls back to plain syscalls otherwise).
     pub io_uring: bool,
+    /// Maximum directory depth to descend during a scan. Protects against
+    /// symlink loops and pathologically deep trees in writable roots.
+    /// 4096 is well past any real-world layout and in line with
+    /// PATH_MAX-era kernel limits; set to 0 to disable (unbounded).
+    pub max_depth: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -123,6 +128,7 @@ impl Default for ScanConfig {
             reindex_interval_hours: 6,
             collect_mtime: true,
             io_uring: true,
+            max_depth: 4096,
         }
     }
 }
@@ -239,6 +245,9 @@ impl Config {
         }
         if self.scan.workers > 1024 {
             err("scan.workers must be at most 1024 (0 = one per CPU)".into());
+        }
+        if self.scan.max_depth > 1_000_000 {
+            err("scan.max_depth must be at most 1,000,000 (0 = unbounded)".into());
         }
         if self.search.threads > 1024 {
             err("search.threads must be at most 1024 (0 = cores × 2)".into());

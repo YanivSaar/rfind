@@ -593,6 +593,7 @@ dependencies = [
  "libc",
  "rfind-core",
  "rusqlite",
+ "tempfile",
  "thiserror",
  "tracing",
 ]
