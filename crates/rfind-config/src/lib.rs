@@ -148,7 +148,12 @@ impl Default for MonitorConfig {
         Self {
             prefer_fanotify: true,
             inotify_fallback: true,
-            watch_new_mounts: true,
+            // Off by default: on kernels with unprivileged FUSE, an
+            // attacker-created mount under a live root would otherwise
+            // trigger a root-owned one-shot indexing walk of a filesystem
+            // the attacker controls (pathological getdents64 responses,
+            // crafted filenames). Admin opt-in only.
+            watch_new_mounts: false,
         }
     }
 }

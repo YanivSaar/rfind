@@ -71,6 +71,10 @@ struct Watches {
     map: Mutex<HashMap<i32, PathBuf>>,
     excludes: Vec<PathBuf>,
     limit_warned: AtomicBool,
+    /// Shared with the event loop. On ENOSPC we flip it so the next
+    /// daemon tick re-indexes rather than silently losing events in
+    /// newly-created directories we can't watch any more.
+    overflow: Arc<AtomicBool>,
 }
 
 /// Poison-tolerant lock on the wd→path map: a transient panic in a holder
@@ -108,15 +112,20 @@ impl Watches {
             return;
         }
         let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::ENOSPC)
-            && !self.limit_warned.swap(true, Ordering::Relaxed)
-        {
-            warn!(
-                "inotify watch limit reached at {} watches — changes in unwatched \
-                 directories will be missed. Raise fs.inotify.max_user_watches, or \
-                 move large trees to scan.periodic_roots.",
-                lock_map(&self.map).len()
-            );
+        if err.raw_os_error() == Some(libc::ENOSPC) {
+            // Promote to overflow so the next daemon tick re-indexes.
+            // Without this, every directory created after the limit is
+            // reached is silently unwatched: good hiding spot for an
+            // attacker (drop files that never make it into the index).
+            self.overflow.store(true, Ordering::Relaxed);
+            if !self.limit_warned.swap(true, Ordering::Relaxed) {
+                warn!(
+                    "inotify watch limit reached at {} watches — changes in unwatched \
+                     directories will be missed. Scheduling a rescan. \
+                     Raise fs.inotify.max_user_watches, or move large trees to scan.periodic_roots.",
+                    lock_map(&self.map).len()
+                );
+            }
         }
     }
 
@@ -208,11 +217,13 @@ impl InotifyMonitor {
         if fd < 0 {
             return Err(InotifyError::Init(std::io::Error::last_os_error()));
         }
+        let overflow = Arc::new(AtomicBool::new(false));
         let watches = Arc::new(Watches {
             fd,
             map: Mutex::new(HashMap::new()),
             excludes,
             limit_warned: AtomicBool::new(false),
+            overflow: Arc::clone(&overflow),
         });
 
         for dir in &dirs {
@@ -221,7 +232,6 @@ impl InotifyMonitor {
 
         let (sink, writer) = sink;
         let stop = Arc::new(AtomicBool::new(false));
-        let overflow = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(true));
         let sink_for_take = sink.clone();
         let handle = {
@@ -488,7 +498,7 @@ fn expire_moves(watches: &Watches, sink: &EventSink, moves: &mut HashMap<u32, Pe
 /// for a symlink to an out-of-scope target like `/root/` before we
 /// descend. `read_dir_safe` fails that `openat2` and we skip the subtree.
 fn watch_new_tree(watches: &Watches, sink: &EventSink, root: &Path) {
-    use crate::safewalk::read_dir_safe;
+    use rfind_core::safewalk::read_dir_safe;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         watches.add(&dir);

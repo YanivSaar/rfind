@@ -10,7 +10,6 @@
 
 mod fanotify;
 mod inotify;
-mod safewalk;
 mod sink;
 
 pub use fanotify::FanotifyMonitor;

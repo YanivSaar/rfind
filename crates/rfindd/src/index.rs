@@ -3,10 +3,10 @@
 use crate::lock;
 use rfind_config::Config;
 use rfind_core::db::{self, EventType};
+use rfind_core::safewalk::stat_safe;
 use rfind_scanner::EntryInfo;
 use rusqlite::Connection;
 use std::{
-    fs,
     os::unix::fs::MetadataExt,
     path::Path,
     sync::{Arc, Mutex},
@@ -52,12 +52,20 @@ pub fn is_excluded(cfg: &Config, path: &Path) -> bool {
 }
 
 /// Make the index agree with the filesystem for one path.
+///
+/// Uses `stat_safe` so no parent component may be a symlink: previously
+/// `fs::symlink_metadata` only AT_SYMLINK_NOFOLLOW'd the leaf, letting
+/// an attacker who owned an ancestor directory of a monitored path
+/// redirect the replay stat to a different file. On ELOOP (any component
+/// is a symlink), treat the entry as absent and delete it from the
+/// index — the daemon should not record metadata for attacker-redirected
+/// paths.
 pub fn sync_path(conn: &Connection, cfg: &Config, path: &str) -> rusqlite::Result<()> {
     let p = Path::new(path);
     if is_excluded(cfg, p) {
         return Ok(());
     }
-    match fs::symlink_metadata(p) {
+    match stat_safe(p) {
         Ok(md) => db::insert_entry(
             conn,
             path,
@@ -68,6 +76,10 @@ pub fn sync_path(conn: &Connection, cfg: &Config, path: &str) -> rusqlite::Resul
             None,
         ),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            db::delete_entries_under(conn, path).map(|_| ())
+        }
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            // Attacker-redirected: treat as absent.
             db::delete_entries_under(conn, path).map(|_| ())
         }
         // Permission errors etc.: leave the index as it is.

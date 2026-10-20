@@ -19,7 +19,6 @@
 use std::ffi::CString;
 use std::fs;
 use std::io;
-use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::io::RawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -53,6 +52,56 @@ pub fn read_dir_safe(path: &Path) -> io::Result<fs::ReadDir> {
         libc::close(fd);
     }
     rd
+}
+
+/// Stat a path so that no component may be a symlink, including parent
+/// components. The daemon's journal replay previously called
+/// `fs::symlink_metadata`, which only `AT_SYMLINK_NOFOLLOW`s the leaf —
+/// an attacker who owns an ancestor directory could redirect the stat
+/// mid-replay. This variant uses `openat2(RESOLVE_NO_SYMLINKS)` plus
+/// `fstatat(..., AT_EMPTY_PATH)` on the resulting fd.
+pub fn stat_safe(path: &Path) -> io::Result<fs::Metadata> {
+    // Open with any-file semantics via O_PATH so a non-dir leaf also
+    // works (sync_path has to handle files and dirs).
+    let cpath = CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let base_flags = libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    let fd = if !OPENAT2_UNAVAILABLE.load(Ordering::Relaxed) {
+        let how = OpenHow {
+            flags: base_flags as u64,
+            mode: 0,
+            resolve: RESOLVE_NO_SYMLINKS,
+        };
+        let fd = unsafe {
+            libc::syscall(
+                SYS_OPENAT2,
+                libc::AT_FDCWD as libc::c_long,
+                cpath.as_ptr() as libc::c_long,
+                &how as *const OpenHow as libc::c_long,
+                std::mem::size_of::<OpenHow>() as libc::c_long,
+            )
+        } as RawFd;
+        if fd >= 0 {
+            fd
+        } else {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::ENOSYS) {
+                OPENAT2_UNAVAILABLE.store(true, Ordering::Relaxed);
+                unsafe { libc::openat(libc::AT_FDCWD, cpath.as_ptr(), base_flags) }
+            } else {
+                return Err(e);
+            }
+        }
+    } else {
+        unsafe { libc::openat(libc::AT_FDCWD, cpath.as_ptr(), base_flags) }
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd is a valid open file descriptor. From_raw_fd takes
+    // ownership and will close it on drop; .metadata() uses fstat.
+    let f = unsafe { <fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    f.metadata()
 }
 
 fn open_dir_strict(path: &Path) -> io::Result<RawFd> {

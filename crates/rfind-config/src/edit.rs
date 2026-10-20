@@ -347,19 +347,44 @@ pub fn check_text(path: &Path, text: &str) -> Result<Vec<Problem>, EditError> {
 /// is durable: without it, a hard crash can leave the pre-edit file in
 /// place even though `rfind config set …` returned success.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), EditError> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let err = |e| EditError::Write(path.to_path_buf(), e);
     let dir = path.parent().unwrap_or(Path::new("/"));
     fs::create_dir_all(dir).map_err(err)?;
-    let tmp = dir.join(format!(
+    // Random suffix so a pre-seeded symlink at ".<name>.tmp" cannot be
+    // the exact file we open (`create_new` fails on EEXIST and we
+    // retry). O_NOFOLLOW prevents following a symlink regardless.
+    let base = format!(
         ".{}.tmp",
         path.file_name().unwrap_or_default().to_string_lossy()
-    ));
-    let mut f = fs::File::create(&tmp).map_err(err)?;
+    );
+    let mut tmp = dir.join(&base);
+    let mut f = loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .mode(0o640)
+            .open(&tmp)
+        {
+            Ok(f) => break f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Add a short random suffix and retry; 8 hex chars of
+                // nanos+pid is plenty for a per-admin edit flow.
+                let r = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos())
+                    .unwrap_or(0)
+                    ^ std::process::id();
+                tmp = dir.join(format!("{base}.{r:08x}"));
+            }
+            Err(e) => return Err(err(e)),
+        }
+    };
     f.write_all(bytes).and_then(|_| f.sync_all()).map_err(err)?;
-    // 0o640: owner (root) read/write, group read, world none. The config
-    // lists excluded paths and roots which routinely include sensitive
-    // directories, so world-readable (0o644) was wrong.
+    // 0o640 is already set via mode() above, but set_permissions also
+    // handles the (unusual) case where umask or an inherited ACL
+    // altered the final mode.
     fs::set_permissions(&tmp, fs::Permissions::from_mode(0o640)).map_err(err)?;
     fs::rename(&tmp, path).map_err(err)?;
     // Fsync the directory so the rename survives a crash. Opening the

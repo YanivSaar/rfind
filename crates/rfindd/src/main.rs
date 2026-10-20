@@ -343,6 +343,14 @@ fn on_mount_change(
         .into_iter()
         .map(|(a, _)| a)
         .collect();
+    // FUSE-family fstypes can be mounted by unprivileged users (fusermount3,
+    // user-ns + mount), so a mount appearing under a live root may be
+    // attacker-controlled. The root-owned indexer would walk it, exposing
+    // us to pathological getdents64 responses, crafted filenames, and
+    // slow responses that hang scanner threads. Reject by default.
+    let is_fuse_family = |t: &str| {
+        t == "fuse" || t.starts_with("fuse.") || t == "fuseblk" || t == "fusectl"
+    };
     let relevant = |m: &mounts::MountEntry| {
         ctx.cfg.scan.roots.iter().any(|r| m.point.starts_with(r))
             && !index::is_excluded(&ctx.cfg, &m.point)
@@ -351,6 +359,7 @@ fn on_mount_change(
                 .any(|p| m.point.starts_with(p))
             && !m.is_pseudo()
             && !matches!(m.fstype.as_str(), "overlay" | "squashfs")
+            && !is_fuse_family(m.fstype.as_str())
             && m.point.is_dir()
     };
     for m in changes.added.iter().filter(|m| relevant(m)) {

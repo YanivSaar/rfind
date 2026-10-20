@@ -378,6 +378,16 @@ fn resolve(rec: &[u8], marked: &RwLock<Vec<MarkedFs>>) -> Option<PathBuf> {
     };
     let fsid = [i32_at(4)?, i32_at(8)?];
     let handle_bytes = i32_at(12)? as u32 as usize;
+    // MAX_HANDLE_SZ is 128 on every current kernel. A larger value is
+    // either kernel corruption, an unusual filesystem, or a crafted
+    // record from a tampered journal; in all three cases allocating
+    // handle_bytes bytes and then passing them to open_by_handle_at
+    // under CAP_DAC_READ_SEARCH is strictly worse than dropping the
+    // event, so cap defensively.
+    const MAX_HANDLE_SZ: usize = 128;
+    if handle_bytes > MAX_HANDLE_SZ {
+        return None;
+    }
     let handle_end = 20 + handle_bytes;
     if rec.len() < handle_end {
         return None;
@@ -627,7 +637,7 @@ fn event_loop(
 /// for a symlink to an out-of-scope target. `read_dir_safe` rejects
 /// any symlinked component.
 fn moved_in(sink: &EventSink, scope: &Scope, path: &Path, is_dir: bool) {
-    use crate::safewalk::read_dir_safe;
+    use rfind_core::safewalk::read_dir_safe;
     let lossy = |p: &Path| p.to_string_lossy().to_string();
     sink.send(EventType::Create, lossy(path), None, is_dir);
     if !is_dir {

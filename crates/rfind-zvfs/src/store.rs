@@ -215,8 +215,22 @@ impl Store {
         if crc32fast::hash(body) != u32_at(b.len() - 4) {
             return; // never happens with rename-based writes; be safe anyway
         }
-        let n = u64_at(32) as usize;
-        if 40 + n * 12 + 4 != b.len() {
+        // The snapshot file is 0600 root-owned, so this is defense in
+        // depth, but `n * 12` wraps silently in release and a crafted
+        // `-zmap` with `n ≈ u64::MAX / 12` plus a matching `b.len()`
+        // would pass the equality check and OOB-panic on the map build.
+        let n = u64_at(32);
+        if n > (1u64 << 30) {
+            return;
+        }
+        let n = n as usize;
+        let Some(need) = n
+            .checked_mul(12)
+            .and_then(|v| v.checked_add(44))
+        else {
+            return;
+        };
+        if need != b.len() {
             return;
         }
         self.page_size = u32_at(8);

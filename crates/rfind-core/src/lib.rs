@@ -2,6 +2,7 @@ pub mod db;
 pub mod filters;
 pub mod log;
 pub mod mounts;
+pub mod safewalk;
 
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;

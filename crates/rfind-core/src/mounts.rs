@@ -105,11 +105,16 @@ fn unescape(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
+        // Operate on &[u8], not &str: slicing &s[i+1..i+4] can panic
+        // if the window straddles a UTF-8 continuation byte (seen on
+        // FUSE and user-namespace mounts with unusual labels).
         if b[i] == b'\\' && i + 3 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 4], 8) {
-                out.push(v);
-                i += 4;
-                continue;
+            if let Ok(digits) = std::str::from_utf8(&b[i + 1..i + 4]) {
+                if let Ok(v) = u8::from_str_radix(digits, 8) {
+                    out.push(v);
+                    i += 4;
+                    continue;
+                }
             }
         }
         out.push(b[i]);
@@ -228,6 +233,24 @@ mod tests {
             .into_iter()
             .map(|(a, c)| (a.display().to_string(), c.display().to_string()))
             .collect()
+    }
+
+    #[test]
+    fn unescape_does_not_panic_on_multibyte_boundary() {
+        // Octal escape sequence "\0a" followed by a 3-byte UTF-8
+        // character — the window s[i+1..i+4] would straddle the
+        // multibyte boundary and panic with the old str-slicing code.
+        // The incomplete escape should be left alone and the rest
+        // passed through.
+        let input = "\\0中";
+        let out = unescape(input);
+        assert!(out.contains('中'));
+    }
+
+    #[test]
+    fn unescape_decodes_valid_octal() {
+        // "\040" is a space (0o40 = 32 = ' ').
+        assert_eq!(unescape(r"foo\040bar"), "foo bar");
     }
 
     #[test]

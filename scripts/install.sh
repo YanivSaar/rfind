@@ -141,10 +141,21 @@ download() {
 
     # Sigstore (cosign) verification: tarballs tagged v* carry .sig + .pem
     # issued by the Release workflow via GitHub OIDC. The sha256 above only
-    # proves the two files were fetched together; cosign proves the tarball
-    # was built by *our* workflow on *our* repo. Use it when available.
+    # proves the two files were fetched together (both come from the same
+    # release bucket): a compromise of the release path replaces them
+    # together and the sha check becomes a tautology. cosign proves the
+    # tarball was built by *our* workflow on *our* repo, so we require it
+    # by default and let the caller opt out explicitly.
     local verified_by="sha256"
-    if command -v cosign >/dev/null 2>&1; then
+    local require_cosign=${RFIND_REQUIRE_COSIGN:-1}
+    if ! command -v cosign >/dev/null 2>&1; then
+        if [ "$require_cosign" = "1" ]; then
+            die "cosign is required to verify provenance. Install it (e.g. apt install cosign, \
+or https://docs.sigstore.dev/system_config/installation), or re-run with RFIND_REQUIRE_COSIGN=0 \
+to accept sha256-only verification (not recommended)."
+        fi
+        warn "cosign not installed and RFIND_REQUIRE_COSIGN=0; falling back to sha256 only"
+    else
         if curl -fsSL "$base/$asset.sig" -o "$WORK/$asset.sig" 2>/dev/null \
            && curl -fsSL "$base/$asset.pem" -o "$WORK/$asset.pem" 2>/dev/null; then
             if cosign verify-blob \
@@ -159,10 +170,13 @@ download() {
                 die "cosign signature check failed for $asset"
             fi
         else
+            if [ "$require_cosign" = "1" ]; then
+                die "no sigstore signature published for this release and \
+RFIND_REQUIRE_COSIGN=1 (default). Re-run with RFIND_REQUIRE_COSIGN=0 to accept \
+sha256-only verification, or wait for a signed release."
+            fi
             warn "cosign installed but no signature published for this release"
         fi
-    else
-        warn "cosign not installed; falling back to sha256 only (install cosign for provenance)"
     fi
 
     tar xzf "$WORK/$asset" -C "$WORK"

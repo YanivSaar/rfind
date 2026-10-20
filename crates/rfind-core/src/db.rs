@@ -629,32 +629,32 @@ pub fn rename_entry(conn: &Connection, old: &str, new: &str) -> Result<usize> {
 /// one dropped. Wrap the body in `catch_unwind` and convert a panic to a
 /// soft error that `with_savepoint` can roll back.
 fn collect_garbage(conn: &Connection) -> Result<()> {
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        conn.execute_batch(
-            "
-            DROP TABLE IF EXISTS _reachable;
-            CREATE TEMP TABLE _reachable (id INTEGER PRIMARY KEY);
-            WITH RECURSIVE anc(id) AS (
-                SELECT DISTINCT dir_id FROM entries
-                UNION
-                SELECT d.parent FROM dirs d JOIN anc ON d.id = anc.id
-                    WHERE d.parent IS NOT NULL
-            )
-            INSERT INTO _reachable (id) SELECT id FROM anc;
-            INSERT OR IGNORE INTO _reachable (id) VALUES (1);
-            DELETE FROM dirs WHERE id NOT IN (SELECT id FROM _reachable);
-            DROP TABLE _reachable;
-            DELETE FROM names
-              WHERE id NOT IN (SELECT name_id FROM entries)
-                AND id NOT IN (SELECT name_id FROM dirs WHERE name_id IS NOT NULL);
-            ",
+    // Previously wrapped in `catch_unwind` to tolerate a REGEXP callback
+    // panic. That is UB: rusqlite callbacks run inside the SQLite C
+    // library, and a Rust unwind through non-`extern "C-unwind"` C
+    // frames is undefined behavior. Instead the REGEXP binding below
+    // converts its own panics to `UserFunctionError`, so a bad regex
+    // comes back as a normal `Result::Err` and `with_savepoint` rolls
+    // back cleanly without an unwind ever reaching SQLite.
+    conn.execute_batch(
+        "
+        DROP TABLE IF EXISTS _reachable;
+        CREATE TEMP TABLE _reachable (id INTEGER PRIMARY KEY);
+        WITH RECURSIVE anc(id) AS (
+            SELECT DISTINCT dir_id FROM entries
+            UNION
+            SELECT d.parent FROM dirs d JOIN anc ON d.id = anc.id
+                WHERE d.parent IS NOT NULL
         )
-    }));
-    match r {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(rusqlite::Error::ExecuteReturnedResults),
-    }
+        INSERT INTO _reachable (id) SELECT id FROM anc;
+        INSERT OR IGNORE INTO _reachable (id) VALUES (1);
+        DELETE FROM dirs WHERE id NOT IN (SELECT id FROM _reachable);
+        DROP TABLE _reachable;
+        DELETE FROM names
+          WHERE id NOT IN (SELECT name_id FROM entries)
+            AND id NOT IN (SELECT name_id FROM dirs WHERE name_id IS NOT NULL);
+        ",
+    )
 }
 
 /// Integer list for an SQL `IN (...)`, from typed ids (injection-safe).
