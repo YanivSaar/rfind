@@ -69,23 +69,23 @@ if [ $UNINSTALL -eq 1 ]; then
     # this hang: `systemctl stop --no-block`, poll for exit, then SIGTERM,
     # then SIGKILL.
     step "Uninstalling rfind"
+    # Grace: 5 s with --purge (we're nuking the index anyway, no reason to
+    # wait for a clean flush), 30 s without (scanner needs several seconds
+    # to cancel in-flight work on slow mounts like WSL2 /mnt/c).
     stop_rfindd() {
-        local pid
+        local pid grace
         pid=$(cat /run/rfindd/rfindd.pid 2>/dev/null || true)
+        grace=$( [ $PURGE -eq 1 ] && echo 50 || echo 300 )  # 100ms ticks
         if [ $HAS_SYSTEMD -eq 1 ] && [ -f "$UNIT" ]; then
             systemctl disable rfindd 2>/dev/null || true
             systemctl stop --no-block rfindd 2>/dev/null || true
         fi
-        # 30 s grace for systemd's own SIGTERM to run its course. The daemon
-        # may need several seconds to cancel an in-flight scan (notably on
-        # WSL2 /mnt/c). Only after that do we SIGKILL. We do NOT send a
-        # second SIGTERM: systemctl stop already did.
         [ -z "$pid" ] && return 0
-        for _ in $(seq 1 300); do
+        for _ in $(seq 1 "$grace"); do
             kill -0 "$pid" 2>/dev/null || return 0
             sleep 0.1
         done
-        echo "install.sh: rfindd (pid $pid) still running 30s after systemctl stop; sending SIGKILL" >&2
+        echo "install.sh: rfindd (pid $pid) still running after systemctl stop; sending SIGKILL" >&2
         kill -KILL "$pid" 2>/dev/null || true
         for _ in $(seq 1 30); do
             kill -0 "$pid" 2>/dev/null || return 0
@@ -95,7 +95,12 @@ if [ $UNINSTALL -eq 1 ]; then
     }
     stop_rfindd
     if [ $HAS_SYSTEMD -eq 1 ] && [ -f "$UNIT" ]; then
-        rm -f "$UNIT"; systemctl daemon-reload
+        rm -f "$UNIT"
+        systemctl daemon-reload
+        # Clear systemd's cached failed-unit state so `systemctl status
+        # rfindd` doesn't keep showing `× rfindd.service … Active: failed`
+        # after the unit file is gone.
+        systemctl reset-failed rfindd 2>/dev/null || true
     fi
     rm -f "$BIN_DIR/rfindd" "$SHARE"/man/man1/rfind.1 "$SHARE"/man/man5/rfind.conf.5 "$SHARE"/man/man8/rfindd.8 \
           "$SHARE"/bash-completion/completions/rfind "$SHARE"/zsh/site-functions/_rfind \
@@ -202,6 +207,72 @@ build_from_source() {
     ok "built rfindd and rfind"
 }
 
+# ── Preflight: existing installation ──────────────────────────────────────────
+# Running the installer twice should not hang. The old behaviour used
+# `systemctl stop rfindd`, which blocks up to TimeoutStopSec (90 s default)
+# waiting for the daemon to exit — on WSL2 /mnt/c scans we have seen that
+# take 30 s. Detect the previous install up front, show its state, and let
+# the user pick: upgrade in place (keep index and config) or purge and
+# reinstall fresh. Non-interactive runs (curl | sudo bash) default to
+# upgrade.
+MODE=upgrade  # upgrade | fresh
+if [ -x "$BIN_DIR/rfind" ] || [ -x "$BIN_DIR/rfindd" ] || [ -f "$UNIT" ]; then
+    step "Existing rfind installation detected"
+    if [ -x "$BIN_DIR/rfind" ]; then
+        INSTALLED_VER=$("$BIN_DIR/rfind" --version 2>/dev/null || echo 'rfind ?')
+        ok "binary:  $BIN_DIR/rfind ($INSTALLED_VER)"
+    fi
+    [ -x "$BIN_DIR/rfindd" ] && ok "daemon:  $BIN_DIR/rfindd"
+    [ -f "$UNIT" ]           && ok "unit:    $UNIT"
+    [ -f "$CONFIG" ]         && ok "config:  $CONFIG"
+    if [ -d /var/lib/rfindd ]; then
+        SIZE=$(du -sh /var/lib/rfindd 2>/dev/null | awk '{print $1}')
+        ok "index:   /var/lib/rfindd${SIZE:+ ($SIZE)}"
+    fi
+    if [ $HAS_SYSTEMD -eq 1 ] && systemctl is-active --quiet rfindd 2>/dev/null; then
+        PID=$(cat /run/rfindd/rfindd.pid 2>/dev/null || echo '?')
+        ok "state:   running (pid $PID)"
+    elif [ $HAS_SYSTEMD -eq 1 ] && [ -f "$UNIT" ]; then
+        ok "state:   stopped"
+    fi
+
+    if [ -t 0 ]; then
+        printf '\n%sWhat would you like to do?%s\n' "$B" "$R"
+        printf '  %s[U]%s Upgrade in place  — keep index and config (default)\n' "$G" "$R"
+        printf '  %s[P]%s Purge and reinstall — removes index AND config\n' "$Y" "$R"
+        printf '  %s[C]%s Cancel\n' "$RD" "$R"
+        printf 'Choice [U/p/c]: '
+        read -r CHOICE
+        case "${CHOICE:-U}" in
+            u|U|'') MODE=upgrade ;;
+            p|P)    MODE=fresh ;;
+            c|C)    die "cancelled" ;;
+            *)      die "unknown choice: $CHOICE" ;;
+        esac
+    else
+        warn "non-interactive — upgrading in place (keep index and config)"
+        warn "to force a fresh install, run: sudo rfind uninstall --purge first"
+    fi
+
+    if [ "$MODE" = fresh ]; then
+        step "Purging existing installation first"
+        if [ -x "$BIN_DIR/rfind" ]; then
+            "$BIN_DIR/rfind" uninstall --yes --purge
+        else
+            warn "no rfind binary found; cleaning up by hand"
+            if [ $HAS_SYSTEMD -eq 1 ] && [ -f "$UNIT" ]; then
+                systemctl disable rfindd 2>/dev/null || true
+                systemctl stop --no-block rfindd 2>/dev/null || true
+                rm -f "$UNIT"
+                systemctl daemon-reload
+                systemctl reset-failed rfindd 2>/dev/null || true
+            fi
+            rm -rf /var/lib/rfindd /etc/rfindd /run/rfindd
+        fi
+        ok "purged"
+    fi
+fi
+
 if [ $IN_CLONE -eq 1 ] || [ "$RFIND_FROM_SOURCE" = 1 ]; then
     build_from_source
 elif ! download; then
@@ -212,8 +283,34 @@ fi
 # ── Install ───────────────────────────────────────────────────────────────────
 step "Installing"
 WAS_RUNNING=0
-if [ $HAS_SYSTEMD -eq 1 ] && systemctl is-active --quiet rfindd; then
-    WAS_RUNNING=1; systemctl stop rfindd
+# Stop the running daemon before overwriting its binary, using the same
+# non-blocking escalation ladder as `rfind uninstall` so a slow shutdown
+# cannot hang the installer. `systemctl stop` on its own blocks up to
+# TimeoutStopSec (90s) — hence --no-block + poll + SIGKILL fallback.
+if [ $HAS_SYSTEMD -eq 1 ] && systemctl is-active --quiet rfindd 2>/dev/null; then
+    WAS_RUNNING=1
+    PID=$(cat /run/rfindd/rfindd.pid 2>/dev/null || true)
+    ok "stopping running rfindd${PID:+ (pid $PID)} before overwrite"
+    systemctl stop --no-block rfindd 2>/dev/null || true
+    if [ -n "$PID" ]; then
+        STOPPED=0
+        for _ in $(seq 1 300); do  # 30s @ 100ms
+            kill -0 "$PID" 2>/dev/null || { STOPPED=1; break; }
+            sleep 0.1
+        done
+        if [ $STOPPED -eq 0 ]; then
+            warn "rfindd (pid $PID) still running 30s after systemctl stop; sending SIGKILL"
+            kill -KILL "$PID" 2>/dev/null || true
+            for _ in $(seq 1 30); do
+                kill -0 "$PID" 2>/dev/null || { STOPPED=1; break; }
+                sleep 0.1
+            done
+        fi
+        [ $STOPPED -eq 1 ] && ok "rfindd stopped" || warn "rfindd survived SIGKILL; continuing anyway"
+    fi
+    # Clear any failed-unit state from a previous crash so `systemctl
+    # start` below doesn't inherit it.
+    systemctl reset-failed rfindd 2>/dev/null || true
 fi
 install -d "$BIN_DIR"
 install -m 755 "$PKG/bin/rfindd" "$PKG/bin/rfind" "$BIN_DIR/"
@@ -260,11 +357,13 @@ fi
 
 if [ $HAS_SYSTEMD -eq 1 ]; then
     install -m 644 "$PKG/packaging/systemd/rfindd.service" "$UNIT"
+    ok "unit → $UNIT"
     systemctl daemon-reload
     systemctl enable --now rfindd >/dev/null 2>&1
     sleep 1
     systemctl is-active --quiet rfindd || die "rfindd failed to start: journalctl -u rfindd -e"
-    ok "service $( [ $WAS_RUNNING -eq 1 ] && echo restarted || echo enabled and started)"
+    NEWPID=$(cat /run/rfindd/rfindd.pid 2>/dev/null || echo '?')
+    ok "service $( [ $WAS_RUNNING -eq 1 ] && echo restarted || echo "enabled and started") (pid $NEWPID)"
 else
     warn "systemd not running — start the daemon yourself:  sudo $BIN_DIR/rfindd &"
 fi

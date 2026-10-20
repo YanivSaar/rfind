@@ -268,12 +268,20 @@ impl InotifyMonitor {
 
     pub fn stop(mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        // The event loop owns the only sink; once it exits the writer
-        // drains the remaining events and exits too.
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
-        if let Some(h) = self.writer.take() {
+        // The writer's `rx.recv()` only returns Err once every sender is
+        // dropped. The event-loop thread above dropped its sender when it
+        // exited; the last one is in `self.sink` (kept so `take_overflow`
+        // can report in-process sink drops). Move the writer handle out,
+        // then drop `self` — which drops `self.sink` — so the writer sees
+        // the channel disconnected and exits. Without this, join() below
+        // blocks forever and `systemctl stop` ends in SIGKILL at the
+        // 30 s grace.
+        let writer = self.writer.take();
+        drop(self);
+        if let Some(h) = writer {
             let _ = h.join();
         }
     }

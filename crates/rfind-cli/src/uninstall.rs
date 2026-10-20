@@ -92,24 +92,20 @@ fn wait_for_exit(secs: u64) -> bool {
 /// Drive the daemon to a stopped state no matter what, so file removal
 /// below never races a live writer.
 ///
-/// 30 s grace period for the systemd-sent SIGTERM to run its course.
-/// On WSL2 or network mounts the scanner can need several seconds just
-/// to cancel in-flight work (e.g. a `/mnt/c` walk under indexing), and
-/// 10 s was observed in the wild to SIGKILL rfindd while it was still
-/// finishing a clean shutdown. If 30 s is not enough the daemon is
-/// genuinely wedged — jump straight to SIGKILL. We do not send our own
-/// SIGTERM: `systemctl stop` already sent one; a duplicate just re-enters
-/// the daemon's shutdown handler and makes the log noisier.
-fn stop_daemon_with_escalation() {
-    const GRACE_SECS: u64 = 30;
-    if wait_for_exit(GRACE_SECS) {
+/// Without `--purge` we give systemd's own SIGTERM a 30 s grace: the
+/// scanner can need several seconds to cancel in-flight work (e.g. a
+/// `/mnt/c` walk under indexing), and we want it to flush the index
+/// cleanly. With `--purge` the index is going in the bin anyway, so we
+/// only wait 5 s before SIGKILL. We do not send our own SIGTERM:
+/// `systemctl stop` already sent one; a duplicate just re-enters the
+/// daemon's shutdown handler and makes the log noisier.
+fn stop_daemon_with_escalation(purge: bool) {
+    let grace = if purge { 5 } else { 30 };
+    if wait_for_exit(grace) {
         return;
     }
     if let Some(pid) = daemon::rfindd_pid() {
-        eprintln!(
-            "rfind: rfindd (pid {pid}) still running {GRACE_SECS}s after systemctl stop; \
-             sending SIGKILL"
-        );
+        eprintln!("rfind: rfindd (pid {pid}) still running {grace}s after systemctl stop; sending SIGKILL");
         unsafe {
             libc::kill(pid, libc::SIGKILL);
         }
@@ -184,7 +180,7 @@ pub fn run(out: &mut Out, purge: bool, yes: bool) -> CmdResult {
             .args(["stop", "--no-block", "rfindd"])
             .status();
     }
-    stop_daemon_with_escalation();
+    stop_daemon_with_escalation(purge);
 
     let mut removed = vec![];
     for p in &files {
@@ -206,6 +202,14 @@ pub fn run(out: &mut Out, purge: bool, yes: bool) -> CmdResult {
     }
     if systemd {
         let _ = Command::new("systemctl").arg("daemon-reload").status();
+        // Clear the cached failed-unit state. Without this, `systemctl
+        // status rfindd` keeps reporting `× rfindd.service … Active:
+        // failed` even though the unit file is gone, because systemd
+        // remembers the SIGKILL'd exit. --quiet so we don't print a
+        // scary line when there was no failed state to clear.
+        let _ = Command::new("systemctl")
+            .args(["reset-failed", "rfindd"])
+            .status();
     }
 
     let text = format!(
