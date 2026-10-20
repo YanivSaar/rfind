@@ -852,7 +852,6 @@ All tests pass in ~0.2s.
 - [x] Scanner work-queue uses mutex-protected notify (no lost-wakeup hang); worker panics
       are caught; io_uring buffer lifetime is sound on error paths
 - [ ] Extension index for `*.ext` globs
-- [ ] Per-directory size totals for instant whole-disk `rfind size`
 - [ ] Debian / RPM packages
 
 ---
