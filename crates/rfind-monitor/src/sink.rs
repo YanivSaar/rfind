@@ -7,6 +7,7 @@
 //! batched transactions.
 
 use rfind_core::db::{insert_pending_event, pending_event_count, EventType};
+use rfind_core::log::sanitize_bytes;
 use rusqlite::Connection;
 use std::{
     sync::{
@@ -27,8 +28,10 @@ const SINK_CAPACITY: usize = MAX_BATCH * 2;
 /// Hard cap on `pending_events` rows. Rapid rename churn can beat the
 /// reconciler (1000-per-5s) and grow the journal without bound,
 /// eventually filling /var. On hit we set overflow (a full rescan will
-/// subsume the lost events), truncate the journal, and keep draining.
+/// subsume the lost events) and keep only the newest rows so admin
+/// events are more likely to survive the trim.
 const PENDING_ROW_CAP: i64 = 1_000_000;
+const PENDING_KEEP_RECENT: i64 = 50_000;
 
 struct RawEvent {
     et: EventType,
@@ -63,7 +66,8 @@ impl EventSink {
             if !self.overflow.swap(true, Ordering::Relaxed) {
                 warn!(
                     "event sink full ({} queued); dropping events and will rescan. First dropped: {}",
-                    SINK_CAPACITY, ev.path
+                    SINK_CAPACITY,
+                    sanitize_bytes(ev.path.as_bytes())
                 );
             }
         }
@@ -105,17 +109,27 @@ fn writer_loop(db: Arc<Mutex<Connection>>, rx: Receiver<RawEvent>, overflow: Arc
         // Cap the journal size: sustained rename churn can beat the
         // reconciler and grow pending_events without bound. On hit, set
         // overflow (a full rescan subsumes the discarded events) and
-        // truncate what's there so we don't fill /var.
+        // drop the OLDEST rows, keeping the newest `PENDING_KEEP_RECENT`.
+        // Admin-side events are more likely to be among the recent ones
+        // than among a flood of attacker churn — the reconciler then has
+        // a chance to apply them before the full rescan runs. A plain
+        // `DELETE FROM pending_events` would wipe them all, which an
+        // attacker could use as an admin-event eraser.
         if let Ok(count) = pending_event_count(&c) {
             if count >= PENDING_ROW_CAP {
                 if !overflow.swap(true, Ordering::Relaxed) {
                     warn!(
-                        "pending_events hit the {} row cap; truncating and scheduling a rescan",
-                        PENDING_ROW_CAP
+                        "pending_events hit the {} row cap; keeping newest {} and scheduling a rescan",
+                        PENDING_ROW_CAP, PENDING_KEEP_RECENT
                     );
                 }
-                if let Err(e) = c.execute("DELETE FROM pending_events", []) {
-                    error!("truncating pending_events: {e}");
+                let sql = format!(
+                    "DELETE FROM pending_events WHERE rowid NOT IN \
+                     (SELECT rowid FROM pending_events ORDER BY rowid DESC LIMIT {})",
+                    PENDING_KEEP_RECENT
+                );
+                if let Err(e) = c.execute(&sql, []) {
+                    error!("trimming pending_events: {e}");
                 }
                 batch.clear();
                 continue;
@@ -138,7 +152,7 @@ fn writer_loop(db: Arc<Mutex<Connection>>, rx: Receiver<RawEvent>, overflow: Arc
                 ev.is_dir,
                 ev.ts,
             ) {
-                error!("journal event {}: {e}", ev.path);
+                error!("journal event {}: {e}", sanitize_bytes(ev.path.as_bytes()));
             }
         }
         if let Err(e) = tx.commit() {

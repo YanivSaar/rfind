@@ -1,9 +1,20 @@
 //! The progress file read by `rfind status`.
 
 use rfind_core::{progress_file_path, DaemonPhase, ScanProgress};
-use std::{fs, io::Write, time::SystemTime};
+use std::{
+    fs,
+    io::Write,
+    os::unix::fs::OpenOptionsExt,
+    time::SystemTime,
+};
 
 /// Write atomically (temp file + rename) so readers never see half a file.
+///
+/// Uses O_NOFOLLOW on the tmp open: /run/rfindd is root-only today, but
+/// if its mode ever loosens or an admin reconfigures the runtime dir, a
+/// pre-seeded symlink at `<progress>.tmp` would otherwise redirect our
+/// write. 0o600 means only root sees the file; the systemd unit's
+/// RuntimeDirectoryMode controls who can see the directory itself.
 pub fn write(progress: &ScanProgress) {
     let path = progress_file_path();
     if let Some(p) = path.parent() {
@@ -11,7 +22,14 @@ pub fn write(progress: &ScanProgress) {
     }
     if let Ok(json) = serde_json::to_string(progress) {
         let tmp = path.with_extension("tmp");
-        if let Ok(mut f) = fs::File::create(&tmp) {
+        let open = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .mode(0o600)
+            .open(&tmp);
+        if let Ok(mut f) = open {
             let _ = f.write_all(json.as_bytes());
             let _ = fs::rename(&tmp, &path);
         }

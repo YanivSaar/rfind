@@ -73,6 +73,33 @@ impl MountEntry {
                 | "udf"
         ) || self.fstype.starts_with("fuse")
     }
+
+    /// Allowlist of local, block-device-backed filesystems that are safe
+    /// to auto-index when a new mount appears under a live root. We used
+    /// to rely on a FUSE-family denylist, but unprivileged users with
+    /// user-namespaces can mount tmpfs/ramfs/ext*-via-loop too — and a
+    /// root-owned walk of attacker-controlled contents is the whole thing
+    /// we are trying to avoid. This allowlist is intentionally narrow;
+    /// everything else must be opted in explicitly via `scan.periodic_roots`.
+    pub fn is_local_block_fs(&self) -> bool {
+        matches!(
+            self.fstype.as_str(),
+            "ext2"
+                | "ext3"
+                | "ext4"
+                | "xfs"
+                | "btrfs"
+                | "f2fs"
+                | "zfs"
+                | "bcachefs"
+                | "jfs"
+                | "reiserfs"
+                | "exfat"
+                | "vfat"
+                | "ntfs"
+                | "ntfs3"
+        )
+    }
 }
 
 pub fn read_mountinfo() -> Vec<MountEntry> {

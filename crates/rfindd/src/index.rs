@@ -3,6 +3,7 @@
 use crate::lock;
 use rfind_config::Config;
 use rfind_core::db::{self, EventType};
+use rfind_core::log::sanitize_path;
 use rfind_core::safewalk::stat_safe;
 use rfind_scanner::EntryInfo;
 use rusqlite::Connection;
@@ -13,14 +14,22 @@ use std::{
 };
 use tracing::{error, info};
 
-/// Insert a batch of scanned entries in one transaction.
-pub fn flush_batch(conn: &Connection, batch: &mut Vec<EntryInfo>, scan_gen: i64) {
+/// Insert a batch of scanned entries in one transaction. Returns the
+/// count of entries that could NOT be inserted (SQLITE_FULL, BUSY,
+/// constraint violation, commit failure). The caller must treat a
+/// nonzero return as a scan integrity failure and skip `sweep_stale`,
+/// otherwise rows tagged with the current `scan_gen` are missing but
+/// the sweep would still wipe anything that didn't get re-tagged.
+#[must_use]
+pub fn flush_batch(conn: &Connection, batch: &mut Vec<EntryInfo>, scan_gen: i64) -> usize {
+    let mut failed = 0usize;
     let tx = match conn.unchecked_transaction() {
         Ok(t) => t,
         Err(e) => {
             error!("tx error: {e}");
+            failed = batch.len();
             batch.clear();
-            return;
+            return failed;
         }
     };
     // Group entries by directory: scanner threads interleave directories,
@@ -38,13 +47,18 @@ pub fn flush_batch(conn: &Connection, batch: &mut Vec<EntryInfo>, scan_gen: i64)
                 entry.size,
                 Some(scan_gen),
             ) {
-                error!("insert {full_path}: {e}");
+                error!("insert {}: {e}", sanitize_path(&entry.path));
+                failed += 1;
             }
         }
     }
     if let Err(e) = tx.commit() {
         error!("commit: {e}");
+        // Everything in this batch is lost; assume the whole set failed
+        // so the caller is appropriately conservative about sweeping.
+        failed = failed.max(1);
     }
+    failed
 }
 
 pub fn is_excluded(cfg: &Config, path: &Path) -> bool {
@@ -79,8 +93,14 @@ pub fn sync_path(conn: &Connection, cfg: &Config, path: &str) -> rusqlite::Resul
             db::delete_entries_under(conn, path).map(|_| ())
         }
         Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
-            // Attacker-redirected: treat as absent.
-            db::delete_entries_under(conn, path).map(|_| ())
+            // Treat ELOOP as transient and skip. Deleting on ELOOP would
+            // hand attackers a self-erase primitive: an ancestor swap by
+            // the directory owner would otherwise erase their own
+            // subtree, or (via the Rename reconcile path) erase entries
+            // just renamed INTO attacker space by root. The next event
+            // or the periodic rescan will reconcile when the symlink is
+            // gone.
+            Ok(())
         }
         // Permission errors etc.: leave the index as it is.
         Err(_) => Ok(()),

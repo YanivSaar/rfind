@@ -24,7 +24,7 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
-    os::unix::fs::{FileExt, MetadataExt},
+    os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
 };
 
@@ -464,10 +464,19 @@ impl Store {
             self.dirty = true;
             self.truncated = true;
             if !self.readonly {
-                self.write_snapshot()?;
+                // CRITICAL ORDER: fsync the data file BEFORE publishing
+                // the snapshot. The snapshot's `map` references offsets
+                // in the data file; if the snapshot lands durable but
+                // the data writes it references are not yet on disk,
+                // a crash leaves a durable snapshot pointing at bytes
+                // that never arrived. On replay, reads return garbage
+                // or the record header check fails. Snapshot last so
+                // that at every crash point, the data on disk is a
+                // superset of what the published snapshot references.
                 if let Some(f) = &self.data {
                     f.sync_data()?;
                 }
+                self.write_snapshot()?;
                 self.truncated = false;
             }
         }
@@ -525,7 +534,17 @@ impl Store {
         b.extend_from_slice(&crc32fast::hash(&b).to_le_bytes());
         let path = snap_path(&self.base);
         let tmp = PathBuf::from(format!("{}.tmp", path.display()));
-        let mut f = File::create(&tmp)?;
+        // Defense in depth: match the config_edit::write_atomic hardening.
+        // /var/lib/rfindd is 0700 root today so this is not reachable from
+        // an unprivileged attacker, but a pre-seeded symlink would otherwise
+        // redirect the write anywhere the daemon can reach.
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .mode(0o600)
+            .open(&tmp)?;
         f.write_all(&b)?;
         f.sync_all()?;
         fs::rename(&tmp, &path)?;

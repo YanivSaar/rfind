@@ -19,8 +19,8 @@
 use crate::sink::EventSink;
 use libc::{
     close, inotify_add_watch, inotify_init1, inotify_rm_watch, read, IN_CLOEXEC, IN_CLOSE_WRITE,
-    IN_CREATE, IN_DELETE, IN_DELETE_SELF, IN_IGNORED, IN_ISDIR, IN_MOVED_FROM, IN_MOVED_TO,
-    IN_NONBLOCK, IN_Q_OVERFLOW,
+    IN_CREATE, IN_DELETE, IN_DELETE_SELF, IN_DONT_FOLLOW, IN_IGNORED, IN_ISDIR, IN_MOVED_FROM,
+    IN_MOVED_TO, IN_NONBLOCK, IN_Q_OVERFLOW,
 };
 use rfind_core::db::EventType;
 use std::{
@@ -39,8 +39,16 @@ use std::{
 use tracing::{error, warn};
 
 /// IN_CLOSE_WRITE keeps sizes and mtimes current after files are written.
-const WATCH_MASK: u32 =
-    IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MOVED_FROM | IN_MOVED_TO | IN_CLOSE_WRITE;
+/// IN_DONT_FOLLOW means an attacker who swaps a watched dentry for a
+/// symlink can't trick inotify_add_watch into attaching to the target
+/// inode (the enumeration side is already covered by safewalk).
+const WATCH_MASK: u32 = IN_CREATE
+    | IN_DELETE
+    | IN_DELETE_SELF
+    | IN_MOVED_FROM
+    | IN_MOVED_TO
+    | IN_CLOSE_WRITE
+    | IN_DONT_FOLLOW;
 
 /// How long a MOVED_FROM waits for its MOVED_TO before it is treated as
 /// a move out of the watched tree.
@@ -70,7 +78,9 @@ struct Watches {
     fd: RawFd,
     map: Mutex<HashMap<i32, PathBuf>>,
     excludes: Vec<PathBuf>,
-    limit_warned: AtomicBool,
+    /// Last Instant at which we logged the ENOSPC warning. Rate-limits
+    /// the warn line; the overflow signal itself fires every ENOSPC.
+    last_warn: Mutex<Option<Instant>>,
     /// Shared with the event loop. On ENOSPC we flip it so the next
     /// daemon tick re-indexes rather than silently losing events in
     /// newly-created directories we can't watch any more.
@@ -96,12 +106,6 @@ impl Watches {
         if self.is_excluded(path) {
             return;
         }
-        // N2: short-circuit once we've hit ENOSPC. Every subsequent
-        // inotify_add_watch would fail anyway, and the daemon is already
-        // scheduled for a rescan via the warning path below.
-        if self.limit_warned.load(Ordering::Relaxed) {
-            return;
-        }
         let c = match CString::new(path.as_os_str().as_encoded_bytes()) {
             Ok(c) => c,
             Err(_) => return,
@@ -113,12 +117,18 @@ impl Watches {
         }
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::ENOSPC) {
-            // Promote to overflow so the next daemon tick re-indexes.
-            // Without this, every directory created after the limit is
-            // reached is silently unwatched: good hiding spot for an
-            // attacker (drop files that never make it into the index).
+            // Always set overflow on ENOSPC: a single rescan clears the
+            // flag but any NEW directory created afterwards still can't
+            // be watched, and would otherwise become a persistent
+            // hiding spot. Rate-limit only the log line, not the
+            // signal.
             self.overflow.store(true, Ordering::Relaxed);
-            if !self.limit_warned.swap(true, Ordering::Relaxed) {
+            const WARN_INTERVAL: Duration = Duration::from_secs(300);
+            let mut last = self.last_warn.lock().unwrap_or_else(|p| p.into_inner());
+            let should_warn = last.map_or(true, |t| t.elapsed() >= WARN_INTERVAL);
+            if should_warn {
+                *last = Some(Instant::now());
+                drop(last);
                 warn!(
                     "inotify watch limit reached at {} watches — changes in unwatched \
                      directories will be missed. Scheduling a rescan. \
@@ -222,7 +232,7 @@ impl InotifyMonitor {
             fd,
             map: Mutex::new(HashMap::new()),
             excludes,
-            limit_warned: AtomicBool::new(false),
+            last_warn: Mutex::new(None),
             overflow: Arc::clone(&overflow),
         });
 

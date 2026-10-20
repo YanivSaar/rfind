@@ -31,8 +31,18 @@ pub fn rfindd_pid() -> Option<libc::pid_t> {
 }
 
 fn is_rfindd(pid: libc::pid_t) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/comm"))
-        .is_ok_and(|c| c.trim() == "rfindd")
+    // /proc/<pid>/comm is settable by the process itself via
+    // prctl(PR_SET_NAME, "rfindd"), so any local user could spoof it.
+    // /proc/<pid>/exe is a symlink to the running binary and the kernel
+    // sets it from the inode of the executed file — not spoofable by
+    // userspace. Compare on basename so we tolerate the admin running
+    // rfindd from /usr/local/sbin, /opt/..., staging dirs during
+    // development, etc.
+    let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    exe.file_name()
+        .is_some_and(|n| n == std::ffi::OsStr::new("rfindd"))
 }
 
 /// Send `sig` to rfindd. Returns its pid.

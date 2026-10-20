@@ -12,9 +12,11 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
 
-# Runtime directory for progress.json
+# Runtime directory for progress.json and the pidfile. 0700 keeps
+# progress.json's sanitized path list and scan activity timings from any
+# local user — rfind status reads it as root anyway.
 RuntimeDirectory=rfindd
-RuntimeDirectoryMode=0755
+RuntimeDirectoryMode=0700
 
 # Logging: structured output goes to journal
 StandardOutput=journal

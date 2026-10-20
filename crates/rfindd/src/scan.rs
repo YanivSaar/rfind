@@ -88,6 +88,13 @@ pub fn scan_root(ctx: &Ctx, root: &Path, report: bool) -> ScanResult {
 
     let batch_size = cfg.index.batch_size;
     let batch: Arc<Mutex<Vec<EntryInfo>>> = Arc::new(Mutex::new(Vec::with_capacity(batch_size)));
+    // Count insert failures across every flush_batch call for this scan.
+    // Any nonzero final value means some scanned entries did NOT make it
+    // into the index, so sweep_stale (which deletes rows whose scan_gen
+    // doesn't match the current one) would silently drop them. Skip the
+    // sweep in that case.
+    let insert_failures: Arc<std::sync::atomic::AtomicUsize> =
+        Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let scan_cfg = ScanConfig::new(
         vec![root.to_path_buf()],
@@ -117,6 +124,7 @@ pub fn scan_root(ctx: &Ctx, root: &Path, report: bool) -> ScanResult {
             let conn = Arc::clone(&ctx.conn);
             let batch = Arc::clone(&batch);
             let watcher = ctx.watcher.clone();
+            let failures = Arc::clone(&insert_failures);
             move |entry: EntryInfo| {
                 // Watch before the scanner reads this directory.
                 if entry.is_dir {
@@ -134,7 +142,10 @@ pub fn scan_root(ctx: &Ctx, root: &Path, report: bool) -> ScanResult {
                     }
                     std::mem::replace(&mut *buf, Vec::with_capacity(batch_size))
                 };
-                index::flush_batch(&lock(&conn), &mut full, scan_gen);
+                let f = index::flush_batch(&lock(&conn), &mut full, scan_gen);
+                if f > 0 {
+                    failures.fetch_add(f, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         },
     )
@@ -154,7 +165,10 @@ pub fn scan_root(ctx: &Ctx, root: &Path, report: bool) -> ScanResult {
     let mut rest = std::mem::take(&mut *batch.lock().unwrap());
     let c = lock(&ctx.conn);
     if !rest.is_empty() {
-        index::flush_batch(&c, &mut rest, scan_gen);
+        let f = index::flush_batch(&c, &mut rest, scan_gen);
+        if f > 0 {
+            insert_failures.fetch_add(f, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     if result.cancelled {
         info!(
@@ -165,14 +179,29 @@ pub fn scan_root(ctx: &Ctx, root: &Path, report: bool) -> ScanResult {
         return result;
     }
 
-    let keep: Vec<String> = nested
-        .iter()
-        .map(|p| p.to_string_lossy().to_string())
-        .collect();
-    match db::sweep_stale(&c, &root.to_string_lossy(), &keep, scan_gen) {
-        Ok(n) if n > 0 => info!("Removed {n} stale entries under {}", sanitize_path(root)),
-        Ok(_) => {}
-        Err(e) => error!("sweep {}: {e}", sanitize_path(root)),
+    let total_failures = insert_failures.load(std::sync::atomic::Ordering::Relaxed);
+    if total_failures > 0 {
+        // Some entries didn't land in the index this scan. Running
+        // sweep_stale against the current scan_gen would delete those
+        // rows (they still carry an older gen or are missing entirely).
+        // Skip the sweep; the next scan will reconcile. Attacker-reach:
+        // induce SQLITE_FULL via disk pressure to otherwise collapse
+        // index coverage to the subset that succeeded.
+        warn!(
+            "Skipping stale sweep for {} — {} insert failure(s); next scan will reconcile",
+            sanitize_path(root),
+            total_failures
+        );
+    } else {
+        let keep: Vec<String> = nested
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        match db::sweep_stale(&c, &root.to_string_lossy(), &keep, scan_gen) {
+            Ok(n) if n > 0 => info!("Removed {n} stale entries under {}", sanitize_path(root)),
+            Ok(_) => {}
+            Err(e) => error!("sweep {}: {e}", sanitize_path(root)),
+        }
     }
     let _ = db::set_metadata(&c, &root_scan_key(root), &now_secs().to_string());
     if !report && !ctx.cancel.load(std::sync::atomic::Ordering::Relaxed) {

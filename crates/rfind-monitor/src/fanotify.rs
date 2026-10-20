@@ -349,6 +349,40 @@ fn mark_filesystem(fd: RawFd, point: &Path, mask: u64) -> Result<MarkedFs, Fanot
     {
         return Err(err(errno()));
     }
+    // From here on, if we exit without an Ok(MarkedFs), the kernel mark
+    // is left set with no caller tracking (next remove_filesystem won't
+    // find it, and the mark survives until the fanotify fd itself is
+    // closed on daemon exit — but it still delivers events we can no
+    // longer resolve). This guard removes the mark on any early return
+    // or panic between here and Ok construction.
+    struct UnmarkGuard<'a> {
+        fd: RawFd,
+        mask: u64,
+        cpath: &'a std::ffi::CStr,
+        armed: bool,
+    }
+    impl Drop for UnmarkGuard<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                unsafe {
+                    fanotify_mark(
+                        self.fd,
+                        FAN_MARK_REMOVE | FAN_MARK_FILESYSTEM,
+                        self.mask,
+                        libc::AT_FDCWD,
+                        self.cpath.as_ptr(),
+                    );
+                }
+            }
+        }
+    }
+    let mut guard = UnmarkGuard {
+        fd,
+        mask,
+        cpath: &c,
+        armed: true,
+    };
+
     let mount_fd = unsafe { open(c.as_ptr(), O_RDONLY | O_DIRECTORY | O_CLOEXEC) };
     if mount_fd < 0 {
         return Err(err(errno()));
@@ -362,6 +396,7 @@ fn mark_filesystem(fd: RawFd, point: &Path, mask: u64) -> Result<MarkedFs, Fanot
     }
     // fsid_t's field is private; it is two i32s, as in event records.
     let fsid: [i32; 2] = unsafe { mem::transmute(st.f_fsid) };
+    guard.armed = false; // Ownership transfers to MarkedFs; its Drop unmarks.
     Ok(MarkedFs {
         fsid,
         point: point.to_path_buf(),
@@ -394,32 +429,54 @@ fn resolve(rec: &[u8], marked: &RwLock<Vec<MarkedFs>>) -> Option<PathBuf> {
     }
     // Look up the mount point AND take a snapshot (or lazily create) of
     // its cached mount fd without holding the RwLock across the syscalls.
-    let (point, cached_fd) = {
+    //
+    // Critically, we `dup()` the cached fd while still under the read
+    // lock: without that, `remove_filesystem` can drop the MarkedFs
+    // between our `read()` and `open_by_handle_at`, closing the cached
+    // fd — the kernel then reuses the fd number for an unrelated open
+    // and open_by_handle_at resolves against the WRONG inode (worst
+    // case: a file the caller never meant to touch). dup() gives us
+    // our own reference whose validity is independent of the cache.
+    let (point, mount_fd_owned) = {
         let g = marked.read().unwrap();
         let m = g.iter().find(|m| m.fsid == fsid)?;
-        let fd = *m.mount_fd.lock().unwrap();
-        (m.point.clone(), fd)
+        let cached = *m.mount_fd.lock().unwrap();
+        let dup_fd = if cached >= 0 {
+            let d = unsafe { libc::dup(cached) };
+            if d >= 0 {
+                Some(d)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        (m.point.clone(), dup_fd)
     };
     let cpoint = CString::new(point.as_os_str().as_encoded_bytes()).ok()?;
-    let mut mount_fd = cached_fd;
-    let mut opened_here = false;
+    let mut mount_fd = mount_fd_owned.unwrap_or(-1);
+    // We always own `mount_fd` from here: either dup gave us a fresh fd,
+    // or we open() a fresh one below. In either case we close on exit.
+    let close_on_exit = true;
     if mount_fd < 0 {
         // Not O_PATH: open_by_handle_at() rejects O_PATH fds with EBADF.
         mount_fd = unsafe { open(cpoint.as_ptr(), O_RDONLY | O_DIRECTORY | O_CLOEXEC) };
         if mount_fd < 0 {
             return None; // unmounted meanwhile
         }
-        opened_here = true;
-        // Publish into the cache; if someone else beat us to it, keep ours
-        // and close theirs. On ESTALE below we invalidate before reopening.
+        // Publish into the cache (dup) so the next event skips open();
+        // keep our owned fd for the syscall below and close it on exit.
         if let Some(m) = marked.read().unwrap().iter().find(|m| m.fsid == fsid) {
             let mut slot = m.mount_fd.lock().unwrap();
             if *slot < 0 {
-                *slot = mount_fd;
-                opened_here = false; // the cache now owns it
+                let d = unsafe { libc::dup(mount_fd) };
+                if d >= 0 {
+                    *slot = d;
+                }
             }
         }
     }
+    let _ = close_on_exit;
 
     // struct file_handle { u32 handle_bytes; i32 handle_type; u8 f_handle[] },
     // copied into a 4-byte-aligned buffer.
@@ -439,10 +496,9 @@ fn resolve(rec: &[u8], marked: &RwLock<Vec<MarkedFs>>) -> Option<PathBuf> {
         )
     };
     let open_err = errno();
-    if opened_here {
-        // We never cached this fd (lost the publish race); close it.
-        unsafe { close(mount_fd) };
-    }
+    // We always own our mount_fd (dup'd from the cache, or opened fresh
+    // and dup'd back into the cache). Close ours unconditionally.
+    unsafe { close(mount_fd) };
     if open_err == libc::ESTALE {
         // The directory went away. The mount itself may still be fine, so
         // don't drop the cached fd; a subsequent event with a live handle

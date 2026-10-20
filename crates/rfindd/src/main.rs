@@ -65,7 +65,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tracing::{error, info, warn};
 
@@ -372,23 +372,19 @@ fn on_mount_change(
         .into_iter()
         .map(|(a, _)| a)
         .collect();
-    // FUSE-family fstypes can be mounted by unprivileged users (fusermount3,
-    // user-ns + mount), so a mount appearing under a live root may be
-    // attacker-controlled. The root-owned indexer would walk it, exposing
-    // us to pathological getdents64 responses, crafted filenames, and
-    // slow responses that hang scanner threads. Reject by default.
-    let is_fuse_family = |t: &str| {
-        t == "fuse" || t.starts_with("fuse.") || t == "fuseblk" || t == "fusectl"
-    };
+    // Allowlist of fstypes safe to auto-index. Unprivileged users with
+    // user-namespaces can mount tmpfs/ramfs/ext*-via-loop (not just FUSE),
+    // and a root-owned walk of attacker-controlled contents is exactly
+    // what we are trying to avoid. Only local block-backed filesystems
+    // get the automatic treatment; anything else must be opted in via
+    // `scan.periodic_roots` so the admin takes responsibility explicitly.
     let relevant = |m: &mounts::MountEntry| {
         ctx.cfg.scan.roots.iter().any(|r| m.point.starts_with(r))
             && !index::is_excluded(&ctx.cfg, &m.point)
             && !periodic_paths(&ctx.cfg)
                 .iter()
                 .any(|p| m.point.starts_with(p))
-            && !m.is_pseudo()
-            && !matches!(m.fstype.as_str(), "overlay" | "squashfs")
-            && !is_fuse_family(m.fstype.as_str())
+            && m.is_local_block_fs()
             && m.point.is_dir()
     };
     for m in changes.added.iter().filter(|m| relevant(m)) {
@@ -741,8 +737,14 @@ fn main() {
     // under any writable scanned path, which without this guard pins root
     // I/O in a re-index loop. SIGUSR1 (forced) is admin-initiated and is
     // never debounced.
+    //
+    // Track BOTH an Instant (monotonic, drops suspend time) and a
+    // SystemTime wallclock. If the suspend-aware wall clock says more
+    // than the debounce has elapsed, we re-arm even if the monotonic
+    // clock disagrees — otherwise a laptop suspend/resume stretches the
+    // admin-blind window indefinitely.
     const OVERFLOW_REINDEX_DEBOUNCE: Duration = Duration::from_secs(60);
-    let mut last_overflow_reindex: Option<Instant> = None;
+    let mut last_overflow_reindex: Option<(Instant, SystemTime)> = None;
     loop {
         // Short sleeps so shutdown and reload are prompt; work runs every 5s.
         thread::sleep(Duration::from_millis(200));
@@ -793,11 +795,19 @@ fn main() {
         let overflowed_raw = monitor.as_ref().is_some_and(|m| m.take_overflow());
         let forced = force_reindex.swap(false, Ordering::Relaxed);
         // Suppress overflow-only triggers that arrive within the debounce
-        // window; a forced trigger always wins.
+        // window; a forced trigger always wins. Debounce only when BOTH
+        // monotonic AND wall-clock agree we're still inside the window —
+        // this prevents a suspend/resume from stretching the window and
+        // creating an unbounded admin-blind period.
         let overflow_debounced = overflowed_raw
             && !forced
-            && last_overflow_reindex
-                .is_some_and(|t| t.elapsed() < OVERFLOW_REINDEX_DEBOUNCE);
+            && last_overflow_reindex.is_some_and(|(mono, wall)| {
+                mono.elapsed() < OVERFLOW_REINDEX_DEBOUNCE
+                    && wall
+                        .elapsed()
+                        .map(|d| d < OVERFLOW_REINDEX_DEBOUNCE)
+                        .unwrap_or(false)
+            });
         if overflow_debounced {
             warn!(
                 "Event overflow during debounce window ({}s); dropping and will reconcile at next tick",
@@ -819,7 +829,7 @@ fn main() {
                 if forced { "SIGUSR1" } else { "event overflow" }
             );
             if overflowed {
-                last_overflow_reindex = Some(Instant::now());
+                last_overflow_reindex = Some((Instant::now(), SystemTime::now()));
             }
             scan::live_reindex(&ctx);
             // This re-index already covers any SIGUSR1 that arrived while it ran.
