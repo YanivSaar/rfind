@@ -1,3 +1,6 @@
 /target/
 *.tmp
 .env
+
+# cargo-cyclonedx output: regenerated per-release in CI, not source.
+*.cdx.json

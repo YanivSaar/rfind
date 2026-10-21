@@ -64,8 +64,11 @@ jobs:
           # each crate's Cargo.toml. We then merge the two shipped crates
           # (daemon + CLI) into one workspace SBOM.
           cargo cyclonedx --format json --target ${{ matrix.target }}
+          # cargo-cyclonedx names its output after the package name, not
+          # the binary name. The CLI's package is `rfind-cli` even though
+          # the shipped binary is `rfind`.
           jq -s '{bomFormat:"CycloneDX", specVersion:"1.5", components: (map(.components) | add | unique_by(.["bom-ref"]))}' \
-            crates/rfindd/rfindd.cdx.json crates/rfind-cli/rfind.cdx.json \
+            crates/rfindd/rfindd.cdx.json crates/rfind-cli/rfind-cli.cdx.json \
             > $name.cdx.json
           tar czf $name.tar.gz $name
           sha256sum $name.tar.gz > $name.tar.gz.sha256
