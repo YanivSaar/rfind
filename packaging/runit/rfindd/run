@@ -1,0 +1,24 @@
+#!/bin/sh
+# runit service for rfindd — the rfind filesystem indexing daemon.
+#
+# Mirrors packaging/systemd/rfindd.service. runit expects the service
+# to run in the foreground and exec itself as PID 1 of the service;
+# we drop io/scheduling priority before exec so a long whole-filesystem
+# scan does not starve the box.
+#
+# Install (Void / Artix):
+#   cp -r rfindd/ /etc/sv/
+#   mkdir -p /var/log/rfindd
+#   ln -s /etc/sv/rfindd /var/service/
+#
+# `sv status rfindd` reflects the running state.
+
+set -e
+
+install -d -m 0700 -o root -g root /run/rfindd /var/lib/rfindd
+
+# Idle I/O + nice-19 for background behavior.
+exec chpst -b rfindd \
+    ionice -c 3 \
+    nice -n 19 \
+    /usr/local/bin/rfindd --pidfile=/run/rfindd/rfindd.pid 2>&1

@@ -1,0 +1,4 @@
+#!/bin/sh
+# runit logger for rfindd.
+# svlogd ships stdout+stderr to timestamped files under /var/log/rfindd.
+exec svlogd -tt /var/log/rfindd

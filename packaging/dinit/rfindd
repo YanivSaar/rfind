@@ -1,0 +1,28 @@
+# dinit service for rfindd — the rfind filesystem indexing daemon.
+#
+# Install (Chimera Linux / Artix-dinit):
+#   cp rfindd /etc/dinit.d/
+#   dinitctl enable rfindd
+#   dinitctl start rfindd
+
+type = process
+command = /usr/local/bin/rfindd --pidfile=/run/rfindd/rfindd.pid
+
+# Keep the daemon alive if it crashes.
+restart = true
+restart-delay = 5
+smooth-recovery = true
+
+# idle I/O + nice-19: rfindd walks the whole filesystem; make sure
+# interactive work keeps priority.
+nice = 19
+ioprio = idle
+
+working-dir = /
+
+# Logging: stderr to syslog where available. dinit's logfile= would be
+# too chatty for a long-running daemon.
+logfile = /var/log/rfindd.log
+logfile-permissions = 0640
+
+depends-on = local-mounts

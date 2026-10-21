@@ -1,0 +1,45 @@
+#!/sbin/openrc-run
+# OpenRC service script for rfindd — the rfind filesystem indexing daemon.
+#
+# Mirrors packaging/systemd/rfindd.service: root user, pidfile under
+# /run/rfindd, journal via syslog, idle I/O so the whole-filesystem
+# scan does not starve interactive IO on shared boxes.
+#
+# Install:
+#   cp rfindd /etc/init.d/rfindd
+#   chmod +x /etc/init.d/rfindd
+#   rc-update add rfindd default
+#   rc-service rfindd start
+
+name="rfindd"
+description="rfind filesystem indexing daemon"
+
+command="/usr/local/bin/rfindd"
+command_args="--pidfile=/run/rfindd/rfindd.pid"
+command_user="root:root"
+pidfile="/run/rfindd/rfindd.pid"
+command_background=true
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+
+# Idle I/O (ionice class 3) + batch CPU scheduling: on a shared box,
+# never slow interactive work for the index.
+ionice="3"
+schedprio="19"
+
+# syslog on Alpine's default (syslog-ng / busybox syslogd); on hosts
+# without a syslog, lines land in /var/log/messages via the kernel.
+output_logger="logger -t rfindd"
+error_logger="logger -t rfindd -p daemon.err"
+
+depend() {
+    need localmount
+    use logger
+    after bootmisc
+}
+
+start_pre() {
+    checkpath --directory --owner root:root --mode 0700 /run/rfindd
+    checkpath --directory --owner root:root --mode 0700 /var/lib/rfindd
+}

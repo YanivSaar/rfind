@@ -1,0 +1,21 @@
+#!/command/execlineb -P
+# s6-rc service for rfindd — the rfind filesystem indexing daemon.
+#
+# Install (Alpine with s6-overlay, or Artix-s6, or a bespoke s6-rc tree):
+#   cp -r rfindd /etc/s6-rc/sv/
+#   s6-rc-bundle add default rfindd
+#   s6-rc-compile /etc/s6-rc/compiled /etc/s6-rc/sv
+#   s6-rc -u change rfindd
+#
+# For plain s6 (no s6-rc), copy this directory under /etc/s6/sv and
+# supervise it with s6-svscan.
+
+fdmove -c 2 1
+foreground { mkdir -p /run/rfindd /var/lib/rfindd }
+foreground { chmod 0700 /run/rfindd /var/lib/rfindd }
+
+s6-setuidgid root
+nice -n 19
+ionice -c 3
+
+/usr/local/bin/rfindd --pidfile=/run/rfindd/rfindd.pid

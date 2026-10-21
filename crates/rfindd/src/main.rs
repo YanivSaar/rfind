@@ -45,6 +45,7 @@ mod config_state;
 mod index;
 mod lifecycle;
 mod mountwatch;
+mod platform;
 mod progress;
 mod scan;
 
@@ -125,15 +126,82 @@ fn config_path() -> PathBuf {
     }
 }
 
-/// Pidfile path: `RFINDD_PIDFILE_PATH` overrides the default in debug
-/// builds only (test harness use). Release builds hard-code the systemd
-/// runtime directory; see `config_path` for the reasoning on env gating.
+/// Pidfile path. Precedence:
+///
+/// 1. `--pidfile=<path>` on the command line (used by OpenRC/runit/s6/dinit
+///    units — see `packaging/openrc`, `packaging/runit`, `packaging/s6`,
+///    `packaging/dinit`). Must be absolute.
+/// 2. `RFINDD_PIDFILE_PATH` env var in debug builds only (test harness).
+/// 3. `/run/rfindd/rfindd.pid` (systemd default).
+///
+/// The env override stays debug-only to preserve the config-path threat
+/// model (see `config_path`); a non-systemd init can always set the arg
+/// instead.
 fn pidfile_path() -> PathBuf {
+    if let Some(p) = cli_pidfile() {
+        return p;
+    }
     #[cfg(debug_assertions)]
     if let Some(v) = std::env::var_os("RFINDD_PIDFILE_PATH") {
         return PathBuf::from(v);
     }
     PathBuf::from("/run/rfindd/rfindd.pid")
+}
+
+/// Parse argv once, latch results. Supported flags: `--pidfile=PATH`,
+/// `--help`, `--version`. Anything else exits 2.
+fn parse_argv_once() {
+    let mut args = std::env::args().skip(1);
+    let mut pidfile = None;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--pidfile" => match args.next() {
+                Some(v) => pidfile = Some(PathBuf::from(v)),
+                None => die_usage(),
+            },
+            s if s.starts_with("--pidfile=") => {
+                pidfile = Some(PathBuf::from(&s["--pidfile=".len()..]));
+            }
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            "--version" | "-V" => {
+                println!("rfindd {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            _ => die_usage(),
+        }
+    }
+    if let Some(p) = pidfile.as_ref() {
+        if !p.is_absolute() {
+            eprintln!("rfindd: --pidfile must be an absolute path");
+            std::process::exit(2);
+        }
+    }
+    let _ = CLI_PIDFILE.set(pidfile);
+}
+
+static CLI_PIDFILE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+fn cli_pidfile() -> Option<PathBuf> {
+    CLI_PIDFILE.get().cloned().unwrap_or(None)
+}
+
+fn print_usage() {
+    let bin = env!("CARGO_PKG_NAME");
+    println!("Usage: {bin} [--pidfile=PATH]");
+    println!();
+    println!("Options:");
+    println!("  --pidfile=PATH   Write the pidfile at PATH (default /run/rfindd/rfindd.pid).");
+    println!("                   Used by non-systemd init scripts.");
+    println!("  -h, --help       Show this message.");
+    println!("  -V, --version    Print version.");
+}
+
+fn die_usage() -> ! {
+    print_usage();
+    std::process::exit(2);
 }
 
 /// Warn about Windows drives (WSL2 drvfs) that would be monitored live:
@@ -381,6 +449,10 @@ fn publish_bg_scan(conn: &Mutex<rusqlite::Connection>, mode: &str, bg: Option<Ba
 }
 
 fn main() {
+    // Parse argv first so flags are latched before path helpers read them.
+    // --help/--version exit here; unknown flags die here.
+    parse_argv_once();
+
     // Install SIG_IGN for SIGHUP / SIGUSR1 as the very first act of
     // main(). The default disposition for both is "terminate"; a signal
     // arriving between kernel exec-return and signal_hook's handler
@@ -516,10 +588,21 @@ fn main() {
         libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
     }
 
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .with_level(true)
+    // Logging: RFIND_LOG env wins (tracing_subscriber EnvFilter syntax,
+    // e.g. "rfindd=debug,rfind_monitor=trace"). Falls back to "info"
+    // for the pre-config bootstrap window; once the config loads we
+    // raise/lower via the reloadable layer below so operators can set
+    // `log.level = "debug"` without rebuilding or touching env vars.
+    use tracing_subscriber::{fmt, layer::SubscriberExt, reload, util::SubscriberInitExt, EnvFilter};
+    let have_env = std::env::var("RFIND_LOG").is_ok();
+    let initial = EnvFilter::try_from_env("RFIND_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    let (filter, filter_handle) = reload::Layer::new(initial);
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer().with_target(false).with_level(true))
         .init();
+    let log_reload: &'static reload::Handle<EnvFilter, tracing_subscriber::Registry> =
+        Box::leak(Box::new(filter_handle));
     info!("rfindd {} starting", env!("CARGO_PKG_VERSION"));
 
     // Everything rfindd creates (index, WAL, progress file) is root-only.
@@ -551,6 +634,15 @@ fn main() {
         }
     };
 
+    // Apply config.log.level unless RFIND_LOG was set (env wins).
+    if !have_env {
+        let desired = cfg.log.level.as_filter_str();
+        if let Ok(new) = EnvFilter::try_new(desired) {
+            let _ = log_reload.modify(|f| *f = new);
+            info!("Log level set to {} from config.log.level", desired);
+        }
+    }
+
     info!("Roots: {:?}", cfg.scan.roots);
     for r in &cfg.scan.periodic_roots {
         info!(
@@ -574,6 +666,21 @@ fn main() {
     );
     warn_drvfs_under_live_roots(&cfg, &mount_table);
     warn_small_runtime_dir();
+
+    // Detect runtime (host / Docker / Podman / LXC / k8s / WSL / nspawn)
+    // once at startup. If the environment can't support fanotify FS
+    // marks, skip the attempt rather than spam fanotify_mark EPERM per
+    // filesystem — go straight to inotify.
+    let runtime_env = platform::RuntimeEnv::detect();
+    runtime_env.log_summary();
+    let prefer_fanotify_effective = cfg.monitor.prefer_fanotify
+        && !runtime_env.should_skip_fanotify();
+    if cfg.monitor.prefer_fanotify && !prefer_fanotify_effective {
+        info!(
+            "Skipping fanotify (runtime {}, caps insufficient) — using inotify",
+            runtime_env.runtime.name()
+        );
+    }
 
     let db_file = cfg.index.db_path.clone();
     let Some(db_parent) = db_file.parent() else {
@@ -736,7 +843,7 @@ fn main() {
             dirs_for_inotify,
             Arc::clone(&conn),
             monitor_excludes.clone(),
-            cfg.monitor.prefer_fanotify,
+            prefer_fanotify_effective,
             cfg.monitor.inotify_fallback,
         );
         // With fanotify preferred, a fast restart skips loading the inotify

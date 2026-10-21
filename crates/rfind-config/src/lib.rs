@@ -19,6 +19,52 @@ pub struct Config {
     pub index: IndexConfig,
     pub monitor: MonitorConfig,
     pub search: SearchConfig,
+    pub log: LogConfig,
+}
+
+/// Logging configuration. The default (stderr, info) is what systemd's
+/// journal expects; non-systemd init scripts (OpenRC, runit, s6, dinit)
+/// pipe stderr through `logger` / `svlogd`, so no in-process syslog
+/// client is needed on those either. The `level` knob is the primary
+/// control users want — the `RFIND_LOG` env var takes precedence and
+/// accepts the full `tracing_subscriber::EnvFilter` syntax
+/// (e.g. `RFIND_LOG=rfindd=debug,rfind_monitor=trace`) for ad-hoc
+/// debugging without editing the config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LogConfig {
+    pub level: LogLevel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    pub fn as_filter_str(self) -> &'static str {
+        match self {
+            LogLevel::Error => "error",
+            LogLevel::Warn => "warn",
+            LogLevel::Info => "info",
+            LogLevel::Debug => "debug",
+            LogLevel::Trace => "trace",
+        }
+    }
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            level: LogLevel::Info,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

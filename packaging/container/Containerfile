@@ -1,0 +1,47 @@
+# Containerfile for rfind — the rfind filesystem indexing daemon + CLI.
+#
+# Multi-stage: Alpine builder with the musl toolchain + Rust nightly
+# toolchain, Alpine runtime with just busybox + the static binaries.
+# The resulting image is ~15 MiB (musl + no shared libs besides libc).
+#
+# Build:
+#   podman build -t rfind:latest -f packaging/container/Containerfile .
+#
+# See docs/containers.md for the three supported deployment modes
+# (host-indexer sidecar, per-container index-only, unsupported).
+
+ARG ALPINE_VERSION=3.20
+ARG RUST_VERSION=1.82
+
+FROM docker.io/library/rust:${RUST_VERSION}-alpine${ALPINE_VERSION} AS builder
+RUN apk add --no-cache musl-dev build-base pkgconfig
+WORKDIR /src
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates/ ./crates/
+COPY tests/ ./tests/
+# Only build the two binaries we ship; skip integration tests and fuzz.
+RUN cargo build --release --locked -p rfindd -p rfind-cli
+
+FROM docker.io/library/alpine:${ALPINE_VERSION}
+LABEL org.opencontainers.image.title="rfind" \
+      org.opencontainers.image.description="Linux filesystem indexer and search daemon" \
+      org.opencontainers.image.source="https://github.com/YanivSaar/rfind" \
+      org.opencontainers.image.licenses="MIT"
+
+# Alpine's busybox is all the runtime needs. No shell, no package
+# manager in the final image beyond what's already in Alpine's base.
+RUN addgroup -S rfind && adduser -S -G rfind rfind \
+    && mkdir -p /etc/rfindd /var/lib/rfindd /run/rfindd \
+    && chmod 0700 /var/lib/rfindd /run/rfindd
+
+COPY --from=builder /src/target/release/rfindd /usr/local/bin/rfindd
+COPY --from=builder /src/target/release/rfind  /usr/local/bin/rfind
+
+# Volumes for state + runtime + config. Mount these as persistent
+# volumes if you want the index to survive container restarts.
+VOLUME ["/etc/rfindd", "/var/lib/rfindd", "/run/rfindd"]
+
+# The daemon writes a pidfile; the CLI reads progress.json. Both
+# live under /run/rfindd (tmpfs by convention — in a container,
+# just a regular dir).
+ENTRYPOINT ["/usr/local/bin/rfindd", "--pidfile=/run/rfindd/rfindd.pid"]

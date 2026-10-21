@@ -57,8 +57,23 @@ done
 
 [ "$(uname -s)" = Linux ] || die "rfind supports Linux only"
 [ "$(id -u)" -eq 0 ] || die "run as root (sudo)"
+
+# Init-system detection. First match wins; systemd always wins when
+# present because that's what packaging/systemd/rfindd.service is
+# written for and what every CI run exercises.
+INIT=""
 HAS_SYSTEMD=0
-[ -d /run/systemd/system ] && HAS_SYSTEMD=1
+if [ -d /run/systemd/system ]; then
+    INIT=systemd; HAS_SYSTEMD=1
+elif command -v openrc >/dev/null 2>&1 || [ -x /sbin/openrc-run ]; then
+    INIT=openrc
+elif command -v sv >/dev/null 2>&1 && [ -d /etc/sv ]; then
+    INIT=runit
+elif [ -d /etc/s6-rc ] || [ -d /etc/s6/sv ]; then
+    INIT=s6
+elif [ -d /etc/dinit.d ] || command -v dinitctl >/dev/null 2>&1; then
+    INIT=dinit
+fi
 
 WORK=$(mktemp -d /tmp/rfind-install.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
@@ -448,18 +463,52 @@ if command -v aa-enabled >/dev/null 2>&1 && aa-enabled --quiet 2>/dev/null \
     fi
 fi
 
-if [ $HAS_SYSTEMD -eq 1 ]; then
-    install -m 644 "$PKG/packaging/systemd/rfindd.service" "$UNIT"
-    ok "unit → $UNIT"
-    systemctl daemon-reload
-    systemctl enable --now rfindd >/dev/null 2>&1
-    sleep 1
-    systemctl is-active --quiet rfindd || die "rfindd failed to start: journalctl -u rfindd -e"
-    NEWPID=$(cat /run/rfindd/rfindd.pid 2>/dev/null || echo '?')
-    ok "service $( [ $WAS_RUNNING -eq 1 ] && echo restarted || echo "enabled and started") (pid $NEWPID)"
-else
-    warn "systemd not running — start the daemon yourself:  sudo $BIN_DIR/rfindd &"
-fi
+install -d -m 0700 /run/rfindd /var/lib/rfindd
+
+case "$INIT" in
+    systemd)
+        install -m 644 "$PKG/packaging/systemd/rfindd.service" "$UNIT"
+        ok "unit → $UNIT"
+        systemctl daemon-reload
+        systemctl enable --now rfindd >/dev/null 2>&1
+        sleep 1
+        systemctl is-active --quiet rfindd || die "rfindd failed to start: journalctl -u rfindd -e"
+        NEWPID=$(cat /run/rfindd/rfindd.pid 2>/dev/null || echo '?')
+        ok "service $( [ $WAS_RUNNING -eq 1 ] && echo restarted || echo "enabled and started") (pid $NEWPID)"
+        ;;
+    openrc)
+        install -m 755 "$PKG/packaging/openrc/rfindd" /etc/init.d/rfindd
+        rc-update add rfindd default >/dev/null 2>&1 || true
+        rc-service rfindd restart || die "rfindd failed to start: tail /var/log/messages"
+        ok "OpenRC service installed and started"
+        ;;
+    runit)
+        install -d -m 0755 /etc/sv/rfindd /etc/sv/rfindd/log /var/log/rfindd
+        install -m 755 "$PKG/packaging/runit/rfindd/run"     /etc/sv/rfindd/run
+        install -m 755 "$PKG/packaging/runit/rfindd/log/run" /etc/sv/rfindd/log/run
+        [ -L /var/service/rfindd ] || ln -s /etc/sv/rfindd /var/service/
+        sv up rfindd 2>/dev/null || true
+        ok "runit service installed; sv status rfindd"
+        ;;
+    s6)
+        install -d -m 0755 /etc/s6-rc/sv/rfindd
+        install -m 755 "$PKG/packaging/s6/rfindd/run"          /etc/s6-rc/sv/rfindd/run
+        install -m 644 "$PKG/packaging/s6/rfindd/type"         /etc/s6-rc/sv/rfindd/type
+        install -m 644 "$PKG/packaging/s6/rfindd/dependencies" /etc/s6-rc/sv/rfindd/dependencies
+        warn "s6: run \`s6-rc-compile\` + \`s6-rc -u change rfindd\` to activate"
+        ok "s6 service template installed under /etc/s6-rc/sv/rfindd"
+        ;;
+    dinit)
+        install -m 644 "$PKG/packaging/dinit/rfindd" /etc/dinit.d/rfindd
+        dinitctl enable rfindd 2>/dev/null || true
+        dinitctl start rfindd  2>/dev/null || die "rfindd failed to start: dinitctl status rfindd"
+        ok "dinit service installed and started"
+        ;;
+    *)
+        warn "no supported init system detected — start the daemon yourself:"
+        warn "    sudo $BIN_DIR/rfindd --pidfile=/run/rfindd/rfindd.pid &"
+        ;;
+esac
 
 printf '\n%s%s✔ rfind installed.%s The first scan runs in the background:\n' "$B" "$G" "$R"
 printf '    sudo rfind status --watch      # scan progress\n'
