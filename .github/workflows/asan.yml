@@ -1,0 +1,55 @@
+name: AddressSanitizer (nightly smoke)
+
+on:
+  schedule:
+    - cron: '14 5 * * *'  # 05:14 UTC every day
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  asan:
+    name: cargo test --release under -Zsanitizer=address
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential
+
+      # Scope ASan to the memory-sensitive crates: the compressed-VFS parser
+      # (hand-written framing + CRC) and the DB layer (large rusqlite
+      # surface, custom VFS registration). Fuzzing already covers the
+      # zvfs parser against random input; ASan here catches heap misuse
+      # that only shows up when the test-suite exercise paths are run as
+      # release code with sanitizer instrumentation.
+      - name: Run tests under AddressSanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=address -Cdebug-assertions=on
+          RUSTDOCFLAGS: -Zsanitizer=address
+          ASAN_OPTIONS: detect_leaks=0:allocator_may_return_null=1
+        run: |
+          cargo +nightly test \
+            --release \
+            -Zbuild-std \
+            --target x86_64-unknown-linux-gnu \
+            -p rfind-zvfs \
+            -p rfind-core \
+            2>&1 | tee asan.log
+
+      - name: Upload ASan log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: asan-log
+          path: asan.log
+          if-no-files-found: ignore

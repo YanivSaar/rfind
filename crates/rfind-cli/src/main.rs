@@ -7,6 +7,7 @@ mod config_cmd;
 mod daemon;
 mod mode;
 mod output;
+mod privacy_report;
 mod uninstall;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -443,6 +444,12 @@ enum Command {
     /// Show or change the configuration (/etc/rfindd/config.toml).
     #[command(subcommand)]
     Config(config_cmd::ConfigCmd),
+
+    /// Audit scan.exclude against a built-in catalog of sensitive trees
+    /// (SSH keys, keyrings, cloud creds, browser profiles, mail stores,
+    /// container state, package caches). Exit 1 if any are missing.
+    #[command(name = "privacy-report")]
+    PrivacyReport,
 
     /// Remove rfind: service, binaries, man pages, completions.
     Uninstall {
@@ -1203,6 +1210,7 @@ fn main() -> ExitCode {
             ),
             Command::Reload => cmd_signal(&mut out, libc::SIGHUP, "Configuration reloaded"),
             Command::Config(cmd) => config_cmd::run(&mut out, cmd),
+            Command::PrivacyReport => privacy_report::run(&mut out),
             Command::Completions { shell } => {
                 clap_complete::generate(
                     shell,

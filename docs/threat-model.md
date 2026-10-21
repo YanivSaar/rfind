@@ -85,6 +85,19 @@ code is the source of truth.
 - Supply-chain compromise of upstream crates: `cargo audit` +
   `cargo deny` + Dependabot are the first line, not the only line.
 
+## Test-only env overrides (debug builds only)
+
+The chaos-test harness (`crates/rfindd/tests/chaos_proc.rs`) spawns the
+real daemon binary against a tempdir using three environment variables:
+`RFINDD_PIDFILE_PATH`, `RFINDD_PROGRESS_PATH`, and a loosened
+`RFIND_CONFIG` that accepts any absolute non-traversal path. All three
+are gated by `cfg(debug_assertions)` and compile out of `cargo build
+--release`, so the production binary ignores them. The restriction on
+`RFIND_CONFIG` (must be under `/etc/rfindd/`) and the hard-coded
+pidfile / progress paths are intact in release builds. A reviewer who
+greps for the env var names should know they are not an exposed
+attack surface in shipped binaries.
+
 ## Change control
 
 A change that moves a boundary (new file written outside

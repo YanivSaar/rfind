@@ -412,6 +412,17 @@ rfind config reset --yes                    # back to defaults (keeps a .bak)
 
 Add `--no-reload` to only write the file; `rfind reload` applies it later.
 
+### Privacy audit
+
+`rfind privacy-report` cross-checks `scan.exclude` against a built-in
+catalog of sensitive trees (SSH keys, GPG, cloud creds, password
+managers, browser profiles, mail stores, container state, package
+caches) and prints what's covered, what's missing, and what's out of
+scope. Exits 1 if anything is missing, so it composes with shell
+checks (`rfind privacy-report || notify-admin`). `--json` emits the
+same data for scripting. Templates in [`packaging/exclusions.d/`](packaging/exclusions.d/)
+hold copy-pasteable `scan.exclude` entries for each category.
+
 ### Daemon commands
 
 ```bash
