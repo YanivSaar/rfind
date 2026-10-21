@@ -85,6 +85,19 @@ code is the source of truth.
 - Supply-chain compromise of upstream crates: `cargo audit` +
   `cargo deny` + Dependabot are the first line, not the only line.
 
+## Signal-handling startup window
+
+Between `execve` (SIGHUP reload re-execs the daemon in place) and the
+`signal_hook::Signals::new()` registration in `main()`, the default
+disposition for SIGHUP/SIGUSR1 is "terminate the process". A client
+that bursts SIGHUPs during startup — a reload loop under `systemctl`,
+a stress test, or hostile churn — could otherwise kill the new daemon
+mid-pidfile-acquire. `main()` blocks both signals via `pthread_sigmask`
+as its very first act; the signal_hook handler drains them normally
+once registered. SIGTERM/SIGINT are intentionally left unblocked so
+an admin stop still works during the startup window. Discovered by
+the `sighup_flood_does_not_crash_the_daemon` chaos test.
+
 ## Test-only env overrides (debug builds only)
 
 The chaos-test harness (`crates/rfindd/tests/chaos_proc.rs`) spawns the

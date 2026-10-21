@@ -354,6 +354,27 @@ fn publish_bg_scan(conn: &Mutex<rusqlite::Connection>, mode: &str, bg: Option<Ba
 }
 
 fn main() {
+    // Block SIGHUP/SIGUSR1 as the very first act of main(): execve
+    // inherits a process-wide signal mask from the pre-exec image, but
+    // not signal handler installations. Between an exec-reload (SIGHUP
+    // triggers reexec) and the signal_hook::Signals::new() call below,
+    // the default disposition for SIGHUP is "terminate" — so a client
+    // that bursts SIGHUPs (reload loop under systemctl, a stress test,
+    // or hostile churn) can kill the new daemon mid-startup. Blocking
+    // these signals here keeps them pending until the handler is
+    // registered, where signal_hook drains them normally.
+    //
+    // SIGTERM/SIGINT are intentionally NOT blocked: an admin who sends
+    // SIGTERM during the pidfile-acquire window should still be able to
+    // stop the daemon.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGHUP);
+        libc::sigaddset(&mut set, libc::SIGUSR1);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+
     tracing_subscriber::fmt()
         .with_target(false)
         .with_level(true)

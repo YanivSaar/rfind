@@ -14,3 +14,14 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    # Major bumps on first-party actions (checkout, cache, upload-artifact
+    # etc.) land Node.js runtime changes and sometimes drop features we
+    # rely on. Keep automatic PRs to minor/patch; majors still show up on
+    # the dashboard but need explicit opt-in via `@dependabot update` or
+    # a manual bump PR.
+    groups:
+      github-actions-minor-and-patch:
+        update-types: ["minor", "patch"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]

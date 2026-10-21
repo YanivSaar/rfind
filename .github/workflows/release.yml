@@ -46,19 +46,36 @@ jobs:
       - name: Build
         run: cargo zigbuild --release --locked --target ${{ matrix.target }} -p rfindd -p rfind-cli
 
+      # CycloneDX SBOM covers every crate that compiled into the release
+      # binaries, with version and license per entry. Attached alongside
+      # the tarball so downstream consumers (distros, SCA tooling) can
+      # match the shipped bits against an upstream advisory feed.
+      - name: Install cargo-cyclonedx
+        run: cargo install --locked cargo-cyclonedx
+
       - name: Package
         run: |
           name=rfind-${{ matrix.arch }}-linux
           mkdir -p $name/bin
           cp target/${{ matrix.target }}/release/rfind target/${{ matrix.target }}/release/rfindd $name/bin/
           cp -r man packaging scripts LICENSE README.md $name/
+          # Generate SBOM for each binary crate and roll them into one
+          # workspace file we ship next to the tarball.
+          cargo cyclonedx --format json --target ${{ matrix.target }} \
+            -p rfindd -p rfind-cli
+          # cargo-cyclonedx writes per-crate files; combine the two we
+          # ship (daemon + CLI) into a single workspace SBOM.
+          jq -s '{bomFormat:"CycloneDX", specVersion:"1.5", components: (map(.components) | add | unique_by(.["bom-ref"]))}' \
+            crates/rfindd/rfindd.cdx.json crates/rfind-cli/rfind.cdx.json \
+            > $name.cdx.json
           tar czf $name.tar.gz $name
           sha256sum $name.tar.gz > $name.tar.gz.sha256
+          sha256sum $name.cdx.json > $name.cdx.json.sha256
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
-      - name: Sign tarball with cosign (keyless, sigstore)
+      - name: Sign tarball and SBOM with cosign (keyless, sigstore)
         env:
           COSIGN_YES: "true"
         run: |
@@ -67,6 +84,10 @@ jobs:
             --output-signature "$name.tar.gz.sig" \
             --output-certificate "$name.tar.gz.pem" \
             "$name.tar.gz"
+          cosign sign-blob --yes \
+            --output-signature "$name.cdx.json.sig" \
+            --output-certificate "$name.cdx.json.pem" \
+            "$name.cdx.json"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -76,6 +97,10 @@ jobs:
             rfind-${{ matrix.arch }}-linux.tar.gz.sha256
             rfind-${{ matrix.arch }}-linux.tar.gz.sig
             rfind-${{ matrix.arch }}-linux.tar.gz.pem
+            rfind-${{ matrix.arch }}-linux.cdx.json
+            rfind-${{ matrix.arch }}-linux.cdx.json.sha256
+            rfind-${{ matrix.arch }}-linux.cdx.json.sig
+            rfind-${{ matrix.arch }}-linux.cdx.json.pem
 
   release:
     name: Publish release
@@ -95,6 +120,10 @@ jobs:
             rfind-*-linux.tar.gz.sha256 \
             rfind-*-linux.tar.gz.sig \
             rfind-*-linux.tar.gz.pem \
+            rfind-*-linux.cdx.json \
+            rfind-*-linux.cdx.json.sha256 \
+            rfind-*-linux.cdx.json.sig \
+            rfind-*-linux.cdx.json.pem \
             --repo "${{ github.repository }}" \
             --title "${{ github.ref_name }}" \
             --generate-notes

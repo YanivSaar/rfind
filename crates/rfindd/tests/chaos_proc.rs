@@ -188,18 +188,52 @@ fn sigterm_and_wait(child: &mut Child) {
     sigkill(child);
 }
 
+/// The daemon's clean-shutdown marker lives next to the DB as a hidden
+/// sibling: `/path/to/index.db` → `/path/to/.index.db.clean`. See
+/// `rfindd::lifecycle::clean_marker_path`.
+fn clean_marker_path(db: &Path) -> PathBuf {
+    let name = db
+        .file_name()
+        .expect("db path has a filename")
+        .to_string_lossy();
+    db.with_file_name(format!(".{name}.clean"))
+}
+
 #[test]
 #[ignore]
 fn sigkill_mid_scan_then_reopen_integrity_ok() {
-    let h = Harness::new(4000);
+    // 40k files keeps the daemon in Scanning long enough that the
+    // post-first-write SIGKILL below lands reliably mid-scan rather
+    // than after Ready. 2 workers so the scan is not CPU-bound to one
+    // core on CI runners with few cores.
+    let h = Harness::new(40_000);
 
-    // First boot: wait for Scanning, then SIGKILL.
+    // First boot: wait for Scanning specifically, then SIGKILL during it.
     let mut child = h.spawn();
-    let phase = h.wait_for_phase(Duration::from_secs(30), |p| {
-        matches!(p, DaemonPhase::Scanning | DaemonPhase::Ready)
+    let scanning = h.wait_for_phase(Duration::from_secs(30), |p| {
+        matches!(p, DaemonPhase::Scanning)
     });
-    assert!(phase.is_some(), "daemon never reached Scanning/Ready");
+    assert!(
+        scanning.is_some(),
+        "daemon never reached Scanning phase before SIGKILL"
+    );
+    // Sanity: we SIGKILL while the daemon is still in Scanning. If it
+    // raced to Ready first, the test still exercises crash recovery, but
+    // we log so a flaky run is diagnosable.
+    let still_scanning = std::fs::read_to_string(&h.progress)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.get("phase")?.as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
     sigkill(&mut child);
+
+    // A SIGKILL cannot write the clean marker; the next boot must see
+    // it absent and run integrity_check as part of recovery.
+    let marker = clean_marker_path(&h.db);
+    assert!(
+        !marker.exists(),
+        "clean marker exists after SIGKILL (phase was {still_scanning}); recovery path would be skipped"
+    );
 
     // Second boot: missing clean marker triggers integrity_check. The DB
     // may or may not exist depending on whether sweep committed. Either
@@ -231,9 +265,16 @@ fn clean_shutdown_leaves_marker_so_next_boot_skips_check() {
     );
     sigterm_and_wait(&mut child);
 
-    // Second boot: clean marker should be present → integrity_check path
-    // skipped. We can't directly observe "skipped", but the DB must still
-    // be sound and the daemon must reach Ready.
+    // After a clean shutdown the marker file next to the DB must exist.
+    // That is what lets the next boot skip integrity_check.
+    let marker = clean_marker_path(&h.db);
+    assert!(
+        marker.exists(),
+        "clean marker was not written on orderly shutdown"
+    );
+
+    // Second boot: `take_clean_marker` unlinks it as part of the open
+    // path. The DB must still be sound and the daemon must reach Ready.
     let _ = std::fs::remove_file(&h.progress);
     let _ = std::fs::remove_file(&h.pidfile);
     let mut child2 = h.spawn();
@@ -245,4 +286,51 @@ fn clean_shutdown_leaves_marker_so_next_boot_skips_check() {
     assert!(h.integrity_ok(), "DB integrity failed after clean restart");
 
     sigterm_and_wait(&mut child2);
+}
+
+/// SIGHUP flood: the daemon's reload handler must coalesce rapid-fire
+/// SIGHUPs without crashing, deadlocking, or losing readiness. If the
+/// reload path leaked threads or mishandled re-exec races, this test
+/// is the one that catches it.
+#[test]
+#[ignore]
+fn sighup_flood_does_not_crash_the_daemon() {
+    let h = Harness::new(200);
+    let mut child = h.spawn();
+    assert!(
+        h.wait_for_phase(Duration::from_secs(30), |p| matches!(p, DaemonPhase::Ready))
+            .is_some(),
+        "did not reach Ready before SIGHUP flood"
+    );
+
+    // 50 SIGHUPs in <0.5s. The daemon treats SIGHUP as "reload config and
+    // re-exec" — a flood exercises the signal queue and the re-exec path.
+    // Note: re-exec may change the daemon's PID. We only need the process
+    // tree to stay alive and converge back to Ready; `child.try_wait()`
+    // tracks the direct child, which stays as long as rfindd stays up.
+    for _ in 0..50 {
+        unsafe {
+            libc::kill(child.id() as libc::pid_t, libc::SIGHUP);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // Give the daemon a chance to settle — reload is debounced + re-exec'd.
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Child must still be running (SIGHUP must not have killed it) and
+    // progress must still parse. Re-exec clears progress briefly so we
+    // allow a longer window to return to Ready.
+    assert!(
+        matches!(child.try_wait(), Ok(None)),
+        "rfindd exited during SIGHUP flood"
+    );
+    assert!(
+        h.wait_for_phase(Duration::from_secs(60), |p| matches!(p, DaemonPhase::Ready))
+            .is_some(),
+        "daemon never reached Ready again after SIGHUP flood"
+    );
+    assert!(h.integrity_ok(), "DB integrity failed after SIGHUP flood");
+
+    sigterm_and_wait(&mut child);
 }
