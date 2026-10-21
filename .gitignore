@@ -4,3 +4,8 @@
 
 # cargo-cyclonedx output: regenerated per-release in CI, not source.
 *.cdx.json
+
+# Local scratch (not source).
+.claude/
+rfind-unified-prd.md
+secondopinion.md
