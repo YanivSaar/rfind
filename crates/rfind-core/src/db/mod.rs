@@ -54,23 +54,25 @@ pub fn open_with(path: &Path, compress: bool) -> Result<Connection> {
     } else {
         Connection::open(path)?
     };
-    conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+    // Rollback-journal (TRUNCATE) instead of WAL. WAL requires a shared-
+    // memory `-shm` file that SQLite's unix VFS always mmaps via xShmMap
+    // (PRAGMA mmap_size only controls xFetch, not xShm). On WSL2 the
+    // index DB lives on virtio-blk-backed ext4; during a long /mnt/c
+    // scan the 9p read pressure evicts the mmap'd shm page, and the
+    // kernel's re-fetch from virtio-blk fails intermittently — the
+    // mapped access then faults as SIGBUS and kills the whole daemon
+    // (seen reproducibly ~30-60s into a /mnt/c scan). TRUNCATE mode
+    // uses a rollback journal with no -shm and no mmap, trading WAL's
+    // non-blocking-reader concurrency for crash-free scans. Readers
+    // (`rfind` CLI) get a short SQLITE_BUSY while a batch commits and
+    // retry via PRAGMA busy_timeout; between batches they see the DB
+    // the same as before.
+    conn.execute_batch("PRAGMA journal_mode=TRUNCATE;")?;
     conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
-    // Checkpoint every ~40 MB of WAL instead of 4 MB: index pages that bulk
-    // scans rewrite many times are written to the database (and compressed)
-    // once per checkpoint rather than once per small batch.
-    conn.execute_batch("PRAGMA wal_autocheckpoint=10000;")?;
     conn.execute_batch("PRAGMA cache_size=-65536;")?;
     conn.execute_batch("PRAGMA temp_store=MEMORY;")?;
-    // Disable mmap entirely. Our custom zvfs refuses mmap on the main DB
-    // (Z_METHODS has no xFetch), but PASS_METHODS used for journal / WAL
-    // files does forward xFetch to the underlying fd. SQLite's bundled
-    // default mmap_size is non-zero, so a long bulk scan with many
-    // commit/truncate cycles would otherwise accumulate mapped journal
-    // pages — and a page that gets truncated under us (seen on WSL2 9p
-    // when the daemon scans /mnt/c for ~2m) faults as SIGBUS and kills
-    // the whole daemon. Pinning mmap_size=0 trades a small bit of hot-
-    // read throughput for a crash-free scan.
+    // Belt-and-braces: pin xFetch mmap off too, so the rollback journal
+    // itself is never memory-mapped. Same SIGBUS class, different file.
     conn.execute_batch("PRAGMA mmap_size=0;")?;
 
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -224,10 +226,13 @@ pub fn open_readonly(path: &Path) -> std::result::Result<Connection, String> {
     // Room for the pages one search touches: with a compressed index each
     // page is then decompressed once per search, not once per visit.
     let _ = conn.execute_batch("PRAGMA cache_size=-65536;");
-    // Mirror the writer: readers also map through the same journal/WAL
-    // files, so leaving mmap on would reintroduce the same SIGBUS risk
-    // for `rfind` CLI processes.
+    // Mirror the writer: no mmap on the rollback journal either.
     let _ = conn.execute_batch("PRAGMA mmap_size=0;");
+    // The daemon uses TRUNCATE journal mode (no WAL), so a reader that
+    // arrives mid-batch would get SQLITE_BUSY and fail. Wait up to 5s
+    // for the writer's lock to drop — scan batches commit in well under
+    // that, so the retry is invisible in practice.
+    let _ = conn.execute_batch("PRAGMA busy_timeout=5000;");
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(|e| format!("cannot read index {}: {e}", path.display()))?;

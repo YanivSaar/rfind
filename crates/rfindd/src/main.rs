@@ -404,6 +404,77 @@ fn main() {
             let _ = unsafe {
                 libc::write(2, msg.as_ptr() as *const _, msg.len())
             };
+            // Dump the /proc/self/maps line covering the fault address, so
+            // the journal tells us whether the fault was in a file-backed
+            // mmap (and which file) vs anonymous memory. async-signal-safe:
+            // open/read/write only, no allocation beyond stack bufs.
+            unsafe {
+                let fd = libc::open(c"/proc/self/maps".as_ptr(), libc::O_RDONLY);
+                if fd >= 0 {
+                    let mut buf = [0u8; 4096];
+                    let mut carry = 0usize;
+                    loop {
+                        let n = libc::read(
+                            fd,
+                            buf.as_mut_ptr().add(carry) as *mut _,
+                            buf.len() - carry,
+                        );
+                        if n <= 0 { break; }
+                        let end = carry + n as usize;
+                        // Scan complete lines.
+                        let mut line_start = 0usize;
+                        for i in 0..end {
+                            if buf[i] == b'\n' {
+                                let line = &buf[line_start..i];
+                                // Parse "start-end ..." hex.
+                                let mut lo: usize = 0;
+                                let mut hi: usize = 0;
+                                let mut j = 0;
+                                while j < line.len() && line[j] != b'-' {
+                                    let d = match line[j] {
+                                        b'0'..=b'9' => (line[j] - b'0') as usize,
+                                        b'a'..=b'f' => (line[j] - b'a' + 10) as usize,
+                                        _ => break,
+                                    };
+                                    lo = lo * 16 + d;
+                                    j += 1;
+                                }
+                                if j < line.len() && line[j] == b'-' {
+                                    j += 1;
+                                    while j < line.len() && line[j] != b' ' {
+                                        let d = match line[j] {
+                                            b'0'..=b'9' => (line[j] - b'0') as usize,
+                                            b'a'..=b'f' => (line[j] - b'a' + 10) as usize,
+                                            _ => break,
+                                        };
+                                        hi = hi * 16 + d;
+                                        j += 1;
+                                    }
+                                    if addr >= lo && addr < hi {
+                                        let prefix = b"rfindd: map: ";
+                                        let _ = libc::write(2, prefix.as_ptr() as *const _, prefix.len());
+                                        let _ = libc::write(2, line.as_ptr() as *const _, line.len());
+                                        let _ = libc::write(2, b"\n".as_ptr() as *const _, 1);
+                                    }
+                                }
+                                line_start = i + 1;
+                            }
+                        }
+                        // Carry trailing partial line.
+                        carry = end - line_start;
+                        if carry > 0 && line_start > 0 {
+                            std::ptr::copy(
+                                buf.as_ptr().add(line_start),
+                                buf.as_mut_ptr(),
+                                carry,
+                            );
+                        } else if carry >= buf.len() {
+                            break;
+                        }
+                    }
+                    libc::close(fd);
+                }
+            }
             // Chain to default: reinstall default handler, re-raise.
             unsafe {
                 libc::signal(signo, libc::SIG_DFL);
