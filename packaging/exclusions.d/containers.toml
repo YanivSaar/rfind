@@ -1,0 +1,33 @@
+# containers.toml — container storage, image layers, flatpak/snap trees.
+#
+# These are high-churn, high-count stores that bloat the index and add
+# little search value: image layer paths look like
+# /var/lib/docker/overlay2/<64-hex>/diff/… — nobody searches for those
+# by hand. Excluding them also keeps the fanotify event rate down.
+
+[scan]
+exclude = [
+  # Docker / Podman / containerd
+  "/var/lib/docker",
+  "/var/lib/containerd",
+  "/var/lib/containers",
+  "/home/alice/.local/share/containers",
+
+  # LXC / LXD / incus
+  "/var/lib/lxc",
+  "/var/lib/lxd",
+  "/var/lib/incus",
+
+  # Flatpak / Snap / AppImage caches
+  "/var/lib/flatpak",
+  "/home/alice/.local/share/flatpak",
+  "/var/lib/snapd",
+  "/home/alice/snap",
+  "/home/alice/Applications",
+
+  # Build caches
+  "/var/cache/pacman",
+  "/var/cache/apt",
+  "/var/cache/dnf",
+  "/var/cache/yum",
+]

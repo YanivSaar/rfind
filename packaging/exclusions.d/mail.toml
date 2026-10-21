@@ -1,0 +1,30 @@
+# mail.toml — Maildir, mbox and desktop mail clients.
+#
+# Maildir filenames encode message IDs, flags, and sometimes subjects.
+# Mbox files are huge and churn-heavy. Excluding mail trees also keeps
+# the index out of OffLineIMAP, mu/notmuch and sync-conflict files.
+
+[scan]
+exclude = [
+  # Common Maildir locations
+  "/home/alice/Mail",
+  "/home/alice/mail",
+  "/home/alice/.mail",
+  "/home/alice/Maildir",
+
+  # Thunderbird / Betterbird / Evolution
+  "/home/alice/.thunderbird",
+  "/home/alice/.betterbird",
+  "/home/alice/.local/share/evolution",
+  "/home/alice/.cache/evolution",
+
+  # Terminal / TUI clients
+  "/home/alice/.mu",
+  "/home/alice/.notmuch",
+  "/home/alice/.offlineimap",
+  "/home/alice/.local/share/aerc",
+
+  # KDE PIM
+  "/home/alice/.local/share/akonadi",
+  "/home/alice/.config/akonadi",
+]

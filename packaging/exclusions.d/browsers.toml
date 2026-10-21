@@ -1,0 +1,30 @@
+# browsers.toml — browser profiles and extension sandboxes.
+#
+# Browser profiles store site-scoped databases, extension state, cached
+# images and (encrypted) saved logins. The filenames alone leak which
+# sites and extensions a user has installed.
+
+[scan]
+exclude = [
+  # Firefox / Firefox-based
+  "/home/alice/.mozilla",
+  "/home/alice/.cache/mozilla",
+  "/home/alice/.librewolf",
+  "/home/alice/.waterfox",
+
+  # Chromium / Chrome / Brave / Edge / Opera / Vivaldi
+  "/home/alice/.config/google-chrome",
+  "/home/alice/.cache/google-chrome",
+  "/home/alice/.config/chromium",
+  "/home/alice/.cache/chromium",
+  "/home/alice/.config/BraveSoftware",
+  "/home/alice/.cache/BraveSoftware",
+  "/home/alice/.config/microsoft-edge",
+  "/home/alice/.cache/microsoft-edge",
+  "/home/alice/.config/opera",
+  "/home/alice/.config/vivaldi",
+
+  # Safari-like / webkit
+  "/home/alice/.config/epiphany",
+  "/home/alice/.cache/epiphany",
+]
