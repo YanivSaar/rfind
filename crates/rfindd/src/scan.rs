@@ -76,6 +76,37 @@ pub fn root_scan_key(root: &Path) -> String {
 ///
 /// `report`: write scan progress to the progress file (foreground scans).
 pub fn scan_root(ctx: &Ctx, root: &Path, report: bool) -> ScanResult {
+    scan_root_with_counter(ctx, root, report, None)
+}
+
+/// Variant that increments an external AtomicU64 for every scanned entry.
+/// Used by background scans so `rfind status` can show a live entry count
+/// via `BackgroundScan.entries` while a long periodic root (e.g. a WSL2
+/// Windows drive over 9p) is being walked. The daemon's main loop reads
+/// this counter on each 200ms tick and republishes progress.json.
+pub fn scan_root_with_counter(
+    ctx: &Ctx,
+    root: &Path,
+    report: bool,
+    counter: Option<Arc<std::sync::atomic::AtomicU64>>,
+) -> ScanResult {
+    // WSL2 drvfs/9p + io_uring batched statx has been seen to SIGBUS the
+    // whole daemon on multi-minute walks of /mnt/c (see v1.6.3 incident
+    // report). Fall back to the one-shot statx path for drvfs roots; it
+    // is slower but does not trigger the 9p translator edge case.
+    let io_uring_ok = {
+        let table = rfind_core::mounts::read_mountinfo();
+        let drvfs = table
+            .iter()
+            .any(|m| m.is_drvfs() && root.starts_with(&m.point));
+        if drvfs {
+            tracing::info!(
+                "Disabling io_uring for scan of {} (drvfs/9p — avoids a WSL2 SIGBUS)",
+                sanitize_path(root)
+            );
+        }
+        !drvfs
+    };
     let cfg = &ctx.cfg;
     let scan_gen = next_scan_gen(&ctx.conn);
     let nested = nested_roots(cfg, root);
@@ -132,6 +163,9 @@ pub fn scan_root(ctx: &Ctx, root: &Path, report: bool) -> ScanResult {
                         w.watch(&entry.path);
                     }
                 }
+                if let Some(c) = &counter {
+                    c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 // Swap the full batch out so the batch lock is never held
                 // while waiting for the DB lock.
                 let mut full = {
@@ -150,7 +184,7 @@ pub fn scan_root(ctx: &Ctx, root: &Path, report: bool) -> ScanResult {
         },
     )
     .with_workers(cfg.scan.workers)
-    .with_io_uring(cfg.scan.io_uring)
+    .with_io_uring(cfg.scan.io_uring && io_uring_ok)
     .with_cancel(Arc::clone(&ctx.cancel))
     .with_error_handler(|p, e| warn!("scan error {}: {}", sanitize_path(p), e))
     .with_skip_dir(move |p| skip.iter().any(|ex| p.starts_with(ex)))

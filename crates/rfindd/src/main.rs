@@ -66,7 +66,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -354,25 +354,67 @@ fn publish_bg_scan(conn: &Mutex<rusqlite::Connection>, mode: &str, bg: Option<Ba
 }
 
 fn main() {
-    // Block SIGHUP/SIGUSR1 as the very first act of main(): execve
-    // inherits a process-wide signal mask from the pre-exec image, but
-    // not signal handler installations. Between an exec-reload (SIGHUP
-    // triggers reexec) and the signal_hook::Signals::new() call below,
-    // the default disposition for SIGHUP is "terminate" — so a client
-    // that bursts SIGHUPs (reload loop under systemctl, a stress test,
-    // or hostile churn) can kill the new daemon mid-startup. Blocking
-    // these signals here keeps them pending until the handler is
-    // registered, where signal_hook drains them normally.
+    // Install SIG_IGN for SIGHUP / SIGUSR1 as the very first act of
+    // main(). execve inherits the process-wide signal mask from the
+    // pre-exec image, but not signal handler installations: between an
+    // exec-reload (SIGHUP triggers reexec) and the signal_hook::
+    // Signals::new() call below, the default disposition for SIGHUP /
+    // SIGUSR1 is "terminate", so a client that bursts SIGHUPs can kill
+    // the new daemon mid-startup.
     //
-    // SIGTERM/SIGINT are intentionally NOT blocked: an admin who sends
-    // SIGTERM during the pidfile-acquire window should still be able to
-    // stop the daemon.
+    // Blocking the signals via pthread_sigmask was tempting but fought
+    // signal_hook's own setup (v1.6.3 regression where SIGHUP stopped
+    // working entirely); SIG_IGN tells the kernel to drop the signal
+    // outright, costs nothing until signal_hook replaces the handler
+    // with its own, and leaves SIGTERM/SIGINT alone so admin-stop
+    // during startup still works.
     unsafe {
-        let mut set: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut set);
-        libc::sigaddset(&mut set, libc::SIGHUP);
-        libc::sigaddset(&mut set, libc::SIGUSR1);
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        libc::signal(libc::SIGUSR1, libc::SIG_IGN);
+    }
+
+    // SIGBUS / SIGSEGV logger: on WSL2 the 9p/drvfs translator can
+    // SIGBUS the process during /mnt/c scans. Previously the daemon
+    // disappeared with only systemd's `status=7/BUS` as a hint; this
+    // handler logs the fault address + pid before letting the default
+    // disposition (core dump + terminate) take over, so journalctl
+    // carries a diagnostic the operator can file.
+    unsafe {
+        extern "C" fn fatal_signal_handler(
+            signo: libc::c_int,
+            info: *mut libc::siginfo_t,
+            _ctx: *mut libc::c_void,
+        ) {
+            // Can't use tracing from a signal handler (allocation,
+            // mutexes). Write a single short line via write(2) to
+            // stderr; systemd captures it as a journal entry.
+            let addr = if !info.is_null() {
+                unsafe { (*info).si_addr() as usize }
+            } else {
+                0
+            };
+            let name = match signo {
+                libc::SIGBUS => "SIGBUS",
+                libc::SIGSEGV => "SIGSEGV",
+                _ => "FATAL",
+            };
+            let pid = unsafe { libc::getpid() };
+            let msg = format!("rfindd: {name} at addr {addr:#x} (pid {pid})\n");
+            let _ = unsafe {
+                libc::write(2, msg.as_ptr() as *const _, msg.len())
+            };
+            // Chain to default: reinstall default handler, re-raise.
+            unsafe {
+                libc::signal(signo, libc::SIG_DFL);
+                libc::raise(signo);
+            }
+        }
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = fatal_signal_handler as *const () as usize;
+        sa.sa_flags = libc::SA_SIGINFO;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGBUS, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
     }
 
     tracing_subscriber::fmt()
@@ -658,7 +700,8 @@ fn main() {
     // Background jobs: periodic roots and new/removed mounts, one at a time.
     let mut queue: VecDeque<PathBuf> = VecDeque::new();
     // (path currently being scanned in the background, join handle)
-    let mut bg: Option<(PathBuf, thread::JoinHandle<()>)> = None;
+    // (path, handle, start_ts, live-entry counter — see "Background jobs").
+    let mut bg: Option<(PathBuf, thread::JoinHandle<()>, u64, Arc<AtomicU64>)> = None;
     let mut mount_watch = mountwatch::MountWatch::new(&mount_table);
     let mut last_tick = Instant::now();
     let mut tick = 0u64;
@@ -690,7 +733,7 @@ fn main() {
                     continue;
                 }
             }
-            if let Some((_, h)) = bg.take() {
+            if let Some((_, h, _, _)) = bg.take() {
                 let _ = h.join(); // cancelled: returns promptly
             }
             if let Some(m) = monitor {
@@ -791,7 +834,7 @@ fn main() {
         // Filesystems mounted / unmounted under live roots.
         if ctx.cfg.monitor.watch_new_mounts {
             if let Some(changes) = mount_watch.poll(&mount_table) {
-                let in_flight = bg.as_ref().map(|(p, _)| p);
+                let in_flight = bg.as_ref().map(|(p, _, _, _)| p);
                 on_mount_change(&ctx, monitor.as_ref(), &changes, &mut queue, in_flight);
                 mount_table = changes.table;
             }
@@ -800,7 +843,14 @@ fn main() {
         // Background jobs, one at a time, so live events keep being applied
         // while a slow drive is walked. Each start/finish updates the
         // progress file so `rfind status` can show the running scan.
-        if bg.as_ref().is_some_and(|(_, h)| h.is_finished()) {
+        // bg carries (root, join_handle, start_ts, shared counter) so
+        // the main loop can republish live progress each tick.
+        if bg
+            .as_ref()
+            .is_some_and(|(_, h, _, _): &(PathBuf, thread::JoinHandle<()>, u64, Arc<AtomicU64>)| {
+                h.is_finished()
+            })
+        {
             bg = None;
             publish_bg_scan(&conn, &ctx.mode, None);
         }
@@ -811,6 +861,9 @@ fn main() {
             if let Some(root) = queue.pop_front() {
                 let ctx = ctx.clone();
                 let root_clone = root.clone();
+                let started_at = now_secs() as u64;
+                let counter = Arc::new(AtomicU64::new(0));
+                let counter_for_thread = Arc::clone(&counter);
                 publish_bg_scan(
                     &conn,
                     &ctx.mode,
@@ -820,15 +873,35 @@ fn main() {
                         // and admin terminals. Sanitize before serializing.
                         path: sanitize_path(&root_clone),
                         entries: 0,
-                        started_at: now_secs() as u64,
+                        started_at,
                     }),
                 );
                 let handle = thread::spawn(move || {
                     info!("Background scan of {}", sanitize_path(&root_clone));
-                    scan::scan_root(&ctx, &root_clone, false);
+                    scan::scan_root_with_counter(
+                        &ctx,
+                        &root_clone,
+                        false,
+                        Some(counter_for_thread),
+                    );
                 });
-                bg = Some((root, handle));
+                bg = Some((root, handle, started_at, counter));
             }
+        } else if let Some((root, _, started_at, counter)) = &bg {
+            // Live progress: republish BackgroundScan with the current
+            // entry count on every tick (5s cadence — the main loop's
+            // steady-state work interval). Keeps `rfind status` from
+            // showing a static "0 entries" through a multi-minute walk
+            // of a WSL2 Windows drive.
+            publish_bg_scan(
+                &conn,
+                &ctx.mode,
+                Some(BackgroundScan {
+                    path: sanitize_path(root),
+                    entries: counter.load(Ordering::Relaxed),
+                    started_at: *started_at,
+                }),
+            );
         }
 
         // Heartbeat every 5 minutes.
