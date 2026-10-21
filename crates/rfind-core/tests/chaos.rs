@@ -59,7 +59,10 @@ fn uncommitted_scan_tx_leaves_no_rows_after_reopen() {
 
     let conn = open(&path);
     assert!(db::integrity_check(&conn).is_ok());
-    assert!(paths(&conn).is_empty(), "uncommitted inserts must not survive");
+    assert!(
+        paths(&conn).is_empty(),
+        "uncommitted inserts must not survive"
+    );
 }
 
 /// A committed scan generation that was partially swept by the next

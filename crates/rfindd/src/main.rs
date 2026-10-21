@@ -98,6 +98,17 @@ fn config_path() -> PathBuf {
         return default;
     };
     let p = PathBuf::from(&v);
+    // Debug builds accept any absolute path so integration tests can point
+    // the daemon at a tempdir-backed config. Release (production) builds
+    // keep the "/etc/rfindd/" restriction so an attacker who can set env
+    // via systemctl edit cannot swap in a config from a world-writable
+    // directory.
+    #[cfg(debug_assertions)]
+    let ok = p.is_absolute()
+        && !p
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir));
+    #[cfg(not(debug_assertions))]
     let ok = p.is_absolute()
         && p.starts_with("/etc/rfindd/")
         // reject traversal: /etc/rfindd/../foo would still start_with the dir
@@ -112,6 +123,17 @@ fn config_path() -> PathBuf {
         );
         default
     }
+}
+
+/// Pidfile path: `RFINDD_PIDFILE_PATH` overrides the default in debug
+/// builds only (test harness use). Release builds hard-code the systemd
+/// runtime directory; see `config_path` for the reasoning on env gating.
+fn pidfile_path() -> PathBuf {
+    #[cfg(debug_assertions)]
+    if let Some(v) = std::env::var_os("RFINDD_PIDFILE_PATH") {
+        return PathBuf::from(v);
+    }
+    PathBuf::from("/run/rfindd/rfindd.pid")
 }
 
 /// Warn about Windows drives (WSL2 drvfs) that would be monitored live:
@@ -143,16 +165,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_path_rejects_paths_outside_etc_rfindd() {
+    fn config_path_rejects_traversal_and_relative() {
         // SAFETY: single-threaded test; cargo test runs module tests sequentially
         // within a `mod tests` unless `test-threads` is overridden. The two config
         // tests touch the same env var and must not run concurrently; we serialise
         // via a mutex to make that explicit.
+        //
+        // Tests always compile with debug_assertions on, so the "must be under
+        // /etc/rfindd/" restriction (release-only, see `config_path`) is not
+        // exercised here — only the invariants that hold in both profiles:
+        // the override must be absolute and must not contain `..`.
         let _g = ENV_LOCK.lock().unwrap();
         let prev = std::env::var_os("RFIND_CONFIG");
-
-        unsafe { std::env::set_var("RFIND_CONFIG", "/tmp/evil.toml") };
-        assert_eq!(config_path(), PathBuf::from(DEFAULT_CONFIG_PATH));
 
         unsafe { std::env::set_var("RFIND_CONFIG", "/etc/rfindd/../tmp/evil.toml") };
         assert_eq!(config_path(), PathBuf::from(DEFAULT_CONFIG_PATH));
@@ -344,15 +368,14 @@ fn main() {
     // the SQLite WAL and the event journal. We leak the lockfile so the
     // flock is held for the lifetime of the process (dropping would close
     // the fd and release the lock).
-    let _lockfile: &'static std::fs::File = Box::leak(Box::new(
-        match acquire_pidfile(std::path::Path::new("/run/rfindd/rfindd.pid")) {
+    let _lockfile: &'static std::fs::File =
+        Box::leak(Box::new(match acquire_pidfile(&pidfile_path()) {
             Ok(f) => f,
             Err(e) => {
                 error!("{e}");
                 std::process::exit(1);
             }
-        },
-    ));
+        }));
 
     let mut mount_table = mounts::read_mountinfo();
     let cfg = match load_effective_config(&mount_table) {

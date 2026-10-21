@@ -68,6 +68,14 @@ impl ScanProgress {
 }
 
 pub fn progress_file_path() -> std::path::PathBuf {
+    // Debug builds honor RFINDD_PROGRESS_PATH so integration tests can point
+    // the daemon at a tempdir. Release builds (production) ignore it: the
+    // daemon runs as root and env is controlled by whoever can set the
+    // systemd unit, so an override there would be defense-in-depth noise.
+    #[cfg(debug_assertions)]
+    if let Some(v) = std::env::var_os("RFINDD_PROGRESS_PATH") {
+        return std::path::PathBuf::from(v);
+    }
     std::path::PathBuf::from("/run/rfindd/progress.json")
 }
 
