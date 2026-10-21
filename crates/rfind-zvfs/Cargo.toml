@@ -5,7 +5,7 @@ edition = "2021"
 description = "SQLite VFS that stores the main database file zstd-compressed"
 
 [dependencies]
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 zstd = "0.14"
 crc32fast = "1"
 libc = "0.2"
