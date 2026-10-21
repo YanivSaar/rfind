@@ -536,7 +536,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rfind-cli"
-version = "1.6.1"
+version = "1.6.2"
 dependencies = [
  "chrono",
  "clap",
@@ -554,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "rfind-config"
-version = "1.6.1"
+version = "1.6.2"
 dependencies = [
  "libc",
  "serde",
@@ -565,7 +565,7 @@ dependencies = [
 
 [[package]]
 name = "rfind-core"
-version = "1.6.1"
+version = "1.6.2"
 dependencies = [
  "libc",
  "regex-lite",
@@ -588,7 +588,7 @@ dependencies = [
 
 [[package]]
 name = "rfind-monitor"
-version = "1.6.1"
+version = "1.6.2"
 dependencies = [
  "libc",
  "rfind-core",
@@ -599,7 +599,7 @@ dependencies = [
 
 [[package]]
 name = "rfind-scanner"
-version = "1.6.1"
+version = "1.6.2"
 dependencies = [
  "io-uring",
  "libc",
@@ -612,7 +612,7 @@ dependencies = [
 
 [[package]]
 name = "rfind-zvfs"
-version = "1.6.1"
+version = "1.6.2"
 dependencies = [
  "crc32fast",
  "libc",
@@ -624,7 +624,7 @@ dependencies = [
 
 [[package]]
 name = "rfindd"
-version = "1.6.1"
+version = "1.6.2"
 dependencies = [
  "libc",
  "num_cpus",

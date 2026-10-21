@@ -59,12 +59,11 @@ jobs:
           mkdir -p $name/bin
           cp target/${{ matrix.target }}/release/rfind target/${{ matrix.target }}/release/rfindd $name/bin/
           cp -r man packaging scripts LICENSE README.md $name/
-          # Generate SBOM for each binary crate and roll them into one
-          # workspace file we ship next to the tarball.
-          cargo cyclonedx --format json --target ${{ matrix.target }} \
-            -p rfindd -p rfind-cli
-          # cargo-cyclonedx writes per-crate files; combine the two we
-          # ship (daemon + CLI) into a single workspace SBOM.
+          # cargo-cyclonedx walks the entire workspace by itself; -p is
+          # not a flag it accepts. It writes <crate>.cdx.json next to
+          # each crate's Cargo.toml. We then merge the two shipped crates
+          # (daemon + CLI) into one workspace SBOM.
+          cargo cyclonedx --format json --target ${{ matrix.target }}
           jq -s '{bomFormat:"CycloneDX", specVersion:"1.5", components: (map(.components) | add | unique_by(.["bom-ref"]))}' \
             crates/rfindd/rfindd.cdx.json crates/rfind-cli/rfind.cdx.json \
             > $name.cdx.json

@@ -35,7 +35,14 @@ use std::{
     name = "rfind",
     version,
     about = "Fast filesystem search backed by the rfindd index",
-    args_conflicts_with_subcommands = true,
+    // Previously `args_conflicts_with_subcommands = true` — tidy for the
+    // bare-pattern form, but clap then rejects `rfind --json name foo`
+    // (and anything else combining the global `--json` flag with a
+    // subcommand), because the top-level `search: SearchArgs` conflicts
+    // with every subcommand even though --json is `global = true`.
+    // Dropping the conflict lets --json compose with subcommands; `main`
+    // already routes on `command.is_some()` first, so a user giving both
+    // a top-level pattern and a subcommand gets the subcommand's result.
     after_help = "\
 Examples:
   sudo rfind passwd                        exact or glob name
@@ -1227,7 +1234,30 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_size, under_prefix};
+    use super::{parse_size, under_prefix, Cli, Command};
+    use clap::Parser;
+
+    /// Regression: `rfind --json name <pat>` used to be rejected by clap
+    /// because `args_conflicts_with_subcommands = true` made the top-level
+    /// `--json` conflict with every subcommand, even though `--json` is
+    /// `global = true`. The bench harness relied on this combination and
+    /// silently reported "not within 20s" on every append — reads like a
+    /// freshness gap, but was a CLI parse error.
+    #[test]
+    fn global_json_flag_composes_with_name_subcommand() {
+        let cli = Cli::try_parse_from(["rfind", "--json", "name", "passwd"])
+            .expect("--json + name subcommand must parse");
+        assert!(cli.json);
+        assert!(matches!(cli.command, Some(Command::Name { .. })));
+    }
+
+    #[test]
+    fn global_json_flag_composes_with_path_subcommand() {
+        let cli = Cli::try_parse_from(["rfind", "--json", "path", "/etc/*"])
+            .expect("--json + path subcommand must parse");
+        assert!(cli.json);
+        assert!(matches!(cli.command, Some(Command::Path { .. })));
+    }
 
     #[test]
     fn sizes_parse_with_binary_units() {
