@@ -36,7 +36,17 @@ jobs:
 
       - name: Run ${{ matrix.target }} for 60s
         working-directory: fuzz
-        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=60
+        run: |
+          set -o pipefail
+          cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=60 2>&1 | tee ../fuzz-${{ matrix.target }}.log
+
+      - name: Upload fuzz log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}-log
+          path: fuzz-${{ matrix.target }}.log
+          if-no-files-found: ignore
 
       - name: Upload crash artifacts on failure
         if: failure()
