@@ -1,0 +1,47 @@
+name: Fuzz (nightly smoke)
+
+on:
+  schedule:
+    - cron: '27 4 * * *'  # 04:27 UTC every day
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  smoke:
+    name: cargo-fuzz 60s per target
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_zvfs_record
+          - fuzz_zvfs_roundtrip
+          - fuzz_fanotify_event
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run ${{ matrix.target }} for 60s
+        working-directory: fuzz
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=60
+
+      - name: Upload crash artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}-crashes
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore

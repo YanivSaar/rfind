@@ -402,6 +402,16 @@ fn mark_filesystem(fd: RawFd, point: &Path, mask: u64) -> Result<MarkedFs, Fanot
     })
 }
 
+/// Fuzz-only entry point: run the DFID_NAME record parser against
+/// arbitrary bytes with no marked filesystems. The empty mark list
+/// short-circuits the `find()` lookup before any syscall, so this
+/// exercises only the bounds-check + offset-arithmetic paths.
+#[doc(hidden)]
+pub fn __fuzz_resolve(rec: &[u8]) -> Option<PathBuf> {
+    let marked: RwLock<Vec<MarkedFs>> = RwLock::new(Vec::new());
+    resolve(rec, &marked)
+}
+
 /// Resolve a DFID_NAME info record (header + fsid + file_handle + name)
 /// to the full path of the entry it names.
 fn resolve(rec: &[u8], marked: &RwLock<Vec<MarkedFs>>) -> Option<PathBuf> {

@@ -8,7 +8,7 @@
 //! Both backends hand events to a writer thread ([`sink`]) that journals
 //! them into the pending_events SQLite table.
 
-mod fanotify;
+pub mod fanotify;
 mod inotify;
 mod sink;
 

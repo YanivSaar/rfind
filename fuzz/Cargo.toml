@@ -1,0 +1,40 @@
+[package]
+name = "rfind-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone package: a stable `cargo build` in the parent workspace must
+# not pull in libfuzzer-sys (which requires nightly + sanitizer flags).
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rfind-zvfs    = { path = "../crates/rfind-zvfs" }
+rfind-monitor = { path = "../crates/rfind-monitor" }
+tempfile      = "3"
+rusqlite      = { version = "0.37", features = ["bundled"] }
+
+[[bin]]
+name = "fuzz_zvfs_record"
+path = "fuzz_targets/fuzz_zvfs_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_zvfs_roundtrip"
+path = "fuzz_targets/fuzz_zvfs_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_fanotify_event"
+path = "fuzz_targets/fuzz_fanotify_event.rs"
+test = false
+doc = false
+bench = false
