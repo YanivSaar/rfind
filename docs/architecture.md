@@ -51,11 +51,16 @@ tests/
 ## Invariants worth preserving
 
 - **One writer, many readers.** Only the daemon writes to the index.
-  CLI processes open the DB read-only. The daemon serialises writes with
-  a `Mutex<Connection>`; readers get WAL concurrent-read snapshots.
+  CLI processes open the DB read-only. The daemon serialises writes
+  with a `Mutex<Connection>`. The DB uses `journal_mode=TRUNCATE`
+  (rollback journal, not WAL): on WSL2 the WAL's `-shm` file is always
+  mmap'd and faults as SIGBUS under /mnt/c scan memory pressure. Readers
+  set `busy_timeout=5000` so a reader that lands during a write batch
+  waits for the lock to drop instead of returning `SQLITE_BUSY`; scan
+  batches commit well under that window.
 - **Reads pin a snapshot.** `db::stream_hits` opens a `DEFERRED` txn so
-  the parent-chain walk through `dirs` cannot stitch together two WAL
-  snapshots (a rename mid-walk otherwise returns `NoRows`).
+  the parent-chain walk through `dirs` cannot stitch together two
+  snapshots across writes (a rename mid-walk otherwise returns `NoRows`).
 - **Scanner work queue.** `WorkQueue::finish_item` decrements and notifies
   under the queue mutex, otherwise a reader can observe `in_flight > 0`
   and then slip into `condvar.wait` after the final notify fires.

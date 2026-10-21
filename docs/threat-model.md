@@ -92,11 +92,44 @@ Between `execve` (SIGHUP reload re-execs the daemon in place) and the
 disposition for SIGHUP/SIGUSR1 is "terminate the process". A client
 that bursts SIGHUPs during startup — a reload loop under `systemctl`,
 a stress test, or hostile churn — could otherwise kill the new daemon
-mid-pidfile-acquire. `main()` blocks both signals via `pthread_sigmask`
-as its very first act; the signal_hook handler drains them normally
-once registered. SIGTERM/SIGINT are intentionally left unblocked so
-an admin stop still works during the startup window. Discovered by
-the `sighup_flood_does_not_crash_the_daemon` chaos test.
+mid-pidfile-acquire.
+
+`main()` installs `SIG_IGN` for both signals as its very first act.
+`SIG_IGN` is preserved across `execve` (unlike installed handlers,
+which reset to default), so once set the ignore disposition carries
+into every subsequent reload-reexec image. `reexec()` re-applies
+`SIG_IGN` immediately before `execve` to cover the first boot path
+and any reinstall where the parent did not. The signal_hook handler
+replaces `SIG_IGN` with pipe-based delivery once registered;
+unblocking signals is required for signal_hook 0.4's backend to work,
+so we rely on the ignore disposition, not `pthread_sigmask`.
+
+SIGTERM/SIGINT are intentionally left at default so an admin stop
+still works during the startup window.
+
+Discovered by `sighup_flood_does_not_crash_the_daemon` (passes 5/5
+after the v1.6.4 fix; v1.6.1 and v1.6.3 each closed only part of the
+race).
+
+## WAL vs rollback-journal, and the WSL2 /mnt/c SIGBUS
+
+The index uses `journal_mode=TRUNCATE` (rollback journal), not WAL.
+
+WAL's `-shm` shared-memory file is always mmap'd by SQLite via
+`xShmMap`, which `PRAGMA mmap_size` does not control. On WSL2 the DB
+lives on a virtio-blk-backed ext4 volume; a long `/mnt/c` scan creates
+enough 9p read pressure to evict the mmap'd `-shm` page, and the
+kernel's re-fetch from virtio-blk fails intermittently. The faulting
+access then raises `SIGBUS` and kills the whole daemon ~30-60s into
+every `/mnt/c` scan. Reproduced locally, caught by a `/proc/self/maps`
+dump in the fatal-signal handler (kept in place: see
+`crates/rfindd/src/main.rs` `fatal_signal_handler`).
+
+TRUNCATE mode uses no `-shm` and no mmap, trading WAL's non-blocking-
+readers concurrency for crash-free scans. Readers (`rfind` CLI) set
+`busy_timeout=5000` so a reader that lands during a write batch waits
+for the writer's lock instead of returning `SQLITE_BUSY`. Scan batches
+commit well under that window, so the retry is invisible in practice.
 
 ## Test-only env overrides (debug builds only)
 
