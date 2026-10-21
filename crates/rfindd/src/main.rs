@@ -355,19 +355,20 @@ fn publish_bg_scan(conn: &Mutex<rusqlite::Connection>, mode: &str, bg: Option<Ba
 
 fn main() {
     // Install SIG_IGN for SIGHUP / SIGUSR1 as the very first act of
-    // main(). execve inherits the process-wide signal mask from the
-    // pre-exec image, but not signal handler installations: between an
-    // exec-reload (SIGHUP triggers reexec) and the signal_hook::
-    // Signals::new() call below, the default disposition for SIGHUP /
-    // SIGUSR1 is "terminate", so a client that bursts SIGHUPs can kill
-    // the new daemon mid-startup.
+    // main(). The default disposition for both is "terminate"; a signal
+    // arriving between kernel exec-return and signal_hook's handler
+    // install would otherwise kill the new daemon.
     //
-    // Blocking the signals via pthread_sigmask was tempting but fought
-    // signal_hook's own setup (v1.6.3 regression where SIGHUP stopped
-    // working entirely); SIG_IGN tells the kernel to drop the signal
-    // outright, costs nothing until signal_hook replaces the handler
-    // with its own, and leaves SIGTERM/SIGINT alone so admin-stop
-    // during startup still works.
+    // SIG_IGN survives execve (per sigaction(2) "dispositions of ignored
+    // signals are left unchanged"); installed handlers are reset to
+    // default. `reexec()` therefore restores SIG_IGN immediately before
+    // calling execve so the new image inherits the ignore disposition —
+    // closing the race across every reload-reexec cycle, not only on
+    // first boot. pthread_sigmask was tried first (v1.6.3) but blocks
+    // signal_hook 0.4's pipe-based delivery entirely in production.
+    //
+    // SIGTERM/SIGINT are intentionally not blocked / ignored so admin-
+    // stop during the pidfile-acquire window still works.
     unsafe {
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
         libc::signal(libc::SIGUSR1, libc::SIG_IGN);

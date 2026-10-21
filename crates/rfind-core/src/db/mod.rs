@@ -62,6 +62,16 @@ pub fn open_with(path: &Path, compress: bool) -> Result<Connection> {
     conn.execute_batch("PRAGMA wal_autocheckpoint=10000;")?;
     conn.execute_batch("PRAGMA cache_size=-65536;")?;
     conn.execute_batch("PRAGMA temp_store=MEMORY;")?;
+    // Disable mmap entirely. Our custom zvfs refuses mmap on the main DB
+    // (Z_METHODS has no xFetch), but PASS_METHODS used for journal / WAL
+    // files does forward xFetch to the underlying fd. SQLite's bundled
+    // default mmap_size is non-zero, so a long bulk scan with many
+    // commit/truncate cycles would otherwise accumulate mapped journal
+    // pages — and a page that gets truncated under us (seen on WSL2 9p
+    // when the daemon scans /mnt/c for ~2m) faults as SIGBUS and kills
+    // the whole daemon. Pinning mmap_size=0 trades a small bit of hot-
+    // read throughput for a crash-free scan.
+    conn.execute_batch("PRAGMA mmap_size=0;")?;
 
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version != SCHEMA_VERSION {
@@ -214,6 +224,10 @@ pub fn open_readonly(path: &Path) -> std::result::Result<Connection, String> {
     // Room for the pages one search touches: with a compressed index each
     // page is then decompressed once per search, not once per visit.
     let _ = conn.execute_batch("PRAGMA cache_size=-65536;");
+    // Mirror the writer: readers also map through the same journal/WAL
+    // files, so leaving mmap on would reintroduce the same SIGBUS risk
+    // for `rfind` CLI processes.
+    let _ = conn.execute_batch("PRAGMA mmap_size=0;");
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(|e| format!("cannot read index {}: {e}", path.display()))?;

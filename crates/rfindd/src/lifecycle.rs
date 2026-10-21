@@ -96,6 +96,19 @@ pub(crate) fn restrict_index_permissions(db_file: &Path) {
 /// binary; exec the path it was installed at instead.
 pub(crate) fn reexec() -> ! {
     use std::os::unix::process::CommandExt;
+    // Restore SIG_IGN for SIGHUP/SIGUSR1 right before execve. The
+    // currently-installed signal_hook handler would be reset to default
+    // (terminate) by execve, opening a race where a signal arriving
+    // between kernel exec-return and the new main()'s SIG_IGN
+    // installation kills the new daemon. SIG_IGN is preserved across
+    // execve, so setting it here guarantees the new image starts with
+    // the ignore disposition already in effect. The new main() will
+    // re-apply SIG_IGN (no-op) and signal_hook will install its handler
+    // once, closing the window.
+    unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        libc::signal(libc::SIGUSR1, libc::SIG_IGN);
+    }
     let exe = std::env::current_exe()
         .map(|p| {
             let s = p.to_string_lossy();
