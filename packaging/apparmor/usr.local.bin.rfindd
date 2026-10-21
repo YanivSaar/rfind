@@ -1,0 +1,106 @@
+# AppArmor profile for rfindd — the rfind filesystem indexing daemon.
+#
+# rfindd must read every file name on the system (and stat() them)
+# to maintain its SQLite index, and uses fanotify filesystem marks
+# plus name_to_handle_at / open_by_handle_at to receive and resolve
+# events live. Ubuntu / SUSE will run it unconfined without this
+# profile; the systemd unit's hardening still applies, but local
+# security policy will want AppArmor confinement on top.
+#
+# Mirrors the systemd unit (packaging/systemd/rfindd.service) and the
+# SELinux module (packaging/selinux/rfindd.te): same capabilities,
+# same read-everything + write-nothing-outside-own-state posture.
+#
+# Install:
+#   cp usr.local.bin.rfindd /etc/apparmor.d/
+#   apparmor_parser -r /etc/apparmor.d/usr.local.bin.rfindd
+#   aa-status | grep rfindd    # should be "enforce"
+#
+# scripts/install.sh does this automatically when `aa-enabled` returns 0.
+
+abi <abi/3.0>,
+
+include <tunables/global>
+
+/usr/local/bin/rfindd {
+  include <abstractions/base>
+
+  # fanotify FS marks need CAP_SYS_ADMIN; open_by_handle_at crosses
+  # DAC on arbitrary inodes and needs CAP_DAC_READ_SEARCH. Nothing
+  # else is granted; audit anything we miss.
+  capability sys_admin,
+  capability dac_read_search,
+  audit deny capability sys_module,
+  audit deny capability net_admin,
+  audit deny capability syslog,
+  audit deny capability sys_rawio,
+  audit deny capability sys_ptrace,
+
+  # The binary itself.
+  /usr/local/bin/rfindd      mr,
+  /usr/bin/rfindd            mr,
+
+  # Config: read /etc/rfindd/config.toml and any drop-ins under
+  # /etc/rfindd/exclusions.d/.
+  /etc/rfindd/                     r,
+  /etc/rfindd/**                   r,
+
+  # State: index.db + sidecars.
+  /var/lib/rfindd/                 rwk,
+  /var/lib/rfindd/**               rwklm,
+
+  # Runtime: progress.json + pidfile.
+  /run/rfindd/                     rwk,
+  /run/rfindd/**                   rwkl,
+
+  # fanotify event FD plus the per-mount FDs we keep open for
+  # open_by_handle_at. These are kernel-mediated already; the paths
+  # here matter mainly for /proc/self/fd dentry reads.
+  /proc/self/fd/*                  r,
+  /proc/self/mountinfo             r,
+  /proc/self/status                r,
+  /proc/self/cgroup                r,
+  /proc/*/mountinfo                r,
+  /proc/[0-9]*/cgroup              r,
+
+  # Mountwatch poller reads /proc/*/mountinfo plus /proc/mounts.
+  /proc/mounts                     r,
+  /proc/self/mounts                r,
+
+  # Read EVERY file. We do not write, unlink, exec, or chmod anything
+  # outside our own state dirs.
+  / r,
+  /** r,
+
+  # Symlink targets we may need to resolve via /proc/self/fd.
+  /** l,
+
+  # Explicit denies: no network, no signal to anything but ourselves,
+  # no module load.
+  deny network inet dgram,
+  deny network inet stream,
+  deny network inet6 dgram,
+  deny network inet6 stream,
+  deny network raw,
+
+  # Allow signal reception from systemd / sudo / our own CLI only.
+  signal receive peer=unconfined,
+  signal receive peer=/usr/bin/sudo,
+
+  # Prevent write-to-exec: mirror MemoryDenyWriteExecute=yes.
+  deny /sys/kernel/debug/** rw,
+  deny /sys/fs/cgroup/** w,
+
+  # journald sockets.
+  /run/systemd/journal/socket      w,
+  /run/systemd/journal/stdout      wr,
+  /run/systemd/journal/dev-log     w,
+
+  # Reload (SIGHUP) swap-in of config re-reads /etc/rfindd.
+  # /proc/self/exe is used by the SIGHUP-reexec path (lifecycle.rs).
+  /proc/self/exe                   mr,
+
+  # Allow attach-via-ptrace by the user if they debug — only from
+  # unconfined (gdb/strace runs unconfined by default).
+  ptrace peer=unconfined,
+}

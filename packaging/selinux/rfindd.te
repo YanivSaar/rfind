@@ -1,0 +1,109 @@
+## <summary>SELinux policy for rfindd — the rfind filesystem indexing daemon.</summary>
+##
+## rfindd must read every file name on the system (and stat() them) in order
+## to maintain its SQLite index, and must call fanotify_init/mark plus
+## name_to_handle_at / open_by_handle_at to receive and resolve filesystem
+## events. Under RHEL/Fedora `targeted` policy enforcing, launching the
+## binary unconfined is not acceptable; this module gives it a dedicated
+## domain `rfindd_t` with just the privileges it needs.
+##
+## Install:
+##   checkmodule -M -m -o rfindd.mod rfindd.te
+##   semodule_package -o rfindd.pp -m rfindd.mod -f rfindd.fc
+##   semodule -i rfindd.pp
+##   restorecon -R /usr/local/bin/rfindd /etc/rfindd /var/lib/rfindd /run/rfindd
+##
+## The install.sh script does this automatically when `selinuxenabled`
+## returns 0.
+##
+## This policy targets `targeted` policy; MLS and MCS are not supported.
+
+policy_module(rfindd, 1.7.0)
+
+########################################
+# Declarations
+########################################
+
+type rfindd_t;
+type rfindd_exec_t;
+init_daemon_domain(rfindd_t, rfindd_exec_t)
+
+type rfindd_etc_t;
+files_config_file(rfindd_etc_t)
+
+type rfindd_var_lib_t;
+files_type(rfindd_var_lib_t)
+
+type rfindd_var_run_t;
+files_pid_file(rfindd_var_run_t)
+
+########################################
+# rfindd local policy
+########################################
+
+# Capabilities actually required: fanotify FS marks need CAP_SYS_ADMIN,
+# open_by_handle_at needs CAP_DAC_READ_SEARCH to cross DAC on arbitrary
+# inodes. Everything else is denied.
+allow rfindd_t self:capability { sys_admin dac_read_search };
+allow rfindd_t self:process { fork signal_perms getsched setsched };
+allow rfindd_t self:fifo_file rw_fifo_file_perms;
+allow rfindd_t self:unix_stream_socket create_stream_socket_perms;
+
+# Config: read /etc/rfindd/config.toml plus any drop-ins under
+# /etc/rfindd/exclusions.d/.
+read_files_pattern(rfindd_t, rfindd_etc_t, rfindd_etc_t)
+list_dirs_pattern(rfindd_t, rfindd_etc_t, rfindd_etc_t)
+
+# State: index.db + its sidecars under /var/lib/rfindd.
+manage_files_pattern(rfindd_t, rfindd_var_lib_t, rfindd_var_lib_t)
+manage_dirs_pattern(rfindd_t, rfindd_var_lib_t, rfindd_var_lib_t)
+files_var_lib_filetrans(rfindd_t, rfindd_var_lib_t, { dir file })
+
+# Runtime: progress.json + pidfile under /run/rfindd.
+manage_files_pattern(rfindd_t, rfindd_var_run_t, rfindd_var_run_t)
+manage_dirs_pattern(rfindd_t, rfindd_var_run_t, rfindd_var_run_t)
+files_pid_filetrans(rfindd_t, rfindd_var_run_t, { dir file })
+
+# fanotify + handle resolution: open_by_handle_at crosses the DAC
+# boundary, so we need read + getattr on every labeled file/dir type.
+# Scope is intentionally broad — this is a whole-system indexer.
+allow rfindd_t self:fanotify_group { create read write mark };
+
+# Walk every directory and stat every file. We never write, never
+# unlink, never execute, never chmod anything outside our own state
+# dirs — only read + getattr.
+files_list_all(rfindd_t)
+files_getattr_all_files(rfindd_t)
+files_getattr_all_dirs(rfindd_t)
+files_getattr_all_symlinks(rfindd_t)
+files_getattr_all_sockets(rfindd_t)
+files_getattr_all_pipes(rfindd_t)
+files_read_all_files(rfindd_t)
+files_read_all_symlinks(rfindd_t)
+# User homes (ProtectHome=read-only in the unit; mirror here).
+userdom_read_all_users_home_content(rfindd_t)
+
+# fanotify + mountinfo + /proc/self reads.
+kernel_read_system_state(rfindd_t)
+kernel_read_fs_sysctls(rfindd_t)
+kernel_read_proc_symlinks(rfindd_t)
+dev_read_sysfs(rfindd_t)
+
+# journald output.
+logging_send_syslog_msg(rfindd_t)
+
+# No network at all. These denials are explicit so audit logs read as
+# "intentional" instead of "missing rule".
+corenet_dontaudit_tcp_bind_all_ports(rfindd_t)
+corenet_dontaudit_udp_bind_all_ports(rfindd_t)
+neverallow rfindd_t self:tcp_socket *;
+neverallow rfindd_t self:udp_socket *;
+neverallow rfindd_t self:rawip_socket *;
+
+# No module load / kernel log read / cgroup edits — the systemd unit
+# denies these too; redundant guard here so SELinux still refuses even
+# if the unit's hardening is weakened.
+neverallow rfindd_t self:capability { sys_module syslog net_admin };
+
+# Don't let anything but init transition into this domain.
+neverallow { domain -init_t -kernel_t } rfindd_t:process transition;

@@ -92,20 +92,23 @@ pub fn scan_root_with_counter(
 ) -> ScanResult {
     // WSL2 drvfs/9p + io_uring batched statx has been seen to SIGBUS the
     // whole daemon on multi-minute walks of /mnt/c (see v1.6.3 incident
-    // report). Fall back to the one-shot statx path for drvfs roots; it
-    // is slower but does not trigger the 9p translator edge case.
+    // report). The same class of bug exists on any filesystem whose
+    // page cache can be invalidated mid-read: 9p, drvfs, and virtiofs
+    // (libvirt/qemu shared folders) all qualify. Fall back to the
+    // one-shot statx path for those roots; it is slower but does not
+    // trigger the translator edge case.
     let io_uring_ok = {
         let table = rfind_core::mounts::read_mountinfo();
-        let drvfs = table
+        let fragile = table
             .iter()
-            .any(|m| m.is_drvfs() && root.starts_with(&m.point));
-        if drvfs {
+            .any(|m| m.is_mmap_fragile() && root.starts_with(&m.point));
+        if fragile {
             tracing::info!(
-                "Disabling io_uring for scan of {} (drvfs/9p — avoids a WSL2 SIGBUS)",
+                "Disabling io_uring for scan of {} (9p/drvfs/virtiofs — avoids a SIGBUS)",
                 sanitize_path(root)
             );
         }
-        !drvfs
+        !fragile
     };
     let cfg = &ctx.cfg;
     let scan_gen = next_scan_gen(&ctx.conn);

@@ -139,6 +139,33 @@ fn pidfile_path() -> PathBuf {
 /// Warn about Windows drives (WSL2 drvfs) that would be monitored live:
 /// inotify never sees changes made from Windows, and watching a whole
 /// drive can exhaust the inotify watch limit.
+/// On very small images (minimal containers, embedded systems) the
+/// tmpfs backing /run can be sized tight enough that progress.json
+/// writes will eventually ENOSPC. Warn once at startup rather than
+/// surprise the operator mid-scan.
+fn warn_small_runtime_dir() {
+    use std::ffi::CString;
+    use std::mem::MaybeUninit;
+    let Ok(path) = CString::new("/run/rfindd") else {
+        return;
+    };
+    let mut st: MaybeUninit<libc::statvfs> = MaybeUninit::uninit();
+    let rc = unsafe { libc::statvfs(path.as_ptr(), st.as_mut_ptr()) };
+    if rc != 0 {
+        return;
+    }
+    let st = unsafe { st.assume_init() };
+    let bytes_free = (st.f_bsize as u64).saturating_mul(st.f_bavail as u64);
+    const MIN: u64 = 16 * 1024 * 1024;
+    if bytes_free < MIN {
+        warn!(
+            "/run/rfindd has only {} KiB free; progress.json writes may fail. \
+             Resize the tmpfs backing /run or raise RuntimeDirectorySize.",
+            bytes_free / 1024
+        );
+    }
+}
+
 fn warn_drvfs_under_live_roots(cfg: &Config, mounts: &[mounts::MountEntry]) {
     let handled: Vec<PathBuf> = cfg
         .scan
@@ -546,6 +573,7 @@ fn main() {
         cfg.scan.reindex_interval_hours
     );
     warn_drvfs_under_live_roots(&cfg, &mount_table);
+    warn_small_runtime_dir();
 
     let db_file = cfg.index.db_path.clone();
     let Some(db_parent) = db_file.parent() else {

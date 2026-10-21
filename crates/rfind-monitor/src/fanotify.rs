@@ -392,8 +392,17 @@ fn mark_filesystem(fd: RawFd, point: &Path, mask: u64) -> Result<MarkedFs, Fanot
     if ret < 0 {
         return Err(err(e));
     }
-    // fsid_t's field is private; it is two i32s, as in event records.
-    let fsid: [i32; 2] = unsafe { mem::transmute(st.f_fsid) };
+    // fsid_t's inner field is private, but the type's layout is
+    // documented and ABI-stable (two i32s matching the FID in event
+    // records). We used to `transmute` into [i32; 2], which requires
+    // same-size proof over an opaque type — miri flags that as UB.
+    // Reading the field through a *const [i32; 2] of the same size has
+    // the same effect without the transmute, and the compile-time
+    // size assertion below guards against a kernel that ever grows the
+    // field.
+    const _: () = assert!(mem::size_of::<libc::fsid_t>() == mem::size_of::<[i32; 2]>());
+    let fsid: [i32; 2] =
+        unsafe { std::ptr::read_unaligned(&st.f_fsid as *const _ as *const [i32; 2]) };
     guard.armed = false; // Ownership transfers to MarkedFs; its Drop unmarks.
     Ok(MarkedFs {
         fsid,

@@ -1,0 +1,41 @@
+## <summary>Interface stubs for rfindd — the rfind filesystem indexing daemon.</summary>
+## <desc>
+##  rfindd runs as a system daemon and does not expose services to other
+##  domains. These interfaces exist only so other policy modules can
+##  grant restricted access (status read, SIGHUP for reload) if they
+##  need to; by default nothing calls them.
+## </desc>
+
+########################################
+## <summary>
+##  Allow a domain to send SIGHUP to rfindd (triggers config reload).
+## </summary>
+## <param name="domain">
+##  <summary>Domain allowed to signal rfindd.</summary>
+## </param>
+#
+interface(`rfindd_signal_hup',`
+    gen_require(`
+        type rfindd_t;
+    ')
+
+    allow $1 rfindd_t:process signal;
+')
+
+########################################
+## <summary>
+##  Allow a domain to read rfindd's runtime files (progress.json).
+## </summary>
+## <param name="domain">
+##  <summary>Domain allowed to read.</summary>
+## </param>
+#
+interface(`rfindd_read_runtime',`
+    gen_require(`
+        type rfindd_var_run_t;
+    ')
+
+    files_search_pids($1)
+    allow $1 rfindd_var_run_t:dir list_dir_perms;
+    allow $1 rfindd_var_run_t:file read_file_perms;
+')

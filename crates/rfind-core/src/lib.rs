@@ -1,3 +1,19 @@
+// rfind is a 64-bit-only project: the zvfs on-disk format and the
+// fanotify event parsing both do `usize == u64` casts, and the
+// release pipeline only publishes x86_64 and aarch64. Catch anyone
+// attempting a 32-bit build loudly.
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!(
+    "rfind requires a 64-bit target: the zvfs page store and fanotify event \
+     parsing assume usize == u64. Build for x86_64, aarch64, riscv64, or s390x."
+);
+
+#[cfg(not(target_os = "linux"))]
+compile_error!(
+    "rfind is Linux-only: it uses fanotify, inotify, statx and openat2 via \
+     direct syscalls. There is no plan to port to other kernels."
+);
+
 pub mod db;
 pub mod filters;
 pub mod log;

@@ -41,14 +41,18 @@ ok()   { printf '    %s✔%s %s\n' "$G" "$R" "$*"; }
 warn() { printf '    %s▲%s %s\n' "$Y" "$R" "$*"; }
 die()  { printf '%s✘ %s%s\n' "$RD" "$*" "$R" >&2; exit 1; }
 
-UNINSTALL=0; PURGE=0
-for a in "$@"; do
-    case "$a" in
-        --uninstall) UNINSTALL=1 ;;
-        --purge)     PURGE=1 ;;
-        -h|--help)   sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        *) die "unknown option: $a" ;;
+UNINSTALL=0; PURGE=0; FROM_TARBALL=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --uninstall)       UNINSTALL=1 ;;
+        --purge)           PURGE=1 ;;
+        --from-tarball)    FROM_TARBALL=${2:-}; shift
+                           [ -n "$FROM_TARBALL" ] || die "--from-tarball needs a path" ;;
+        --from-tarball=*)  FROM_TARBALL=${1#--from-tarball=} ;;
+        -h|--help)         sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) die "unknown option: $1" ;;
     esac
+    shift
 done
 
 [ "$(uname -s)" = Linux ] || die "rfind supports Linux only"
@@ -184,6 +188,39 @@ sha256-only verification, or wait for a signed release."
     ok "verified $asset ($verified_by)"
 }
 
+from_tarball() {
+    local tb=$1
+    [ -r "$tb" ] || die "cannot read $tb"
+    step "Installing from local tarball $tb (air-gapped mode)"
+
+    local sha=$tb.sha256
+    [ -r "$sha" ] || die "missing $sha next to the tarball"
+    (cd "$(dirname "$tb")" && sha256sum -c --quiet "$(basename "$sha")") \
+        || die "checksum mismatch for $tb"
+    ok "sha256 verified"
+
+    # Offline cosign: expects the signature + certificate as siblings and
+    # a local public key at $tb.cosign.pub (or RFIND_COSIGN_PUBKEY).
+    local pub=${RFIND_COSIGN_PUBKEY:-$tb.cosign.pub}
+    local sig=$tb.sig
+    if command -v cosign >/dev/null 2>&1 && [ -r "$sig" ] && [ -r "$pub" ]; then
+        if cosign verify-blob --key "$pub" --signature "$sig" "$tb" >/dev/null 2>&1; then
+            ok "cosign signature verified against $pub"
+        else
+            die "cosign signature check failed for $tb"
+        fi
+    else
+        warn "cosign offline verification skipped (no cosign, or no $sig / $pub)"
+        warn "re-run with RFIND_COSIGN_PUBKEY=/path/to/key.pub to require it"
+    fi
+
+    tar xzf "$tb" -C "$WORK"
+    PKG=$(find "$WORK" -maxdepth 2 -type d -name 'rfind-*-linux' | head -n1)
+    [ -n "$PKG" ] && [ -x "$PKG/bin/rfindd" ] && [ -x "$PKG/bin/rfind" ] \
+        || die "tarball does not contain bin/rfindd + bin/rfind"
+    ok "unpacked $(basename "$PKG")"
+}
+
 build_from_source() {
     local src
     if [ $IN_CLONE -eq 1 ]; then
@@ -287,7 +324,9 @@ if [ -x "$BIN_DIR/rfind" ] || [ -x "$BIN_DIR/rfindd" ] || [ -f "$UNIT" ]; then
     fi
 fi
 
-if [ $IN_CLONE -eq 1 ] || [ "$RFIND_FROM_SOURCE" = 1 ]; then
+if [ -n "$FROM_TARBALL" ]; then
+    from_tarball "$FROM_TARBALL"
+elif [ $IN_CLONE -eq 1 ] || [ "$RFIND_FROM_SOURCE" = 1 ]; then
     build_from_source
 elif ! download; then
     warn "no prebuilt binary for this system/version; building from source"
@@ -368,6 +407,46 @@ if [ ! -f "$CONFIG" ] && grep -qi microsoft /proc/version 2>/dev/null; then
     fi
 fi
 [ -f "$CONFIG" ] && ok "config: $CONFIG" || ok "config: defaults written on first start"
+
+# ── MAC: SELinux ──────────────────────────────────────────────────────────────
+# On RHEL/Fedora/Rocky/Alma with SELinux enforcing, running rfindd
+# unconfined is unacceptable. Build + load our policy module if the
+# toolchain is present; otherwise warn so the operator knows the
+# daemon is running under a less-restrictive domain than intended.
+if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled; then
+    POLDIR=$PKG/packaging/selinux
+    if [ -d "$POLDIR" ] && command -v semodule >/dev/null 2>&1; then
+        step "Loading SELinux policy for rfindd"
+        if [ -f /usr/share/selinux/devel/Makefile ] \
+           && command -v checkmodule >/dev/null 2>&1 \
+           && command -v semodule_package >/dev/null 2>&1; then
+            (cd "$POLDIR" && make -f /usr/share/selinux/devel/Makefile rfindd.pp >/dev/null)
+            semodule -i "$POLDIR/rfindd.pp"
+            restorecon -R "$BIN_DIR/rfindd" /etc/rfindd /var/lib/rfindd /run/rfindd 2>/dev/null || true
+            ok "SELinux module rfindd installed (domain rfindd_t)"
+        else
+            warn "SELinux is enforcing but policy devel tools missing;"
+            warn "install selinux-policy-devel (RHEL/Fedora) or selinux-policy-dev (SUSE)"
+            warn "then: cd $POLDIR && make -f /usr/share/selinux/devel/Makefile && semodule -i rfindd.pp"
+        fi
+    fi
+fi
+
+# ── MAC: AppArmor ─────────────────────────────────────────────────────────────
+# Ubuntu 20.04+ and SUSE 15+ ship AppArmor enabled. Load our profile if
+# apparmor_parser is on PATH.
+if command -v aa-enabled >/dev/null 2>&1 && aa-enabled --quiet 2>/dev/null \
+   && command -v apparmor_parser >/dev/null 2>&1 \
+   && [ -r "$PKG/packaging/apparmor/usr.local.bin.rfindd" ]; then
+    step "Loading AppArmor profile for rfindd"
+    install -m 0644 "$PKG/packaging/apparmor/usr.local.bin.rfindd" /etc/apparmor.d/
+    if apparmor_parser -r /etc/apparmor.d/usr.local.bin.rfindd 2>/dev/null; then
+        ok "AppArmor profile loaded (enforce)"
+    else
+        warn "apparmor_parser rejected the profile; the daemon will run unconfined."
+        warn "Debian-stable AppArmor may need the abi line removed — see packaging/apparmor/README.md"
+    fi
+fi
 
 if [ $HAS_SYSTEMD -eq 1 ]; then
     install -m 644 "$PKG/packaging/systemd/rfindd.service" "$UNIT"

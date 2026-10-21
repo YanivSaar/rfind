@@ -61,6 +61,7 @@ impl MountEntry {
         matches!(
             self.fstype.as_str(),
             "9p" | "drvfs"
+                | "virtiofs"
                 | "nfs"
                 | "nfs4"
                 | "cifs"
@@ -69,9 +70,17 @@ impl MountEntry {
                 | "glusterfs"
                 | "overlay"
                 | "squashfs"
+                | "erofs"
                 | "iso9660"
                 | "udf"
         ) || self.fstype.starts_with("fuse")
+    }
+
+    /// Filesystems where mmapped page eviction can SIGBUS the daemon
+    /// (virtio/9p/drvfs/virtiofs under memory pressure). Scan paths must
+    /// use one-shot statx, not io_uring batched statx, when under these.
+    pub fn is_mmap_fragile(&self) -> bool {
+        matches!(self.fstype.as_str(), "9p" | "drvfs" | "virtiofs")
     }
 
     /// Allowlist of local, block-device-backed filesystems that are safe

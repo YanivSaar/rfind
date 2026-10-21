@@ -1,0 +1,15 @@
+# rfindd file contexts.
+#
+# Paths follow the install.sh layout: binary under /usr/local/bin,
+# config under /etc/rfindd, state under /var/lib/rfindd, runtime
+# under /run/rfindd. Users who install to /usr/bin instead must copy
+# this file and adjust the first entry.
+
+/usr/local/bin/rfindd       --      gen_context(system_u:object_r:rfindd_exec_t,s0)
+/usr/bin/rfindd             --      gen_context(system_u:object_r:rfindd_exec_t,s0)
+
+/etc/rfindd(/.*)?                   gen_context(system_u:object_r:rfindd_etc_t,s0)
+
+/var/lib/rfindd(/.*)?               gen_context(system_u:object_r:rfindd_var_lib_t,s0)
+
+/run/rfindd(/.*)?                   gen_context(system_u:object_r:rfindd_var_run_t,s0)
