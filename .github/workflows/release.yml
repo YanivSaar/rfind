@@ -20,15 +20,45 @@ env:
 
 jobs:
   build:
-    name: Build ${{ matrix.arch }}
+    name: Build ${{ matrix.arch }}-${{ matrix.libc }}
     runs-on: ubuntu-latest
+    # riscv64 is experimental: let it fail the job without failing
+    # the whole matrix. x86_64/aarch64 (musl + gnu) stay required.
+    continue-on-error: ${{ matrix.experimental == true }}
     strategy:
+      fail-fast: false
       matrix:
         include:
+          # Static musl builds — portable across every glibc version
+          # and every distro, including Alpine. The default downloads
+          # for users on install.sh.
           - arch: x86_64
             target: x86_64-unknown-linux-musl
+            libc: musl
           - arch: aarch64
             target: aarch64-unknown-linux-musl
+            libc: musl
+          # glibc dynamic builds — for RHEL-FIPS / Ubuntu Pro users
+          # who need to link the distro's crypto-wrapped libsqlite3
+          # against a dynamic binary. Smaller runtime image on
+          # systems that already have glibc + libstdc++. Named with
+          # the libc suffix so install.sh and air-gapped bundles
+          # pick the right one explicitly.
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            libc: gnu
+          - arch: aarch64
+            target: aarch64-unknown-linux-gnu
+            libc: gnu
+          # RISC-V 64-bit (gnu only — no production musl toolchain
+          # for riscv64 under cargo-zigbuild as of 1.10). Marked
+          # continue-on-error below because riscv64 is a tier-2
+          # Rust target and a single transient failure shouldn't
+          # fail the whole release.
+          - arch: riscv64
+            target: riscv64gc-unknown-linux-gnu
+            libc: gnu
+            experimental: true
     steps:
       - uses: actions/checkout@v7
 
@@ -55,9 +85,20 @@ jobs:
 
       - name: Package
         run: |
-          name=rfind-${{ matrix.arch }}-linux
+          # Artifact naming:
+          #   rfind-<arch>-linux.tar.gz          (musl, portable; keeps the
+          #                                       existing name for backwards
+          #                                       compatibility with install.sh)
+          #   rfind-<arch>-linux-gnu.tar.gz      (glibc dynamic)
+          if [ "${{ matrix.libc }}" = "gnu" ]; then
+            name=rfind-${{ matrix.arch }}-linux-gnu
+          else
+            name=rfind-${{ matrix.arch }}-linux
+          fi
+          echo "ARTIFACT_NAME=$name" >> "$GITHUB_ENV"
           mkdir -p $name/bin
-          cp target/${{ matrix.target }}/release/rfind target/${{ matrix.target }}/release/rfindd $name/bin/
+          cp target/${{ matrix.target }}/release/rfind \
+             target/${{ matrix.target }}/release/rfindd $name/bin/
           cp -r man packaging scripts LICENSE README.md $name/
           # cargo-cyclonedx walks the entire workspace by itself; -p is
           # not a flag it accepts. It writes <crate>.cdx.json next to
@@ -81,7 +122,7 @@ jobs:
         env:
           COSIGN_YES: "true"
         run: |
-          name=rfind-${{ matrix.arch }}-linux
+          name=$ARTIFACT_NAME
           cosign sign-blob --yes \
             --output-signature "$name.tar.gz.sig" \
             --output-certificate "$name.tar.gz.pem" \
@@ -93,16 +134,19 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: rfind-${{ matrix.arch }}
+          name: rfind-${{ matrix.arch }}-${{ matrix.libc }}
+          # The matrix row sets ARTIFACT_NAME above; expand it here
+          # via the shell to cover both `rfind-<arch>-linux*` (musl)
+          # and `rfind-<arch>-linux-gnu*` (glibc) patterns.
           path: |
-            rfind-${{ matrix.arch }}-linux.tar.gz
-            rfind-${{ matrix.arch }}-linux.tar.gz.sha256
-            rfind-${{ matrix.arch }}-linux.tar.gz.sig
-            rfind-${{ matrix.arch }}-linux.tar.gz.pem
-            rfind-${{ matrix.arch }}-linux.cdx.json
-            rfind-${{ matrix.arch }}-linux.cdx.json.sha256
-            rfind-${{ matrix.arch }}-linux.cdx.json.sig
-            rfind-${{ matrix.arch }}-linux.cdx.json.pem
+            ${{ env.ARTIFACT_NAME }}.tar.gz
+            ${{ env.ARTIFACT_NAME }}.tar.gz.sha256
+            ${{ env.ARTIFACT_NAME }}.tar.gz.sig
+            ${{ env.ARTIFACT_NAME }}.tar.gz.pem
+            ${{ env.ARTIFACT_NAME }}.cdx.json
+            ${{ env.ARTIFACT_NAME }}.cdx.json.sha256
+            ${{ env.ARTIFACT_NAME }}.cdx.json.sig
+            ${{ env.ARTIFACT_NAME }}.cdx.json.pem
 
   release:
     name: Publish release
@@ -117,15 +161,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Globs include an optional `-gnu` suffix so both the musl
+          # (`rfind-x86_64-linux.tar.gz`) and glibc dynamic
+          # (`rfind-x86_64-linux-gnu.tar.gz`) artifacts upload.
           gh release create "${{ github.ref_name }}" \
-            rfind-*-linux.tar.gz \
-            rfind-*-linux.tar.gz.sha256 \
-            rfind-*-linux.tar.gz.sig \
-            rfind-*-linux.tar.gz.pem \
-            rfind-*-linux.cdx.json \
-            rfind-*-linux.cdx.json.sha256 \
-            rfind-*-linux.cdx.json.sig \
-            rfind-*-linux.cdx.json.pem \
+            rfind-*-linux*.tar.gz \
+            rfind-*-linux*.tar.gz.sha256 \
+            rfind-*-linux*.tar.gz.sig \
+            rfind-*-linux*.tar.gz.pem \
+            rfind-*-linux*.cdx.json \
+            rfind-*-linux*.cdx.json.sha256 \
+            rfind-*-linux*.cdx.json.sig \
+            rfind-*-linux*.cdx.json.pem \
             --repo "${{ github.repository }}" \
             --title "${{ github.ref_name }}" \
             --generate-notes

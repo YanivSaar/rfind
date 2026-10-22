@@ -17,6 +17,12 @@ pub struct MountEntry {
     pub fstype: String,
     /// Per-superblock options (e.g. "aname=drvfs;path=C:\" for WSL2 drives).
     pub super_options: String,
+    /// Mount source string from mountinfo field 10: `/dev/sdb1` for block
+    /// devices, `tmpfs`/`cgroup`/… for virtual, `//host/share` for CIFS,
+    /// `host:/export` for NFS. Used by mountwatch to detect a USB
+    /// re-plug at the same mount point: if the point stays but
+    /// `source` changes, the stored entries under it must be invalidated.
+    pub source: String,
 }
 
 impl MountEntry {
@@ -190,6 +196,12 @@ pub fn parse_mountinfo(text: &str) -> Vec<MountEntry> {
                 fsroot: PathBuf::from(unescape(f[3])),
                 point: PathBuf::from(unescape(f[4])),
                 fstype: f[sep + 1].to_string(),
+                // mountinfo field 10 (sep+2) is the mount source;
+                // mountinfo escapes it the same way as root/point.
+                source: f
+                    .get(sep + 2)
+                    .map(|s| unescape(s))
+                    .unwrap_or_default(),
                 super_options: f.get(sep + 3).unwrap_or(&"").to_string(),
             })
         })
@@ -440,6 +452,7 @@ mod tests {
             fsroot: PathBuf::from("/"),
             point: PathBuf::from("/x"),
             fstype: fstype.into(),
+            source: String::new(),
             super_options: String::new(),
         };
         assert_eq!(mk("ext4").index_strategy(), IndexStrategy::FanotifyLive);

@@ -75,6 +75,34 @@ code is the source of truth.
 - **Not defended against:** side channels (disk-usage, timing) that
   reveal rough index size; these are considered acceptable.
 
+### 6a. `sudo` as a trust-boundary surface
+
+**The system index is root-equivalent read of every path on the
+box.** Any user who can `sudo rfind …` sees every file name, every
+mtime, and every size — including paths inside other users' home
+directories whose DAC permissions would normally forbid listing.
+This is intentional: that's what the daemon is for, and `sudo`'s
+job is to decide who crosses the boundary. But it is louder than
+`sudo find /` because the answer comes back instantly, so the
+operational guidance for shared boxes is:
+
+- Prefer **per-user mode** (`rfindd --user`, v1.9+) on
+  developer / shell boxes. Each user indexes only what they can
+  already see; the system index can stay off.
+- When you do run the system daemon on a shared box, treat
+  `search.filter_by_dac = true` (v1.10, config knob) as the
+  default. When set, the CLI re-stats each result through the
+  invoking user's `fsuid`/`fsgid` before emitting it, filtering
+  out paths they couldn't have found with `find` of their own.
+  Off by default because it costs one extra `stat()` per result;
+  on by convention wherever `sudo rfind` means "give me what *I*
+  could have found", not "give me everything".
+- Audit who has `sudo rfind` separately from who has `sudo`. A
+  sudoers rule `%indexing ALL=(root) NOPASSWD: /usr/local/bin/rfind`
+  is less dangerous than full `sudo` but still grants whole-system
+  path visibility; it is a privacy decision, not a convenience
+  one.
+
 ## What is explicitly *not* in scope
 
 - Preventing root from seeing sensitive filenames: rfind indexes

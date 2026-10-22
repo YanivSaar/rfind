@@ -163,6 +163,12 @@ pub struct SearchConfig {
     pub io_uring: bool,
     /// Worker threads for walk mode. 0 = cores × 2 (I/O-bound default).
     pub threads: usize,
+    /// On shared boxes, when a non-root user runs `sudo rfind`, re-stat
+    /// each result through the invoking user's `fsuid`/`fsgid` and
+    /// drop paths they could not have reached themselves. Off by
+    /// default (costs one `stat()` per result); turn on per
+    /// `docs/threat-model.md § 6a` on multi-user systems.
+    pub filter_by_dac: bool,
 }
 
 /// User preference for which backend answers a query.
@@ -248,6 +254,7 @@ impl Default for SearchConfig {
             mode: SearchModePref::Auto,
             io_uring: true,
             threads: 0,
+            filter_by_dac: false,
         }
     }
 }

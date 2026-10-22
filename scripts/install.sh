@@ -147,7 +147,16 @@ download() {
         *) return 1 ;;
     esac
     command -v curl >/dev/null || return 1
-    asset=rfind-$arch-linux.tar.gz
+    # Default to musl (portable, static, works everywhere). Set
+    # RFIND_LIBC=gnu to pick the glibc dynamic artifact — useful on
+    # RHEL-FIPS / Ubuntu Pro hosts that want to link the distro's
+    # crypto-wrapped libsqlite3 at runtime. See docs/fips.md.
+    libc=${RFIND_LIBC:-musl}
+    case "$libc" in
+        musl) asset=rfind-$arch-linux.tar.gz ;;
+        gnu)  asset=rfind-$arch-linux-gnu.tar.gz ;;
+        *)    die "RFIND_LIBC must be 'musl' or 'gnu'; got '$libc'" ;;
+    esac
     if [ "$RFIND_VERSION" = latest ]; then
         base=https://github.com/$GITHUB/releases/latest/download
     else

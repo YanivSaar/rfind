@@ -4,6 +4,7 @@
 //! Exit status: 0 = results found / success, 1 = no results, 2 = error.
 
 mod config_cmd;
+mod dac_filter;
 mod daemon;
 mod mode;
 mod output;
@@ -437,6 +438,12 @@ enum Command {
         /// Refresh every second until the daemon is ready.
         #[arg(short, long)]
         watch: bool,
+        /// After the normal status, list every mount under a live root
+        /// with how rfindd treats it (indexed live, periodic rescan,
+        /// skipped — and why). Useful on multi-mount hosts where
+        /// "why don't I see /mnt/data?" is a common question.
+        #[arg(long)]
+        mounts: bool,
     },
 
     /// Index statistics: top file types, largest directories.
@@ -1024,7 +1031,7 @@ fn cmd_size(out: &mut Out, path: &str, top: usize) -> CmdResult {
 
 /// Combined daemon + index state. One command replaces the former
 /// `status` (daemon progress file) and `health` (DB freshness).
-fn cmd_status(out: &mut Out, watch: bool) -> CmdResult {
+fn cmd_status(out: &mut Out, watch: bool, mounts: bool) -> CmdResult {
     require_root()?;
     let cfg = config()?;
     loop {
@@ -1043,6 +1050,9 @@ fn cmd_status(out: &mut Out, watch: bool) -> CmdResult {
             eprintln!("Waiting for rfindd...");
         } else {
             out.status(progress.as_ref(), health.as_ref(), pid, now());
+            if mounts && !watch && !out.json {
+                print_mount_report(&cfg);
+            }
             let done = progress
                 .as_ref()
                 .map(|p| p.phase == DaemonPhase::Ready)
@@ -1053,6 +1063,88 @@ fn cmd_status(out: &mut Out, watch: bool) -> CmdResult {
         }
         thread::sleep(Duration::from_secs(1));
     }
+}
+
+/// For `rfind status --mounts`: enumerate every mount under a live
+/// root and classify how rfindd treats it. The classifier is the same
+/// `MountEntry::index_strategy()` the daemon uses, so this reads as
+/// a precise "why don't I see X?" tool rather than a guess.
+fn print_mount_report(cfg: &rfind_config::Config) {
+    use rfind_core::mounts::{read_mountinfo, IndexStrategy};
+
+    let mounts = read_mountinfo();
+    let under_live = |m: &rfind_core::mounts::MountEntry| {
+        cfg.scan.roots.iter().any(|r| m.point.starts_with(r))
+            || cfg
+                .scan
+                .roots
+                .iter()
+                .any(|r| r.starts_with(&m.point))
+    };
+    let is_excluded = |p: &std::path::Path| cfg.scan.exclude.iter().any(|e| p.starts_with(e));
+
+    println!();
+    println!("Mounts under live roots:");
+    println!("  {:<30} {:<12} {}", "MOUNT", "FSTYPE", "STRATEGY — WHY");
+
+    let mut any = false;
+    for m in mounts.iter().filter(|m| under_live(m)) {
+        any = true;
+        let excluded = is_excluded(&m.point);
+        let (strat, why) = if excluded {
+            (
+                "skip",
+                "excluded by scan.exclude".to_string(),
+            )
+        } else {
+            let s = m.index_strategy();
+            let w = match s {
+                IndexStrategy::FanotifyLive => "local block fs; live via fanotify",
+                IndexStrategy::InotifyLive => "non-block-local fs; live via inotify",
+                IndexStrategy::PeriodicRescan => {
+                    if m.fstype.starts_with("fuse") {
+                        "fuse fs; events unreliable, rescan periodically"
+                    } else if matches!(
+                        m.fstype.as_str(),
+                        "nfs" | "nfs4" | "cifs" | "smb3" | "ceph" | "glusterfs"
+                    ) {
+                        "network fs; fanotify can't see remote changes"
+                    } else if matches!(m.fstype.as_str(), "overlay" | "squashfs" | "erofs") {
+                        "stacked/image fs; fanotify can't mark reliably"
+                    } else if matches!(m.fstype.as_str(), "9p" | "drvfs" | "virtiofs") {
+                        "shared-page fs; fanotify fragile, rescan periodically"
+                    } else if m.fstype == "ecryptfs" {
+                        "stacked fs; events unreliable, rescan periodically"
+                    } else {
+                        "classified as unmonitorable"
+                    }
+                }
+                IndexStrategy::OnceAtStartup => "read-only image; walked once at startup",
+                IndexStrategy::Skip => "pseudo fs (proc/sys/dev/...)",
+            };
+            let s = match s {
+                IndexStrategy::FanotifyLive => "fanotify",
+                IndexStrategy::InotifyLive => "inotify",
+                IndexStrategy::PeriodicRescan => "rescan",
+                IndexStrategy::OnceAtStartup => "once",
+                IndexStrategy::Skip => "skip",
+            };
+            (s, w.to_string())
+        };
+        println!(
+            "  {:<30} {:<12} {:<8} — {}",
+            m.point.display(),
+            m.fstype,
+            strat,
+            why
+        );
+    }
+    if !any {
+        println!("  (no mounts under configured roots)");
+    }
+    println!();
+    println!("To rescan a non-live mount periodically:  rfind config periodic add <path>");
+    println!("To exclude a mount entirely:              rfind config exclude add <path>");
 }
 
 fn cmd_stats(out: &mut Out) -> CmdResult {
@@ -1208,7 +1300,7 @@ fn main() -> ExitCode {
                 filter,
             } => legacy_largest(&mut out, under, limit, filter),
             Command::Uninstall { purge, yes } => uninstall::run(&mut out, purge, yes),
-            Command::Status { watch } => cmd_status(&mut out, watch),
+            Command::Status { watch, mounts } => cmd_status(&mut out, watch, mounts),
             Command::Stats => cmd_stats(&mut out),
             Command::Update => cmd_signal(
                 &mut out,
