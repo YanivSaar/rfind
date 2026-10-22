@@ -83,14 +83,30 @@ impl ScanProgress {
     }
 }
 
+/// Path to the daemon's progress.json. Resolution:
+///
+/// 1. `RFINDD_PROGRESS_PATH` env — debug builds only (test harness).
+/// 2. User-mode progress at `$XDG_RUNTIME_DIR/rfind/progress.json`
+///    when the invoking user has one (`rfindd --user`, v1.10.1+).
+/// 3. System progress at `/run/rfindd/progress.json`.
 pub fn progress_file_path() -> std::path::PathBuf {
-    // Debug builds honor RFINDD_PROGRESS_PATH so integration tests can point
-    // the daemon at a tempdir. Release builds (production) ignore it: the
-    // daemon runs as root and env is controlled by whoever can set the
-    // systemd unit, so an override there would be defense-in-depth noise.
     #[cfg(debug_assertions)]
     if let Some(v) = std::env::var_os("RFINDD_PROGRESS_PATH") {
         return std::path::PathBuf::from(v);
+    }
+    // config module owns the XDG helpers; keep this crate dep-free by
+    // computing the user path inline.
+    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+        let p = std::path::PathBuf::from(xdg).join("rfind").join("progress.json");
+        if p.is_file() {
+            return p;
+        }
+    } else if let Ok(home) = std::env::var("HOME") {
+        let p = std::path::PathBuf::from(home)
+            .join(".local/share/rfind/progress.json");
+        if p.is_file() {
+            return p;
+        }
     }
     std::path::PathBuf::from("/run/rfindd/progress.json")
 }

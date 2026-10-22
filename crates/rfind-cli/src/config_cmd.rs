@@ -128,10 +128,27 @@ pub enum PeriodicCmd {
     List,
 }
 
+/// Config path for the CLI. Precedence:
+///
+/// 1. `RFIND_CONFIG` env var — explicit opt-in, used by tests and
+///    operators who keep a config outside the standard locations.
+/// 2. Per-user config at `$XDG_CONFIG_HOME/rfind/config.toml` if it
+///    exists — written by `rfindd --user` on first run.
+/// 3. System config `/etc/rfindd/config.toml` — written by the system
+///    daemon; only root can usually read it.
+///
+/// The user-mode fallback was added in v1.10.1 so `rfind name foo`
+/// run as a non-root user talks to the user daemon's index without
+/// trying (and failing) to read the root-owned system config.
 pub fn config_path() -> PathBuf {
-    std::env::var_os("RFIND_CONFIG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(rfind_config::DEFAULT_CONFIG_PATH))
+    if let Some(v) = std::env::var_os("RFIND_CONFIG") {
+        return PathBuf::from(v);
+    }
+    let user = rfind_config::user_paths::config_path();
+    if user.is_file() {
+        return user;
+    }
+    PathBuf::from(rfind_config::DEFAULT_CONFIG_PATH)
 }
 
 fn edit_err(e: EditError) -> Failed {

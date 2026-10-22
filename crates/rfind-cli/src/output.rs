@@ -281,6 +281,10 @@ impl Out {
                         "monitoring": h.monitoring_mode,
                         "events_pending": h.pending_events,
                         "db_size_bytes": h.db_size_bytes,
+                        "db_size_logical_bytes": h.db_size_logical_bytes,
+                        "compression_ratio": if h.db_size_bytes > 0 {
+                            h.db_size_logical_bytes as f64 / h.db_size_bytes as f64
+                        } else { 1.0 },
                         "indexed_bytes": h.total_bytes,
                         "last_full_scan": h.last_scan_completed,
                         "last_scan_age_secs": age,
@@ -331,6 +335,35 @@ impl Out {
                 .last_scan_completed
                 .map(|t| format!("{} ago", format_duration(now - t)))
                 .unwrap_or_else(|| "never".into());
+            // zvfs compressed-page store: show the ratio alongside the
+            // raw on-disk number so operators can see at a glance
+            // whether compaction has run and how much zstd + name
+            // interning are saving. Logical size is SQLite's
+            // page_count * page_size; on-disk sums every zdata
+            // generation + WAL. For plain stores (--no-compress)
+            // logical == on-disk and we hide the ratio line.
+            let bytes_per_entry = if h.entry_count > 0 {
+                h.db_size_bytes as f64 / h.entry_count as f64
+            } else {
+                0.0
+            };
+            let compressed = h.db_size_logical_bytes > h.db_size_bytes
+                && h.db_size_bytes > 0;
+            let compression_line = if compressed {
+                let ratio = h.db_size_logical_bytes as f64 / h.db_size_bytes as f64;
+                let saved = h.db_size_logical_bytes.saturating_sub(h.db_size_bytes);
+                format!(
+                    "Compression    : {:.2}× (logical {}, saved {}, {:.1} B/entry)\n",
+                    ratio,
+                    format_bytes(h.db_size_logical_bytes),
+                    format_bytes(saved),
+                    bytes_per_entry,
+                )
+            } else if h.entry_count > 0 {
+                format!("DB density     : {:.1} B/entry\n", bytes_per_entry)
+            } else {
+                String::new()
+            };
             text += &format!(
                 "Status         : {status}\n\
                  Last full scan : {age}\n\
@@ -339,7 +372,8 @@ impl Out {
                  Files          : {} ({})\n\
                  Monitoring     : {}\n\
                  Events pending : {}\n\
-                 DB size        : {}\n",
+                 DB size        : {}\n\
+                 {compression_line}",
                 h.entry_count,
                 h.dir_count,
                 h.file_count,

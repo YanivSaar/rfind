@@ -1,20 +1,27 @@
 //! Finding and signalling the running rfindd.
 
-/// PID of the running rfindd. Prefers the daemon's own pidfile at
-/// /run/rfindd/rfindd.pid (written while holding an exclusive flock), and
-/// falls back to a /proc scan when the pidfile isn't there (older daemon,
-/// or /run/rfindd not available).
+/// PID of the running rfindd. Prefers the daemon's own pidfile.
+/// Pidfile search order:
+///   1. User-mode pidfile at $XDG_RUNTIME_DIR/rfind/rfindd.pid when
+///      the invoking user has one (v1.10.1).
+///   2. System pidfile at /run/rfindd/rfindd.pid.
+///   3. /proc scan as last resort (older daemon, no pidfile).
 pub fn rfindd_pid() -> Option<libc::pid_t> {
-    if let Ok(s) = std::fs::read_to_string("/run/rfindd/rfindd.pid") {
-        if let Ok(pid) = s.trim().parse::<libc::pid_t>() {
-            // kill(pid, 0) only checks that the pid exists — if the
-            // daemon crashed without clearing the pidfile and the pid
-            // was reused (kernel OOM killer, external SIGKILL), we'd
-            // signal an unrelated process. In uninstall --purge that
-            // signal is SIGKILL as root, which could kill a critical
-            // daemon. Verify /proc/<pid>/comm == "rfindd" too.
-            if unsafe { libc::kill(pid, 0) } == 0 && is_rfindd(pid) {
-                return Some(pid);
+    let candidates = [
+        rfind_config::user_paths::pidfile_path(),
+        std::path::PathBuf::from("/run/rfindd/rfindd.pid"),
+    ];
+    for p in &candidates {
+        if let Ok(s) = std::fs::read_to_string(p) {
+            if let Ok(pid) = s.trim().parse::<libc::pid_t>() {
+                // kill(pid, 0) only checks that the pid exists — if the
+                // daemon crashed without clearing the pidfile and the
+                // pid was reused (kernel OOM killer, external SIGKILL),
+                // we'd signal an unrelated process. Verify /proc/<pid>
+                // basename too.
+                if unsafe { libc::kill(pid, 0) } == 0 && is_rfindd(pid) {
+                    return Some(pid);
+                }
             }
         }
     }

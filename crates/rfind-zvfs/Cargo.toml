@@ -1,6 +1,6 @@
 [package]
 name = "rfind-zvfs"
-version = "1.10.1"
+version = "1.10.2"
 edition = "2021"
 description = "SQLite VFS that stores the main database file zstd-compressed"
 

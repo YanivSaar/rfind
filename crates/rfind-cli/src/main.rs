@@ -1048,7 +1048,12 @@ fn cmd_size(out: &mut Out, path: &str, top: usize) -> CmdResult {
 /// Combined daemon + index state. One command replaces the former
 /// `status` (daemon progress file) and `health` (DB freshness).
 fn cmd_status(out: &mut Out, watch: bool, mounts: bool) -> CmdResult {
-    require_root()?;
+    // User mode: a non-root caller with their own per-user index gets
+    // the status of their own daemon, no sudo needed. require_root()
+    // still gates the system daemon's state.
+    if !mode::user_index_available() {
+        require_root()?;
+    }
     let cfg = config()?;
     loop {
         if watch && !out.json {

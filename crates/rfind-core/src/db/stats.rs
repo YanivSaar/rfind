@@ -17,6 +17,12 @@ pub struct HealthInfo {
     pub monitoring_mode: String,
     pub pending_events: i64,
     pub db_size_bytes: u64,
+    /// SQLite's view of the database's uncompressed size:
+    /// `page_count * page_size`. For zvfs-compressed stores this is
+    /// what the index "would weigh" without zstd + name interning.
+    /// Compared to `db_size_bytes` it yields the live compression
+    /// ratio, surfaced by `rfind status`.
+    pub db_size_logical_bytes: u64,
     /// Sum of all indexed file sizes.
     pub total_bytes: u64,
 }
@@ -27,6 +33,13 @@ pub fn get_health(conn: &Connection, db_path: &Path) -> Result<HealthInfo> {
         [],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
+    let page_count: i64 = conn
+        .query_row("PRAGMA page_count", [], |r| r.get(0))
+        .unwrap_or(0);
+    let page_size: i64 = conn
+        .query_row("PRAGMA page_size", [], |r| r.get(0))
+        .unwrap_or(0);
+    let db_size_logical_bytes = (page_count.max(0) as u64) * (page_size.max(0) as u64);
     let last_scan = get_metadata(conn, "last_scan_completed")?.and_then(|v| v.parse::<i64>().ok());
     let last_count = get_metadata(conn, "last_entry_count")?.and_then(|v| v.parse::<i64>().ok());
     let monitoring_mode =
@@ -41,6 +54,7 @@ pub fn get_health(conn: &Connection, db_path: &Path) -> Result<HealthInfo> {
         monitoring_mode,
         pending_events: pending_event_count(conn)?,
         db_size_bytes: db_size_bytes(db_path),
+        db_size_logical_bytes,
         total_bytes: total_bytes as u64,
     })
 }
