@@ -38,6 +38,12 @@ jobs:
         working-directory: fuzz
         run: |
           set -o pipefail
+          # libFuzzer requires the corpus directory to exist before it
+          # starts — `cargo fuzz run <target> corpus/<target>` with a
+          # missing directory errors out before any work. The corpus is
+          # scratch state (we don't track it in git; seeds/ is what
+          # ships), so recreate it on each run.
+          mkdir -p corpus/${{ matrix.target }}
           # Pass the committed seeds corpus explicitly so libFuzzer starts
           # from known-interesting inputs instead of /dev/urandom bytes.
           cargo +nightly fuzz run ${{ matrix.target }} \
