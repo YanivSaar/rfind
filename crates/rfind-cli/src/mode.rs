@@ -87,7 +87,13 @@ pub fn choose_mode<'a>(req: &Request, env: &Env<'a>) -> Result<(Mode, Option<Str
     if req.walk_only_filter || matches!(req.symlinks, SymlinkMode::H | SymlinkMode::L) {
         return Ok((Mode::Walk, None));
     }
+    // A per-user index (built by `rfindd --user`) is readable without
+    // root — prefer it over live-walk when it exists. The system index
+    // still needs root; keep the walk fallback for everyone else.
     if !env.caller_is_root {
+        if user_index_available() {
+            return Ok((Mode::Index, None));
+        }
         return Ok((Mode::Walk, None));
     }
     if !env.index_available {
@@ -122,9 +128,6 @@ fn index_available_at(path: &Path) -> bool {
 /// `rfindd --user`?  If so, searches run against that one (readable
 /// without root) in auto mode, before falling through to the system
 /// index (root) or live walk.
-#[allow(dead_code)] // Consumed by the auto-mode selector in a follow-up
-                   // CL that wires the per-user index path through
-                   // open_db(); mode.rs lands first.
 pub fn user_index_available() -> bool {
     let p = rfind_config::user_paths::index_path();
     std::fs::metadata(&p)
@@ -133,7 +136,9 @@ pub fn user_index_available() -> bool {
 }
 
 /// Path to the user's per-user index, when it exists.
-#[allow(dead_code)]
+#[allow(dead_code)] // Exposed for callers that want the path even
+                   // without checking availability; mode.rs itself
+                   // only needs user_index_available.
 pub fn user_index_path() -> std::path::PathBuf {
     rfind_config::user_paths::index_path()
 }

@@ -107,15 +107,21 @@ pub fn apply(conn: &Connection, cfg: &Config) -> Changes {
         || prev.exclude != now.exclude
         || prev.collect_mtime != now.collect_mtime;
     let rescan_live = roots_or_exclude_changed;
-    // Periodic roots: rescan if collection settings changed or something
-    // inside them is no longer excluded. New periodic roots are scanned
+    // Periodic roots: rescan if collection settings changed or an
+    // *ancestor* exclude was removed. New periodic roots are scanned
     // anyway (they have no last-scan time).
+    //
+    // Before v1.10.1 the ancestor test was reversed (`e.starts_with(p)`
+    // instead of `p.starts_with(e)`), so removing /mnt from excludes
+    // did not re-arm periodic roots like /mnt/c. Combined with v1.9's
+    // overbroad default of /mnt in excludes, WSL2 installs silently
+    // never indexed Windows drives on first run.
     let prev_periodic_paths: std::collections::HashSet<&PathBuf> =
         prev.periodic.iter().map(|p| &p.path).collect();
     for pp in &now.periodic {
         let p = &pp.path;
         let changed = prev.collect_mtime != now.collect_mtime
-            || removed_excludes.iter().any(|e| e.starts_with(p));
+            || removed_excludes.iter().any(|e| p.starts_with(e));
         if changed && prev_periodic_paths.contains(p) {
             let _ = db::set_metadata(conn, &root_scan_key(p), "0");
             info!(

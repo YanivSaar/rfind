@@ -13,6 +13,12 @@ use serde_json::{json, Value};
 use std::io::{self, BufWriter, Write};
 
 pub struct Out {
+    /// Filters results against the invoking user's DAC permissions
+    /// when `sudo rfind` runs on a shared box with
+    /// `search.filter_by_dac = true`. See
+    /// `docs/threat-model.md § 6a`. Default-constructed (disabled)
+    /// unless the caller replaces it.
+    pub dac_filter: crate::dac_filter::DacFilter,
     pub json: bool,
     /// Text mode: show size and modification time with each path.
     pub long: bool,
@@ -105,6 +111,7 @@ pub fn format_bytes(b: u64) -> String {
 impl Out {
     pub fn new(json: bool) -> Self {
         Self {
+            dac_filter: crate::dac_filter::DacFilter::new(false),
             json,
             long: false,
             print0: false,
@@ -130,6 +137,14 @@ impl Out {
     }
 
     pub fn hit(&mut self, h: &Hit) -> bool {
+        // DAC filter (search.filter_by_dac = true, under sudo on a
+        // shared box): drop paths the invoking user could not have
+        // reached with their own `find`. Returning `true` here keeps
+        // the search streaming — a filtered-out result is NOT a stop
+        // signal, just skipped silently.
+        if !self.dac_filter.keep(std::path::Path::new(h.path)) {
+            return true;
+        }
         if self.json {
             let v = json!({ "path": h.path, "type": kind(h.is_dir), "size": h.size, "mtime": h.mtime_sec });
             self.line(&v.to_string())

@@ -515,14 +515,29 @@ fn config() -> Result<rfind_config::Config, Failed> {
 }
 
 /// Open the index read-only: searching never modifies it.
+///
+/// Resolution order:
+/// 1. Per-user index at `$XDG_DATA_HOME/rfind/index.db` if the
+///    invoking user has one built by `rfindd --user`. Readable
+///    without root; opened directly as that user.
+/// 2. System index at `cfg.index.db_path` — requires root.
 fn open_db() -> Result<rusqlite::Connection, Failed> {
+    let user_idx = rfind_config::user_paths::index_path();
+    if user_idx.is_file() {
+        return db::open_readonly(&user_idx).map_err(fail);
+    }
     require_root()?;
     db::open_readonly(&config()?.index.db_path).map_err(fail)
 }
 
 /// Same as [`open_db`] but reuses an already-loaded `Config` to skip the
-/// second file read. The index path is still enforced root-only.
+/// second file read. The user-mode index is preferred when it exists;
+/// the system index then requires root.
 fn open_db_with_cfg(cfg: &rfind_config::Config) -> Result<rusqlite::Connection, Failed> {
+    let user_idx = rfind_config::user_paths::index_path();
+    if user_idx.is_file() {
+        return db::open_readonly(&user_idx).map_err(fail);
+    }
     require_root()?;
     db::open_readonly(&cfg.index.db_path).map_err(fail)
 }
@@ -673,6 +688,7 @@ fn cmd_search_index(out: &mut Out, a: &SearchArgs, cfg: &rfind_config::Config) -
     let conn = open_db_with_cfg(cfg)?;
     let filter = a.filter.filter(now())?;
     let kind = PatternKind::build(a)?;
+    out.dac_filter = dac_filter::DacFilter::new(cfg.search.filter_by_dac);
     if a.recent || a.has_time_filter() {
         return search_by_time(out, &conn, a, &kind, &filter);
     }

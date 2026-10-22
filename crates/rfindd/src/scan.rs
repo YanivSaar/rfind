@@ -113,7 +113,29 @@ pub fn scan_root_with_counter(
     let cfg = &ctx.cfg;
     let scan_gen = next_scan_gen(&ctx.conn);
     let nested = nested_roots(cfg, root);
-    let mut skip: Vec<PathBuf> = cfg.scan.exclude.clone();
+    // Periodic-root opt-in overrides ancestor excludes: if the operator
+    // explicitly added /mnt/c as a periodic root and /mnt happens to be
+    // in `exclude`, scan /mnt/c anyway. Without this, the exclude's
+    // prefix match in skip_dir rejects every child of the periodic
+    // root and the scan silently completes with 0 entries — the symptom
+    // behind the v1.10 WSL2 regression. We still keep siblings/other
+    // branches of the exclude in effect; only ancestors of this scan
+    // root are dropped.
+    let is_periodic = cfg
+        .scan
+        .periodic_roots
+        .iter()
+        .any(|r| r.path == *root);
+    let mut skip: Vec<PathBuf> = if is_periodic {
+        cfg.scan
+            .exclude
+            .iter()
+            .filter(|e| !root.starts_with(e))
+            .cloned()
+            .collect()
+    } else {
+        cfg.scan.exclude.clone()
+    };
     skip.extend(nested.iter().cloned());
 
     if let Some(w) = &ctx.watcher {

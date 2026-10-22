@@ -202,7 +202,12 @@ impl Default for ScanConfig {
                 PathBuf::from("/dev"),
                 PathBuf::from("/run"),
                 PathBuf::from("/media"),
-                PathBuf::from("/mnt"),
+                // `/mnt` is intentionally NOT excluded by default. On WSL2
+                // Windows drives are mounted under /mnt (and the installer
+                // auto-adds them to periodic_roots), and on other systems
+                // /mnt is a common place to mount drives the operator wants
+                // indexed. Excluding it caused v1.10 WSL2 installs to
+                // silently never index anything on /mnt/c, /mnt/d.
                 PathBuf::from("/var/lib/flatpak"),
                 PathBuf::from("/var/lib/snapd"),
                 PathBuf::from("/snap"),
@@ -494,12 +499,10 @@ impl Config {
                 message: m,
             })
         };
-        for r in self
-            .scan
-            .roots
-            .iter()
-            .chain(self.scan.periodic_roots.iter().map(|p| &p.path))
-        {
+        // Errors accumulated inside the warn-closure borrow scope; appended
+        // after the closure's lifetime ends.
+        let mut extra_errors: Vec<Problem> = Vec::new();
+        for r in self.scan.roots.iter() {
             if r.is_absolute() && !r.exists() {
                 warn(format!("{} does not exist (yet)", r.display()));
             }
@@ -508,6 +511,29 @@ impl Config {
                     "{} is inside an exclude and will not be indexed",
                     r.display()
                 ));
+            }
+        }
+        // Periodic roots: before v1.10.1 we only *warned* when one was
+        // inside an exclude. The scan then completed with 0 entries
+        // silently and marked last_scan=now, locking out further scans
+        // for a full interval. That caused the v1.10 WSL2 regression.
+        // Hard-error now; the operator removes the conflicting
+        // exclude or removes the periodic root. `scan_root` additionally
+        // drops ancestor excludes at runtime as a belt-and-braces guard.
+        for p in &self.scan.periodic_roots {
+            if p.path.is_absolute() && !p.path.exists() {
+                warn(format!("{} does not exist (yet)", p.path.display()));
+            }
+            if let Some(e) = self.scan.exclude.iter().find(|e| p.path.starts_with(e)) {
+                extra_errors.push(Problem {
+                    error: true,
+                    message: format!(
+                        "periodic root {} is inside exclude {} — drop one; a periodic root \
+                         inside an exclude would silently never be indexed",
+                        p.path.display(),
+                        e.display()
+                    ),
+                });
             }
         }
         // With both live backends off and no periodic rescan, the index
@@ -525,6 +551,8 @@ impl Config {
                     .into(),
             );
         }
+        drop(warn);
+        out.extend(extra_errors);
         out
     }
 }

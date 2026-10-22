@@ -420,6 +420,16 @@ if ! [ -r /usr/share/bash-completion/bash_completion ] \
     warn "then start a new shell."
 fi
 
+# Heal v1.9/v1.10 configs that still carry /mnt as a default exclude:
+# that exclude silently neutralises /mnt/c and /mnt/d periodic roots on
+# WSL2, which is why fresh v1.10 installs saw entries stuck in the
+# low tens of thousands. The daemon validator in 1.10.1+ hard-errors
+# on this combination, so we have to strip it before start.
+if [ -f "$CONFIG" ] && grep -qE '^\s*"/mnt"\s*,' "$CONFIG" 2>/dev/null; then
+    "$BIN_DIR/rfind" config exclude remove /mnt --no-reload >/dev/null 2>&1 || true
+    ok "removed legacy /mnt exclude (v1.9/v1.10 default; see v1.10.1 fix)"
+fi
+
 # First install on WSL2: Windows drives get periodic rescans, not live
 # monitoring (the kernel sees no events for changes made from Windows).
 if [ ! -f "$CONFIG" ] && grep -qi microsoft /proc/version 2>/dev/null; then
