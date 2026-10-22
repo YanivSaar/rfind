@@ -118,6 +118,26 @@ fn index_available_at(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Does the invoking user have their own per-user index built by
+/// `rfindd --user`?  If so, searches run against that one (readable
+/// without root) in auto mode, before falling through to the system
+/// index (root) or live walk.
+#[allow(dead_code)] // Consumed by the auto-mode selector in a follow-up
+                   // CL that wires the per-user index path through
+                   // open_db(); mode.rs lands first.
+pub fn user_index_available() -> bool {
+    let p = rfind_config::user_paths::index_path();
+    std::fs::metadata(&p)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+}
+
+/// Path to the user's per-user index, when it exists.
+#[allow(dead_code)]
+pub fn user_index_path() -> std::path::PathBuf {
+    rfind_config::user_paths::index_path()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -77,8 +77,16 @@ pub struct ScanConfig {
     /// /mnt/c (changes made from Windows never generate events).
     /// A periodic root nested inside a live root is skipped by that root.
     pub periodic_roots: Vec<PeriodicRoot>,
-    /// Paths to skip entirely (no index, no recursion).
+    /// Paths to skip entirely (no index, no recursion). Absolute
+    /// prefix match: `/var/log` matches `/var/log/anything`.
     pub exclude: Vec<PathBuf>,
+    /// Directory *basenames* to skip anywhere they appear in the tree.
+    /// Equivalent to a `**/<name>` glob. Use for roots that are
+    /// re-mounted at many paths (btrfs snapshots at `.snapshots`,
+    /// ZFS at `.zfs`, Git packs at `.git/objects` via `.git`), or for
+    /// well-known cache dirs that bloat the index without benefit
+    /// (`node_modules`, `__pycache__`, `.venv`).
+    pub exclude_dir_names: Vec<String>,
     /// Worker thread count. 0 = num_cpus.
     pub workers: usize,
     /// Hours between automatic re-indexes in index-only mode. 0 = never.
@@ -106,6 +114,19 @@ pub struct PeriodicRoot {
 
 fn default_periodic_interval() -> u64 {
     12
+}
+
+/// Basenames excluded by default from auto-walked trees. btrfs
+/// (`.snapshots`), ZFS (`.zfs`) and Timeshift (`@snapshots`) all
+/// present the live tree many times over through these; indexing
+/// them explodes the DB without finding anything a current-tree
+/// search wouldn't.
+pub fn default_exclude_dir_names() -> Vec<String> {
+    vec![
+        ".snapshots".to_string(),
+        "@snapshots".to_string(),
+        ".zfs".to_string(),
+    ]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,13 +184,30 @@ impl Default for ScanConfig {
         Self {
             roots: vec![PathBuf::from("/")],
             periodic_roots: Vec::new(),
+            // Base exclusions. Pseudo-fs mountpoints (proc/sys/dev/run) are
+            // non-negotiable; the rest keep the index down to a reasonable
+            // size on real-world systems without hiding things the operator
+            // typically searches for. Package stores (Nix/Guix) and
+            // container storage are heavy and churn constantly; snapshots
+            // on btrfs/ZFS multiply the real tree many times over.
             exclude: vec![
                 PathBuf::from("/proc"),
                 PathBuf::from("/sys"),
                 PathBuf::from("/dev"),
                 PathBuf::from("/run"),
                 PathBuf::from("/media"),
+                PathBuf::from("/mnt"),
+                PathBuf::from("/var/lib/flatpak"),
+                PathBuf::from("/var/lib/snapd"),
+                PathBuf::from("/snap"),
+                PathBuf::from("/nix/store"),
+                PathBuf::from("/gnu/store"),
+                PathBuf::from("/var/lib/machines"),
+                PathBuf::from("/var/lib/libvirt"),
+                PathBuf::from("/var/lib/docker/overlay2"),
+                PathBuf::from("/var/lib/containers/storage/overlay"),
             ],
+            exclude_dir_names: default_exclude_dir_names(),
             workers: 0,
             reindex_interval_hours: 6,
             collect_mtime: true,
@@ -224,6 +262,109 @@ pub enum ConfigError {
 
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/rfindd/config.toml";
 
+/// XDG-compliant per-user paths for `rfindd --user` mode. The daemon
+/// runs as the invoking user (no root), monitors with inotify only
+/// (no fanotify FS marks without CAP_SYS_ADMIN), and keeps its state
+/// under the user's own directories so multiple users on one box can
+/// each have their own index without collision.
+pub mod user_paths {
+    use std::path::PathBuf;
+
+    fn home() -> PathBuf {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/"))
+    }
+
+    pub fn config_dir() -> PathBuf {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home().join(".config"))
+            .join("rfind")
+    }
+
+    pub fn data_dir() -> PathBuf {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home().join(".local").join("share"))
+            .join("rfind")
+    }
+
+    pub fn runtime_dir() -> PathBuf {
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data_dir())
+            .join("rfind")
+    }
+
+    pub fn config_path() -> PathBuf {
+        config_dir().join("config.toml")
+    }
+
+    pub fn index_path() -> PathBuf {
+        data_dir().join("index.db")
+    }
+
+    pub fn pidfile_path() -> PathBuf {
+        runtime_dir().join("rfindd.pid")
+    }
+
+    pub fn progress_path() -> PathBuf {
+        runtime_dir().join("progress.json")
+    }
+
+    /// Default config for a user-mode daemon: index $HOME with the
+    /// obvious cache/trash excludes, inotify-only (fanotify FS marks
+    /// need CAP_SYS_ADMIN in the init userns).
+    pub fn default_user_config() -> super::Config {
+        let h = home();
+        let excludes = [
+            ".cache",
+            ".local/share/Trash",
+            ".local/share/flatpak",
+            "snap",
+            ".var",
+            "node_modules",
+            ".git/objects",
+        ];
+        super::Config {
+            scan: super::ScanConfig {
+                roots: vec![h.clone()],
+                periodic_roots: Vec::new(),
+                exclude: excludes.iter().map(|e| h.join(e)).collect(),
+                exclude_dir_names: {
+                    let mut v = super::default_exclude_dir_names();
+                    v.extend([
+                        "node_modules".to_string(),
+                        "__pycache__".to_string(),
+                        ".venv".to_string(),
+                        ".tox".to_string(),
+                        "target".to_string(),
+                    ]);
+                    v
+                },
+                workers: 0,
+                reindex_interval_hours: 12,
+                collect_mtime: true,
+                io_uring: true,
+                max_depth: 4096,
+            },
+            index: super::IndexConfig {
+                db_path: index_path(),
+                batch_size: 10_000,
+                compress: true,
+            },
+            monitor: super::MonitorConfig {
+                prefer_fanotify: false,
+                inotify_fallback: true,
+                watch_new_mounts: false,
+            },
+            search: super::SearchConfig::default(),
+            log: super::LogConfig::default(),
+        }
+    }
+}
+
 /// Load config from the given path, falling back to defaults if not found.
 pub fn load(path: &Path) -> Result<Config, ConfigError> {
     if !path.exists() {
@@ -241,10 +382,21 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
 
 /// Write default config to the given path (for first-time install).
 pub fn write_default(path: &Path) -> std::io::Result<()> {
+    write_default_cfg(path, &Config::default())
+}
+
+/// Write a user-mode default config (XDG paths, inotify-only, $HOME root)
+/// to the given path. Used by `rfindd --user` first-run.
+pub fn write_default_user(path: &Path) -> std::io::Result<()> {
+    write_default_cfg(path, &user_paths::default_user_config())
+}
+
+fn write_default_cfg(path: &Path, cfg: &Config) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, default_toml())
+    let text = toml::to_string_pretty(cfg).expect("Default config serialization failed");
+    std::fs::write(path, text)
 }
 
 /// The default configuration as TOML.

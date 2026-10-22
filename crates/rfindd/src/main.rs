@@ -84,16 +84,38 @@ fn lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// Config path: `RFIND_CONFIG` overrides the default.
+/// Daemon mode: system (root, /etc/rfindd, /var/lib/rfindd, /run/rfindd)
+/// or user (XDG paths under the invoking user's home).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonMode {
+    System,
+    User,
+}
+
+/// The mode is latched once at startup from argv. All path helpers
+/// consult it instead of threading a flag through every call site.
+static DAEMON_MODE: std::sync::OnceLock<DaemonMode> = std::sync::OnceLock::new();
+
+fn daemon_mode() -> DaemonMode {
+    *DAEMON_MODE.get().unwrap_or(&DaemonMode::System)
+}
+
+/// Config path.
 ///
+/// System mode: `RFIND_CONFIG` overrides the default `/etc/rfindd/config.toml`.
 /// The daemon runs as root, so whoever can set its environment can also
 /// swap its config. `systemctl edit` and malicious unit drop-ins both do
 /// this. Restrict the override to absolute paths under `/etc/rfindd/`:
 /// the config dir is already 0640 and only root-writable, so anything an
 /// attacker places there needs root first. Anything else logs a warning
-/// and falls back to the default. The CLI (`rfind-cli`) stays permissive
-/// — it runs as the user and reads a config they already own.
+/// and falls back to the default.
+///
+/// User mode: config path is `$XDG_CONFIG_HOME/rfind/config.toml`, with
+/// no override — the user owns their own home.
 fn config_path() -> PathBuf {
+    if daemon_mode() == DaemonMode::User {
+        return rfind_config::user_paths::config_path();
+    }
     let default = PathBuf::from(DEFAULT_CONFIG_PATH);
     let Some(v) = std::env::var_os("RFIND_CONFIG") else {
         return default;
@@ -145,16 +167,22 @@ fn pidfile_path() -> PathBuf {
     if let Some(v) = std::env::var_os("RFINDD_PIDFILE_PATH") {
         return PathBuf::from(v);
     }
+    if daemon_mode() == DaemonMode::User {
+        return rfind_config::user_paths::pidfile_path();
+    }
     PathBuf::from("/run/rfindd/rfindd.pid")
 }
 
-/// Parse argv once, latch results. Supported flags: `--pidfile=PATH`,
+/// Parse argv once, latch results into statics (DAEMON_MODE +
+/// CLI_PIDFILE). Supported flags: `--user`, `--pidfile=PATH`,
 /// `--help`, `--version`. Anything else exits 2.
 fn parse_argv_once() {
     let mut args = std::env::args().skip(1);
     let mut pidfile = None;
+    let mut user_mode = false;
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--user" => user_mode = true,
             "--pidfile" => match args.next() {
                 Some(v) => pidfile = Some(PathBuf::from(v)),
                 None => die_usage(),
@@ -179,6 +207,7 @@ fn parse_argv_once() {
             std::process::exit(2);
         }
     }
+    let _ = DAEMON_MODE.set(if user_mode { DaemonMode::User } else { DaemonMode::System });
     let _ = CLI_PIDFILE.set(pidfile);
 }
 
@@ -190,10 +219,15 @@ fn cli_pidfile() -> Option<PathBuf> {
 
 fn print_usage() {
     let bin = env!("CARGO_PKG_NAME");
-    println!("Usage: {bin} [--pidfile=PATH]");
+    println!("Usage: {bin} [--user] [--pidfile=PATH]");
     println!();
     println!("Options:");
-    println!("  --pidfile=PATH   Write the pidfile at PATH (default /run/rfindd/rfindd.pid).");
+    println!("  --user           Per-user daemon: use XDG paths under $HOME, inotify only,");
+    println!("                   no root. Config at $XDG_CONFIG_HOME/rfind/config.toml,");
+    println!("                   index at $XDG_DATA_HOME/rfind/index.db, pidfile at");
+    println!("                   $XDG_RUNTIME_DIR/rfind/rfindd.pid.");
+    println!("  --pidfile=PATH   Write the pidfile at PATH (default /run/rfindd/rfindd.pid in");
+    println!("                   system mode, $XDG_RUNTIME_DIR/rfind/rfindd.pid in user mode).");
     println!("                   Used by non-systemd init scripts.");
     println!("  -h, --help       Show this message.");
     println!("  -V, --version    Print version.");
@@ -308,7 +342,12 @@ mod tests {
 fn load_effective_config(table: &[mounts::MountEntry]) -> Result<Config, String> {
     let path = config_path();
     if !path.exists() {
-        match write_default(&path) {
+        let r = if daemon_mode() == DaemonMode::User {
+            rfind_config::write_default_user(&path)
+        } else {
+            write_default(&path)
+        };
+        match r {
             Ok(()) => info!("Wrote default config to {}", path.display()),
             Err(e) => warn!("Could not write default config: {e}"),
         }

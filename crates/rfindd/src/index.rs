@@ -62,7 +62,23 @@ pub fn flush_batch(conn: &Connection, batch: &mut Vec<EntryInfo>, scan_gen: i64)
 }
 
 pub fn is_excluded(cfg: &Config, path: &Path) -> bool {
-    cfg.scan.exclude.iter().any(|ex| path.starts_with(ex))
+    if cfg.scan.exclude.iter().any(|ex| path.starts_with(ex)) {
+        return true;
+    }
+    // Match basenames anywhere in the tree: a path is excluded if any
+    // of its components equals one of `exclude_dir_names`. This gives
+    // `**/.snapshots`, `**/.zfs`, `**/node_modules` semantics without
+    // a glob dep. Comparison is OsStr-exact (no case folding).
+    if !cfg.scan.exclude_dir_names.is_empty() {
+        for comp in path.components() {
+            if let std::path::Component::Normal(c) = comp {
+                if cfg.scan.exclude_dir_names.iter().any(|n| c == n.as_str()) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Make the index agree with the filesystem for one path.

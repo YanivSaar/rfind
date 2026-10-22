@@ -1,0 +1,68 @@
+[Unit]
+# rfind — per-user filesystem indexing daemon.
+#
+# Runs as the invoking user (no root), using inotify only (fanotify
+# filesystem marks need CAP_SYS_ADMIN in the init user namespace, and a
+# normal user does not have that even with sudo-less sudo). Indexes
+# $HOME by default; edit $XDG_CONFIG_HOME/rfind/config.toml to change.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   install -m 644 rfindd.user.service ~/.config/systemd/user/rfindd.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now rfindd
+#   # Optional: loginctl enable-linger $USER   # keeps it running across logout
+#
+# `rfind` picks up the user index automatically when invoked as the
+# same user (see mode.rs).
+
+Description=rfind per-user filesystem indexing daemon
+Documentation=https://github.com/YanivSaar/rfind
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/rfindd --user
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+
+# Idle I/O so the whole-home scan doesn't contend with interactive work.
+IOSchedulingClass=idle
+Nice=19
+
+# $XDG_RUNTIME_DIR is already created by systemd-logind at session
+# start; our paths sit under it. Same for $XDG_DATA_HOME.
+Environment=HOME=%h
+
+# No network needed. Keep AF_UNIX for journald.
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+# Standard systemd hardening — this is a user service, so
+# ProtectSystem=strict isn't appropriate (we're not system-wide), but
+# the rest applies.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+# System-call surface: user mode doesn't call fanotify_init / mark —
+# the inotify family only. Drop the privileged syscalls.
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @reboot @swap @module @obsolete @privileged
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rfindd-user
+
+[Install]
+WantedBy=default.target

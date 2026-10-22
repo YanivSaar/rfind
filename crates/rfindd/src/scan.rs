@@ -190,7 +190,20 @@ pub fn scan_root_with_counter(
     .with_io_uring(cfg.scan.io_uring && io_uring_ok)
     .with_cancel(Arc::clone(&ctx.cancel))
     .with_error_handler(|p, e| warn!("scan error {}: {}", sanitize_path(p), e))
-    .with_skip_dir(move |p| skip.iter().any(|ex| p.starts_with(ex)))
+    .with_skip_dir({
+        let names = cfg.scan.exclude_dir_names.clone();
+        move |p| {
+            if skip.iter().any(|ex| p.starts_with(ex)) {
+                return true;
+            }
+            if let Some(name) = p.file_name() {
+                if names.iter().any(|n| name == n.as_str()) {
+                    return true;
+                }
+            }
+            false
+        }
+    })
     .with_max_depth(if cfg.scan.max_depth == 0 {
         None
     } else {

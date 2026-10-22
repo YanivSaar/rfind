@@ -83,6 +83,66 @@ impl MountEntry {
         matches!(self.fstype.as_str(), "9p" | "drvfs" | "virtiofs")
     }
 
+    /// How this mount should be treated by the indexing + monitoring
+    /// pipeline. A single enum per mount is clearer than the mix of
+    /// is_pseudo/is_unmonitorable/is_local_block booleans and gives
+    /// each callsite one place to decide.
+    pub fn index_strategy(&self) -> IndexStrategy {
+        if self.is_pseudo() {
+            return IndexStrategy::Skip;
+        }
+        if self.is_unmonitorable() {
+            return IndexStrategy::PeriodicRescan;
+        }
+        // eCryptfs is stacked FUSE-ish: event delivery is unreliable
+        // across the stack but a one-shot walk of the mounted view
+        // works. Treat like a periodic root.
+        if self.fstype == "ecryptfs" {
+            return IndexStrategy::PeriodicRescan;
+        }
+        if self.is_local_block_fs() {
+            return IndexStrategy::FanotifyLive;
+        }
+        IndexStrategy::InotifyLive
+    }
+}
+
+/// Per-filesystem indexing + monitoring strategy. One enum variant
+/// per real behavior; the daemon's main loop picks branches from this
+/// instead of a mix of booleans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexStrategy {
+    /// Attach a fanotify FS mark and expect live events.
+    FanotifyLive,
+    /// Watch directories with inotify (per-dir watches).
+    InotifyLive,
+    /// Walk once at startup and again on scan.reindex_interval_hours.
+    /// No live events; the operator opted into stale-for-a-few-hours.
+    PeriodicRescan,
+    /// Walk once at startup, never again. For read-only images (ISOs,
+    /// squashfs mounted at a stable path).
+    OnceAtStartup,
+    /// Pseudo-fs, excluded, or otherwise ignored.
+    Skip,
+}
+
+impl IndexStrategy {
+    pub fn walks_at_startup(self) -> bool {
+        matches!(
+            self,
+            IndexStrategy::FanotifyLive
+                | IndexStrategy::InotifyLive
+                | IndexStrategy::PeriodicRescan
+                | IndexStrategy::OnceAtStartup
+        )
+    }
+
+    pub fn uses_fanotify(self) -> bool {
+        matches!(self, IndexStrategy::FanotifyLive)
+    }
+}
+
+impl MountEntry {
     /// Allowlist of local, block-device-backed filesystems that are safe
     /// to auto-index when a new mount appears under a live root. We used
     /// to rely on a FUSE-family denylist, but unprivileged users with
@@ -371,6 +431,29 @@ mod tests {
             skipped.iter().map(|m| m.point.clone()).collect::<Vec<_>>(),
             vec![PathBuf::from("/usr/lib/wsl/lib")]
         );
+    }
+
+    #[test]
+    fn index_strategy_classifies_known_fstypes() {
+        let mk = |fstype: &str| MountEntry {
+            dev: "0:1".into(),
+            fsroot: PathBuf::from("/"),
+            point: PathBuf::from("/x"),
+            fstype: fstype.into(),
+            super_options: String::new(),
+        };
+        assert_eq!(mk("ext4").index_strategy(), IndexStrategy::FanotifyLive);
+        assert_eq!(mk("btrfs").index_strategy(), IndexStrategy::FanotifyLive);
+        assert_eq!(mk("tmpfs").index_strategy(), IndexStrategy::InotifyLive);
+        assert_eq!(mk("virtiofs").index_strategy(), IndexStrategy::PeriodicRescan);
+        assert_eq!(mk("nfs4").index_strategy(), IndexStrategy::PeriodicRescan);
+        assert_eq!(mk("fuse.sshfs").index_strategy(), IndexStrategy::PeriodicRescan);
+        assert_eq!(mk("ecryptfs").index_strategy(), IndexStrategy::PeriodicRescan);
+        assert_eq!(mk("proc").index_strategy(), IndexStrategy::Skip);
+        assert_eq!(mk("sysfs").index_strategy(), IndexStrategy::Skip);
+        assert!(mk("ext4").index_strategy().uses_fanotify());
+        assert!(!mk("tmpfs").index_strategy().uses_fanotify());
+        assert!(!mk("proc").index_strategy().walks_at_startup());
     }
 
     #[test]
