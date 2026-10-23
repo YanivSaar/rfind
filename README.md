@@ -11,6 +11,15 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform: Linux](https://img.shields.io/badge/platform-Linux-green.svg)](https://kernel.org)
 
+<video src="https://raw.githubusercontent.com/YanivSaar/rfind/main/docs/media/rfind-brag.mp4"
+       poster="https://raw.githubusercontent.com/YanivSaar/rfind/main/docs/media/rfind-brag.jpg"
+       controls muted playsinline width="720">
+  <a href="https://raw.githubusercontent.com/YanivSaar/rfind/main/docs/media/rfind-brag.mp4">
+    <img src="https://raw.githubusercontent.com/YanivSaar/rfind/main/docs/media/rfind-brag.jpg"
+         alt="rfind — find any file on your system in milliseconds, not minutes" width="720">
+  </a>
+</video>
+
 </div>
 
 ---
