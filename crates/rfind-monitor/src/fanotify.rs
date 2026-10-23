@@ -438,6 +438,47 @@ pub fn __fuzz_resolve(rec: &[u8]) -> Option<PathBuf> {
     resolve(rec, &marked)
 }
 
+/// Walk an arbitrary byte buffer the same way `event_loop` walks a
+/// kernel-returned fanotify read: outer per-event loop + inner
+/// per-info-record loop. No syscalls, no sink dispatch, no fd close —
+/// just the bounds / version / event_len / rec_len arithmetic. Must
+/// terminate for every input: the invariant proven here is that an
+/// attacker-controllable kernel-boundary buffer cannot drive the
+/// daemon into an infinite loop or a panicking read. Returns the
+/// number of events successfully walked.
+///
+/// Intentional parallel of `event_loop`'s parse logic; keep them in
+/// sync when either changes.
+#[doc(hidden)]
+pub fn __fuzz_parse_buf(buf: &[u8]) -> usize {
+    let meta_len = mem::size_of::<fanotify_event_metadata>();
+    let len = buf.len();
+    let mut off = 0usize;
+    let mut count = 0usize;
+    while off + meta_len <= len {
+        let meta: fanotify_event_metadata =
+            unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off) as *const _) };
+        let event_len = meta.event_len as usize;
+        if meta.vers != libc::FANOTIFY_METADATA_VERSION || event_len < meta_len {
+            break;
+        }
+        let end = (off + event_len).min(len);
+
+        let mut p = off + meta.metadata_len as usize;
+        while p + 4 <= end {
+            let rec_len = u16::from_ne_bytes([buf[p + 2], buf[p + 3]]) as usize;
+            if rec_len < 4 || p + rec_len > end {
+                break;
+            }
+            p += rec_len;
+        }
+
+        count += 1;
+        off = end;
+    }
+    count
+}
+
 /// Resolve a DFID_NAME info record (header + fsid + file_handle + name)
 /// to the full path of the entry it names.
 fn resolve(rec: &[u8], marked: &RwLock<Vec<MarkedFs>>) -> Option<PathBuf> {
@@ -665,10 +706,18 @@ fn event_loop(
         while off + meta_len <= len {
             let meta: fanotify_event_metadata =
                 unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off) as *const _) };
-            if meta.vers != libc::FANOTIFY_METADATA_VERSION || meta.event_len as usize == 0 {
+            // Defensive lower bound: a well-formed event must cover at
+            // least the metadata header itself. event_len==0 would
+            // deadlock the outer loop; event_len<meta_len would mean the
+            // info-record walk starts in the middle of the next event's
+            // header. Neither is reachable with a sane kernel, but
+            // treating this buffer like any other kernel-user boundary
+            // (fuzzed, hard-fail on malformed) matches zvfs' discipline.
+            let event_len = meta.event_len as usize;
+            if meta.vers != libc::FANOTIFY_METADATA_VERSION || event_len < meta_len {
                 break;
             }
-            let end = (off + meta.event_len as usize).min(len);
+            let end = (off + event_len).min(len);
             if meta.fd >= 0 {
                 unsafe { close(meta.fd) };
             }
