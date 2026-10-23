@@ -1,6 +1,6 @@
 [package]
 name = "rfind-config"
-version = "1.10.2"
+version = "1.13.0"
 edition = "2021"
 
 [dependencies]

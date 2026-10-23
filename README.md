@@ -865,7 +865,12 @@ per-entry bytes roughly flat as the index grows.
   readable by unprivileged users
 - Search queries read the index directly — no daemon IPC required
 - The zvfs page store verifies the per-page CRC on **every read**, not only at startup
-  replay — defence-in-depth against on-disk corruption of `index.db-zdata.<gen>`
+  replay — defence-in-depth against on-disk corruption of `index.db-zdata.<gen>`.
+  CRC32 is a **corruption** check, not a cryptographic MAC: an attacker who already has
+  write access to `/var/lib/rfindd/` can craft a page that passes it. The index is
+  `0700` and root-owned precisely so no non-root process has that access. See
+  [`docs/fips.md`](docs/fips.md) and [`docs/threat-model.md`](docs/threat-model.md)
+  for the full integrity-vs-authenticity story.
 - Symlinks are **not followed** during scan (prevents cycles)
 - Excluded paths (default `/proc`, `/sys`, `/dev`, `/run`, `/media`) are never indexed
 - `rfind config edit` uses a private `0700` tmp subdir with `O_CREAT|O_EXCL|O_NOFOLLOW`
@@ -890,6 +895,21 @@ per-entry bytes roughly flat as the index grows.
   invoking user's `fsuid`/`fsgid` and drops paths they could not have reached
   themselves, for shared boxes with multiple sudoers (see
   [`docs/threat-model.md`](docs/threat-model.md) § 6a)
+- **Search results are an index snapshot, not a live filesystem check.** Like
+  every indexed finder (`locate`, `plocate`, …), a path that was present when
+  the index last reconciled may have been renamed, deleted, or replaced by a
+  symlink by the time your pipeline opens it. For destructive automation,
+  re-validate each path before acting on it:
+
+  ```bash
+  rfind "*.log" --print0 | while IFS= read -r -d '' p; do
+      [ -f "$p" ] && [ ! -L "$p" ] && rm -f -- "$p"
+  done
+  ```
+
+  For higher-assurance scripts, open the parent directory once and use
+  `openat()` / `statx()` with `AT_SYMLINK_NOFOLLOW`, or `O_NOFOLLOW` when
+  opening the final component — the index is the planner, not the executor.
 
 ---
 

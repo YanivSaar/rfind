@@ -76,7 +76,7 @@ fn sudo_user_groups(primary: u32) -> Option<Vec<u32>> {
         };
         if rc >= 0 {
             buf.truncate(ngroups as usize);
-            return Some(buf.into_iter().map(|g| g as u32).collect());
+            return Some(buf.into_iter().collect());
         }
         // -1 means buf was too small; libc updated ngroups with the
         // needed size. Retry once. If the second call also fails,
@@ -87,14 +87,9 @@ fn sudo_user_groups(primary: u32) -> Option<Vec<u32>> {
     }
 }
 
+#[derive(Default)]
 pub struct DacFilter {
     inv: Option<Invoker>,
-}
-
-impl Default for DacFilter {
-    fn default() -> Self {
-        Self { inv: None }
-    }
 }
 
 impl DacFilter {
@@ -172,9 +167,9 @@ fn stat_mode_owner(path: &Path) -> Option<(u32, u32, u32)> {
     let rc2 = unsafe { libc::stat(c.as_ptr(), st_follow.as_mut_ptr()) };
     if rc2 == 0 {
         let s = unsafe { st_follow.assume_init() };
-        return Some((s.st_mode as u32, s.st_uid, s.st_gid));
+        return Some((s.st_mode, s.st_uid, s.st_gid));
     }
-    Some((st.st_mode as u32, st.st_uid, st.st_gid))
+    Some((st.st_mode, st.st_uid, st.st_gid))
 }
 
 /// Mode-bit check: does `inv` have `want_bits` (R=4, W=2, X=1) on
@@ -197,7 +192,11 @@ mod tests {
     use tempfile::TempDir;
 
     fn mk_inv(uid: u32, gid: u32) -> Invoker {
-        Invoker { uid, gid, groups: vec![gid] }
+        Invoker {
+            uid,
+            gid,
+            groups: vec![gid],
+        }
     }
 
     #[test]

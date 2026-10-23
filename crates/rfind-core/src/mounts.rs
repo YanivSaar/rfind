@@ -198,10 +198,7 @@ pub fn parse_mountinfo(text: &str) -> Vec<MountEntry> {
                 fstype: f[sep + 1].to_string(),
                 // mountinfo field 10 (sep+2) is the mount source;
                 // mountinfo escapes it the same way as root/point.
-                source: f
-                    .get(sep + 2)
-                    .map(|s| unescape(s))
-                    .unwrap_or_default(),
+                source: f.get(sep + 2).map(|s| unescape(s)).unwrap_or_default(),
                 super_options: f.get(sep + 3).unwrap_or(&"").to_string(),
             })
         })
@@ -458,10 +455,19 @@ mod tests {
         assert_eq!(mk("ext4").index_strategy(), IndexStrategy::FanotifyLive);
         assert_eq!(mk("btrfs").index_strategy(), IndexStrategy::FanotifyLive);
         assert_eq!(mk("tmpfs").index_strategy(), IndexStrategy::InotifyLive);
-        assert_eq!(mk("virtiofs").index_strategy(), IndexStrategy::PeriodicRescan);
+        assert_eq!(
+            mk("virtiofs").index_strategy(),
+            IndexStrategy::PeriodicRescan
+        );
         assert_eq!(mk("nfs4").index_strategy(), IndexStrategy::PeriodicRescan);
-        assert_eq!(mk("fuse.sshfs").index_strategy(), IndexStrategy::PeriodicRescan);
-        assert_eq!(mk("ecryptfs").index_strategy(), IndexStrategy::PeriodicRescan);
+        assert_eq!(
+            mk("fuse.sshfs").index_strategy(),
+            IndexStrategy::PeriodicRescan
+        );
+        assert_eq!(
+            mk("ecryptfs").index_strategy(),
+            IndexStrategy::PeriodicRescan
+        );
         assert_eq!(mk("proc").index_strategy(), IndexStrategy::Skip);
         assert_eq!(mk("sysfs").index_strategy(), IndexStrategy::Skip);
         assert!(mk("ext4").index_strategy().uses_fanotify());
