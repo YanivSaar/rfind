@@ -207,7 +207,11 @@ fn parse_argv_once() {
             std::process::exit(2);
         }
     }
-    let _ = DAEMON_MODE.set(if user_mode { DaemonMode::User } else { DaemonMode::System });
+    let _ = DAEMON_MODE.set(if user_mode {
+        DaemonMode::User
+    } else {
+        DaemonMode::System
+    });
     let _ = CLI_PIDFILE.set(pidfile);
 }
 
@@ -257,7 +261,7 @@ fn warn_small_runtime_dir() {
         return;
     }
     let st = unsafe { st.assume_init() };
-    let bytes_free = (st.f_bsize as u64).saturating_mul(st.f_bavail as u64);
+    let bytes_free = st.f_bsize.saturating_mul(st.f_bavail);
     const MIN: u64 = 16 * 1024 * 1024;
     if bytes_free < MIN {
         warn!(
@@ -539,9 +543,7 @@ fn main() {
             };
             let pid = unsafe { libc::getpid() };
             let msg = format!("rfindd: {name} at addr {addr:#x} (pid {pid})\n");
-            let _ = unsafe {
-                libc::write(2, msg.as_ptr() as *const _, msg.len())
-            };
+            let _ = unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()) };
             // Dump the /proc/self/maps line covering the fault address, so
             // the journal tells us whether the fault was in a file-backed
             // mmap (and which file) vs anonymous memory. async-signal-safe:
@@ -557,7 +559,9 @@ fn main() {
                             buf.as_mut_ptr().add(carry) as *mut _,
                             buf.len() - carry,
                         );
-                        if n <= 0 { break; }
+                        if n <= 0 {
+                            break;
+                        }
                         let end = carry + n as usize;
                         // Scan complete lines.
                         let mut line_start = 0usize;
@@ -590,8 +594,13 @@ fn main() {
                                     }
                                     if addr >= lo && addr < hi {
                                         let prefix = b"rfindd: map: ";
-                                        let _ = libc::write(2, prefix.as_ptr() as *const _, prefix.len());
-                                        let _ = libc::write(2, line.as_ptr() as *const _, line.len());
+                                        let _ = libc::write(
+                                            2,
+                                            prefix.as_ptr() as *const _,
+                                            prefix.len(),
+                                        );
+                                        let _ =
+                                            libc::write(2, line.as_ptr() as *const _, line.len());
                                         let _ = libc::write(2, b"\n".as_ptr() as *const _, 1);
                                     }
                                 }
@@ -601,11 +610,7 @@ fn main() {
                         // Carry trailing partial line.
                         carry = end - line_start;
                         if carry > 0 && line_start > 0 {
-                            std::ptr::copy(
-                                buf.as_ptr().add(line_start),
-                                buf.as_mut_ptr(),
-                                carry,
-                            );
+                            std::ptr::copy(buf.as_ptr().add(line_start), buf.as_mut_ptr(), carry);
                         } else if carry >= buf.len() {
                             break;
                         }
@@ -632,7 +637,9 @@ fn main() {
     // for the pre-config bootstrap window; once the config loads we
     // raise/lower via the reloadable layer below so operators can set
     // `log.level = "debug"` without rebuilding or touching env vars.
-    use tracing_subscriber::{fmt, layer::SubscriberExt, reload, util::SubscriberInitExt, EnvFilter};
+    use tracing_subscriber::{
+        fmt, layer::SubscriberExt, reload, util::SubscriberInitExt, EnvFilter,
+    };
     let have_env = std::env::var("RFIND_LOG").is_ok();
     let initial = EnvFilter::try_from_env("RFIND_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
     let (filter, filter_handle) = reload::Layer::new(initial);
@@ -712,8 +719,8 @@ fn main() {
     // filesystem — go straight to inotify.
     let runtime_env = platform::RuntimeEnv::detect();
     runtime_env.log_summary();
-    let prefer_fanotify_effective = cfg.monitor.prefer_fanotify
-        && !runtime_env.should_skip_fanotify();
+    let prefer_fanotify_effective =
+        cfg.monitor.prefer_fanotify && !runtime_env.should_skip_fanotify();
     if cfg.monitor.prefer_fanotify && !prefer_fanotify_effective {
         info!(
             "Skipping fanotify (runtime {}, caps insufficient) — using inotify",
@@ -1091,12 +1098,9 @@ fn main() {
         // progress file so `rfind status` can show the running scan.
         // bg carries (root, join_handle, start_ts, shared counter) so
         // the main loop can republish live progress each tick.
-        if bg
-            .as_ref()
-            .is_some_and(|(_, h, _, _): &(PathBuf, thread::JoinHandle<()>, u64, Arc<AtomicU64>)| {
-                h.is_finished()
-            })
-        {
+        if bg.as_ref().is_some_and(
+            |(_, h, _, _): &(PathBuf, thread::JoinHandle<()>, u64, Arc<AtomicU64>)| h.is_finished(),
+        ) {
             bg = None;
             publish_bg_scan(&conn, &ctx.mode, None);
         }

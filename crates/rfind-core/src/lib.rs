@@ -97,13 +97,14 @@ pub fn progress_file_path() -> std::path::PathBuf {
     // config module owns the XDG helpers; keep this crate dep-free by
     // computing the user path inline.
     if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        let p = std::path::PathBuf::from(xdg).join("rfind").join("progress.json");
+        let p = std::path::PathBuf::from(xdg)
+            .join("rfind")
+            .join("progress.json");
         if p.is_file() {
             return p;
         }
     } else if let Ok(home) = std::env::var("HOME") {
-        let p = std::path::PathBuf::from(home)
-            .join(".local/share/rfind/progress.json");
+        let p = std::path::PathBuf::from(home).join(".local/share/rfind/progress.json");
         if p.is_file() {
             return p;
         }

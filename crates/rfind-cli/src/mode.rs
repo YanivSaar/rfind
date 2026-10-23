@@ -130,15 +130,13 @@ fn index_available_at(path: &Path) -> bool {
 /// index (root) or live walk.
 pub fn user_index_available() -> bool {
     let p = rfind_config::user_paths::index_path();
-    std::fs::metadata(&p)
-        .map(|m| m.is_file())
-        .unwrap_or(false)
+    std::fs::metadata(&p).map(|m| m.is_file()).unwrap_or(false)
 }
 
 /// Path to the user's per-user index, when it exists.
 #[allow(dead_code)] // Exposed for callers that want the path even
-                   // without checking availability; mode.rs itself
-                   // only needs user_index_available.
+                    // without checking availability; mode.rs itself
+                    // only needs user_index_available.
 pub fn user_index_path() -> std::path::PathBuf {
     rfind_config::user_paths::index_path()
 }

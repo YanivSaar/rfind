@@ -347,8 +347,7 @@ impl Out {
             } else {
                 0.0
             };
-            let compressed = h.db_size_logical_bytes > h.db_size_bytes
-                && h.db_size_bytes > 0;
+            let compressed = h.db_size_logical_bytes > h.db_size_bytes && h.db_size_bytes > 0;
             let compression_line = if compressed {
                 let ratio = h.db_size_logical_bytes as f64 / h.db_size_bytes as f64;
                 let saved = h.db_size_logical_bytes.saturating_sub(h.db_size_bytes);

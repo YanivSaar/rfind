@@ -78,6 +78,27 @@ fi
 WORK=$(mktemp -d /tmp/rfind-install.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 
+# Narrow the PID-reuse race on kill: between `cat pidfile` and `kill`
+# the daemon can exit and the kernel can reuse the PID for an
+# unrelated process. Check /proc/<pid>/exe before signalling. Still
+# race-prone (someone could re-exec in the microsecond window), but
+# materially better than blind kill.
+kill_rfindd_safely() {
+    local pid=$1 signal=${2:-TERM}
+    [ -n "$pid" ] || return 0
+    kill -0 "$pid" 2>/dev/null || return 0
+    local exe
+    exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+    case "$exe" in
+        "$BIN_DIR/rfindd"|"$BIN_DIR/rfindd (deleted)")
+            kill -"$signal" "$pid" 2>/dev/null || true
+            ;;
+        *)
+            echo "install.sh: refusing to kill pid $pid: /proc/$pid/exe=${exe:-<unreadable>} is not $BIN_DIR/rfindd" >&2
+            ;;
+    esac
+}
+
 # ── Uninstall ─────────────────────────────────────────────────────────────────
 if [ $UNINSTALL -eq 1 ]; then
     if [ -x "$BIN_DIR/rfind" ]; then
@@ -105,7 +126,7 @@ if [ $UNINSTALL -eq 1 ]; then
             sleep 0.1
         done
         echo "install.sh: rfindd (pid $pid) still running after systemctl stop; sending SIGKILL" >&2
-        kill -KILL "$pid" 2>/dev/null || true
+        kill_rfindd_safely "$pid" KILL
         for _ in $(seq 1 30); do
             kill -0 "$pid" 2>/dev/null || return 0
             sleep 0.1
@@ -207,9 +228,37 @@ sha256-only verification, or wait for a signed release."
         fi
     fi
 
-    tar xzf "$WORK/$asset" -C "$WORK"
+    safe_extract "$WORK/$asset" "$WORK" "rfind-$arch-linux"
     PKG=$WORK/rfind-$arch-linux
     ok "verified $asset ($verified_by)"
+}
+
+# Extract a release tarball into $2 after validating its members. The
+# tarball runs through tar as root, so a compromised release producer
+# must not be able to overwrite paths outside $2 or ride on a tar
+# default (same-owner / same-permissions) that preserves root-owned,
+# world-writable, or setuid bits set by the attacker. Cosign is the
+# primary provenance control; this is defense-in-depth.
+#
+# $1 archive, $2 destination dir, $3 expected top-level directory
+safe_extract() {
+    local archive=$1 dest=$2 top=$3
+    # Reject absolute paths, parent-directory traversal, and any member
+    # outside the expected top-level dir. Also catches archives that
+    # ship symlinks that would later point outside $dest.
+    if tar -tzf "$archive" | grep -Eq '(^|/)\.\.(/|$)|^/'; then
+        die "release tarball contains unsafe path members (absolute or parent traversal)"
+    fi
+    if tar -tzf "$archive" | awk -v top="$top" '
+        $0 == top || $0 ~ "^"top"($|/)" { next }
+        { print; exit 1 }
+    ' | grep -q .; then
+        die "release tarball contains members outside expected directory '$top/'"
+    fi
+    tar -xzf "$archive" -C "$dest" \
+        --no-same-owner \
+        --no-same-permissions \
+        --no-overwrite-dir
 }
 
 from_tarball() {
@@ -238,7 +287,14 @@ from_tarball() {
         warn "re-run with RFIND_COSIGN_PUBKEY=/path/to/key.pub to require it"
     fi
 
-    tar xzf "$tb" -C "$WORK"
+    # Air-gapped bundles are built by the operator, so we don't know
+    # the exact top-level dir up front. Still reject traversal/absolute
+    # members and apply --no-same-{owner,permissions} as defence in
+    # depth against a hostile or malformed tarball.
+    if tar -tzf "$tb" | grep -Eq '(^|/)\.\.(/|$)|^/'; then
+        die "tarball contains unsafe path members (absolute or parent traversal)"
+    fi
+    tar -xzf "$tb" -C "$WORK" --no-same-owner --no-same-permissions --no-overwrite-dir
     PKG=$(find "$WORK" -maxdepth 2 -type d -name 'rfind-*-linux' | head -n1)
     [ -n "$PKG" ] && [ -x "$PKG/bin/rfindd" ] && [ -x "$PKG/bin/rfind" ] \
         || die "tarball does not contain bin/rfindd + bin/rfind"
@@ -377,7 +433,7 @@ if [ $HAS_SYSTEMD -eq 1 ] && systemctl is-active --quiet rfindd 2>/dev/null; the
         done
         if [ $STOPPED -eq 0 ]; then
             warn "rfindd (pid $PID) still running 30s after systemctl stop; sending SIGKILL"
-            kill -KILL "$PID" 2>/dev/null || true
+            kill_rfindd_safely "$PID" KILL
             for _ in $(seq 1 30); do
                 kill -0 "$PID" 2>/dev/null || { STOPPED=1; break; }
                 sleep 0.1

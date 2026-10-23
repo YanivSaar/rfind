@@ -10,10 +10,12 @@ on:
     tags: [ "v*" ]
   workflow_dispatch:
 
-permissions:
-  contents: write
-  # Required for sigstore keyless signing (cosign sign-blob --yes).
-  id-token: write
+# Default permissions: nothing. Each job grants only what it needs.
+# contents:write is scoped to `release`; id-token:write is scoped to
+# `build` (sigstore keyless signing). A compromised third-party Action
+# in `build` can therefore sign but cannot publish; one in `release`
+# can publish an already-signed artifact but cannot mint a signature.
+permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,6 +24,10 @@ jobs:
   build:
     name: Build ${{ matrix.arch }}-${{ matrix.libc }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required for sigstore keyless signing (cosign sign-blob --yes).
+      id-token: write
     # riscv64 is experimental: let it fail the job without failing
     # the whole matrix. x86_64/aarch64 (musl + gnu) stay required.
     continue-on-error: ${{ matrix.experimental == true }}
@@ -60,17 +66,22 @@ jobs:
             libc: gnu
             experimental: true
     steps:
-      - uses: actions/checkout@v7
+      # Third-party Actions pinned to full commit SHAs; the `# vX`
+      # comment names the tag the SHA was taken from so Dependabot /
+      # a reviewer can bump both together.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
 
       # zig is the C cross-compiler for the bundled SQLite; musl makes the
-      # binaries static, so they run on any distribution.
+      # binaries static, so they run on any distribution. Version-pin
+      # ziglang so release builds are reproducible across workflow runs
+      # and a silent PyPI bump cannot change the cross-compiler.
       - name: Install zig and cargo-zigbuild
         run: |
-          pip install ziglang
+          pip install 'ziglang==0.17.0'
           cargo install --locked cargo-zigbuild
 
       - name: Build
@@ -116,7 +127,7 @@ jobs:
           sha256sum $name.cdx.json > $name.cdx.json.sha256
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
       - name: Sign tarball and SBOM with cosign (keyless, sigstore)
         env:
@@ -132,7 +143,7 @@ jobs:
             --output-certificate "$name.cdx.json.pem" \
             "$name.cdx.json"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: rfind-${{ matrix.arch }}-${{ matrix.libc }}
           # The matrix row sets ARTIFACT_NAME above; expand it here
@@ -153,8 +164,13 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
+    # Only what gh release create needs. id-token is NOT granted here —
+    # the signatures were minted inside `build` and travel with the
+    # artifact; `release` just publishes bytes.
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           merge-multiple: true
       - name: Create release
