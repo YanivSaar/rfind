@@ -7,7 +7,7 @@
 *Find any file on your system in milliseconds, not minutes*
 
 [![CI](https://github.com/YanivSaar/rfind/actions/workflows/ci.yml/badge.svg)](https://github.com/YanivSaar/rfind/actions)
-[![Rust](https://img.shields.io/badge/rust-1.99%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.77%2B-orange.svg)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform: Linux](https://img.shields.io/badge/platform-Linux-green.svg)](https://kernel.org)
 
@@ -68,10 +68,12 @@ queries directly against the index — no daemon round-trip, no re-walk.
   stitching across concurrent writes); the daemon holds a pidfile
   flock so two instances cannot race; the scanner catches worker
   panics instead of hanging; crash safety is tested with SIGKILL
-  mid-write (SQLite WAL + an append-only, CRC-checked compressed VFS).
+  mid-write (append-only, CRC-checked compressed VFS; SQLite in
+  `journal_mode=TRUNCATE` to stay crash-safe on 9p/virtiofs shared
+  mmap pages).
 - **Small on disk.** The index is name-interned, directory-trie
-  structured, and zstd page-compressed by default — about 45 bytes
-  per entry on real data (69 MB for 1.54M entries, 400 MB for 10M).
+  structured, and zstd page-compressed by default — about 47 bytes
+  per entry on real data (68 MB for 1.5M entries, ~400 MB for 10M).
 - **Not a service you have to think about.** One systemd unit, one
   config file, `rfind` as a drop-in `find`/`locate` replacement for the
   common questions.
@@ -84,70 +86,85 @@ system you own, with the kernel keeping the index honest.
 
 ## ⚡ Performance
 
-Measured with `scripts/bench.sh` (release build, WSL2, 4 cores) on a real
-system with 1.54M indexed entries (450 GB of files), against plocate, GNU
-locate and find. Every query returned exactly `find`'s results.
+Measured with `scripts/bench.sh` (release build, WSL2, 4 cores) against
+plocate, GNU locate and find on a real system with **1,508,113 entries**
+and about **518 GB** of files indexed. Every query returned exactly
+`find`'s results (100% accuracy on the Linux-scope `find` baseline).
 
-| Operation | rfind | plocate | find |
-|-----------|------:|--------:|-----:|
-| Exact name (`passwd`) | **7 ms** | 14 ms | 1.6 s |
-| Under a directory (`/etc`, `*.conf`) | 7 ms | **6 ms** | 8 ms |
-| Glob `*.conf` | 127 ms | **19 ms** | 1.7 s |
-| Total size of `/usr` (9.8 GB) | **30 ms** | — | 4.1 s |
-| 10 largest files under `/usr` | **19 ms** | — | 3.5 s |
-| Change visible (create / rename / append / delete) | **≤ 5 s** | at next `updatedb` | immediate |
-| Index size | 70 MB (1.54M entries) | **5 MB** (194k entries) | — |
-| Daemon memory | 33 MB | — | — |
+| Operation | rfind | plocate | GNU locate | find |
+|-----------|------:|--------:|-----------:|-----:|
+| Exact name (`passwd`) | **13 ms** | 26 ms | 52 ms | 3.05 s |
+| Under a directory (`/etc`, `*.conf`) | **9 ms** | 8 ms | 49 ms | 9 ms |
+| Glob `*.conf` | 162 ms | **21 ms** | 59 ms | 3.24 s |
+| Glob `*.dll` (729 results) | 383 ms | 109 ms | **60 ms** | 3.03 s |
+| Regex `^lib.*\.so\.[0-9]+$` | 207 ms | **27 ms** | 214 ms | 3.68 s |
+| Total size of `/usr` (9.7 GB) | **25 ms** | — | — | 6.05 s |
+| 10 largest files under `/usr` | **24 ms** | — | — | 5.44 s |
+| Change visible (create / rename / append / delete) | **≤ 5 s** | at next `updatedb` | at next `updatedb` | immediate |
+| Index size | 68 MB (1.51M entries) | **9.6 MB** (299k entries) | 5.3 MB (299k entries) | — |
+| Bytes/entry | 47 | 33 | **18** | — |
+| Daemon RSS | 124 MB | — | — | — |
+| Initial index build (Linux scope) | **2.3 s** | 6.8 s | 2.8 s | — |
 
-> plocate's database here held only the 194k Linux-side entries while rfind
-> searched all 1.54M (including a Windows drive), so plocate's glob times are
-> not like-for-like.
+> Locate databases only cover the Linux-side scope (299k entries); rfind
+> also indexes 1.2M entries on the mounted Windows drives (`/mnt/c`,
+> `/mnt/d`) as `scan.periodic_roots`. The locate times are therefore
+> optimistic — rfind holds its ground while searching 5× more data.
 
-### Index size and speed by version
+### Index size and compression
 
-Same real system (1.54M entries), each search timed end to end:
+Live from `rfind status`:
 
-| | v0.6 | **v0.7 compressed** (default) | v0.7 plain |
-|---|---:|---:|---:|
-| **Index size** | 302 MB | **69 MB (−77%)** | 163 MB (−46%) |
-| Exact name / under / recent | 1–1.5 ms | 2–3 ms | 1.4–1.6 ms |
-| Glob `*.conf` | 94 ms | 119 ms | **66 ms** |
-| Glob `*.dll` (79k results) | **155 ms** | 253 ms | 183 ms |
-| Regex | 244 ms | 137 ms | **87 ms** |
-| Size of `/` | 521 ms | 373 ms | **296 ms** |
-| Full index incl. a Windows drive | 337 s | **247 s** | 270 s |
+```
+DB size        : 67.9 MB
+Compression    : 2.24× (logical 152.4 MB, saved 84.5 MB, 47.5 B/entry)
+```
 
-Compression trades some CPU on broad scans for a 2.4× smaller index; set
-`index.compress = false` to prefer speed.
+- **zstd-compressed pages** via `rfind-zvfs` cut the on-disk database
+  about in half compared to plain SQLite pages.
+- **Name interning + directory-trie schema** stores every basename
+  once (half of all names repeat on real systems: `index.js`,
+  `__init__.py`, …) and the tree as `(parent_dir_id, name_id)`.
+  Renaming a directory rewrites one row.
+- **~47 B/entry** on real data, trending toward 45 B/entry as the
+  index grows (shared prefixes amortise). Set `index.compress = false`
+  to switch to plain SQLite pages if you'd rather trade size for
+  slightly faster broad globs.
+- Compaction runs after every scan, so the ratio snaps back down as
+  dead-page overhead builds up and gets reclaimed — watch it live in
+  `rfind status`.
 
 ### Scale: 10 million files
 
 10,000,001 files on ext4 in 10,201 directories, half named like a real
 system's files and half random, indexed by an isolated rfindd:
 
-| | v0.6 | **v0.7 compressed** | v0.7 plain |
-|---|---:|---:|---:|
-| **Index size** | 1.35 GB | **0.40 GB (−71%)** | 0.90 GB (−34%) |
-| Daemon memory (peak) | 91 MB | 97 MB | 90 MB |
-| Initial index build | **280 s** | 423 s | 304 s |
-| Full rescan | **39 s** | 53 s | 45 s |
-| Daemon restart (journal replay) | **0.2 s** | 0.6 s | 0.2 s |
-| Exact name | 4 ms | 6 ms | **3 ms** |
-| Glob `*.json` (133k results) | 777 ms | 1.2 s | **629 ms** |
-| First 10 matches of a glob | 8 ms | 6 ms | **4 ms** |
-| Regex over all names | 1.4 s | 0.83 s | **0.48 s** |
-| Total size of all 10M files | 3.0 s | 0.94 s | **0.66 s** |
-| `--larger-than 1K` | 2.9 s | 0.81 s | **0.46 s** |
-| Change visible (create / rename / delete 50k) | ≤ 5 s | ≤ 5 s | ≤ 5 s |
+| | compressed (default) | plain |
+|---|---:|---:|
+| **Index size** | **~400 MB** | ~900 MB |
+| Daemon memory (peak) | ~95 MB | ~90 MB |
+| Initial index build | ~420 s | ~300 s |
+| Full rescan | ~55 s | ~45 s |
+| Daemon restart (journal replay) | **~0.6 s** | **~0.2 s** |
+| Exact name | ~6 ms | **~3 ms** |
+| Glob `*.json` (133k results) | ~1.2 s | **~0.6 s** |
+| First 10 matches of a glob | ~6 ms | **~4 ms** |
+| Regex over all names | ~0.8 s | **~0.5 s** |
+| Total size of all 10M files | ~0.9 s | **~0.7 s** |
+| Change visible (create / rename / delete 50k) | ≤ 5 s | ≤ 5 s |
 
 ### io_uring
 
-The scanner batches `statx` through io_uring (`scan.io_uring`, on by default):
+The scanner batches `statx` through io_uring (`scan.io_uring`, on by
+default). On WSL2 drvfs/9p and libvirt virtiofs the batched path is
+automatically disabled (page-cache eviction mid-read SIGBUSes the
+read; see [`crates/rfind-core/src/mounts.rs`](crates/rfind-core/src/mounts.rs)
+`is_mmap_fragile`):
 
 | Tree | plain `statx` | io_uring |
 |------|--------------:|---------:|
 | `/usr` on ext4 (57k entries) | 33–37k entries/s | **62–66k entries/s** |
-| `C:\Windows\System32` over 9p (35k) | 4.0k entries/s | **7.4k entries/s** |
+| `C:\Windows\System32` over 9p (35k) | 4.0k entries/s | 4.0k entries/s *(forced plain)* |
 
 ---
 
@@ -168,7 +185,7 @@ and kept current via kernel filesystem notifications. No more waiting for
 │  │   inotify    │                         │ reconcile   │
 │  │   (WSL2)     │              ┌──────────▼──────────┐  │
 │  └──────────────┘              │   entries index     │  │
-│                                │   (SQLite WAL)      │  │
+│                                │   (zvfs + TRUNCATE) │  │
 │  ┌──────────────┐    insert    │                     │  │
 │  │  getdents64  │─────────────▶│  basename index     │  │
 │  │  + statx     │              │  mtime index        │  │
@@ -230,11 +247,14 @@ sudo apt install -y cosign
 |------|-----------|
 | Install / update | `curl -fsSL https://raw.githubusercontent.com/YanivSaar/rfind/main/scripts/install.sh \| sudo bash` |
 | From a clone | `git clone https://github.com/YanivSaar/rfind.git && cd rfind && sudo ./scripts/install.sh` |
-| Specific release | `curl -fsSL …/install.sh \| sudo RFIND_VERSION=v1.0.3 bash` |
+| Specific release | `curl -fsSL …/install.sh \| sudo RFIND_VERSION=v1.10.2 bash` |
 | Build from source | `curl -fsSL …/install.sh \| sudo RFIND_FROM_SOURCE=1 bash` |
+| Air-gapped (offline) | `sudo ./install.sh --from-tarball rfind-x86_64-linux.tar.gz` ([`docs/airgapped.md`](docs/airgapped.md)) |
+| glibc build (vs musl default) | `curl -fsSL …/install.sh \| sudo RFIND_LIBC=gnu bash` |
 | Uninstall (keep index) | `sudo rfind uninstall` |
 | Uninstall + purge | `sudo rfind uninstall --purge` |
 | Watch first scan | `rfind status --watch` |
+| Mount classification | `rfind status --mounts` |
 | Benchmark vs find/locate | `sudo ./scripts/bench.sh --quick` |
 
 Updating is the same command: it rebuilds, swaps the binaries, restarts the
@@ -487,6 +507,46 @@ io_uring = true
 threads = 0         # 0 = cores × 2
 ```
 
+### User mode — one daemon per user, no root
+
+`rfindd --user` runs the daemon as the invoking user with no root privileges.
+It uses inotify (fanotify filesystem marks need `CAP_SYS_ADMIN` in the init
+userns), defaults its root to `$HOME`, and keeps all of its state under the
+user's XDG directories, so each user on a shared box can have their own
+index that no other user — including root — needs to know about:
+
+| | System mode (default) | User mode (`rfindd --user`) |
+|---|---|---|
+| Runs as | root | invoking user |
+| Monitor | fanotify (one mark per filesystem) | inotify (one watch per directory) |
+| Default roots | `/` | `$HOME` |
+| Config | `/etc/rfindd/config.toml` | `$XDG_CONFIG_HOME/rfind/config.toml` |
+| Index | `/var/lib/rfindd/index.db` | `$XDG_DATA_HOME/rfind/index.db` |
+| Pidfile | `/run/rfindd/rfindd.pid` | `$XDG_RUNTIME_DIR/rfind/rfindd.pid` |
+
+```bash
+# Start a user daemon in the background:
+rfindd --user &
+
+# From then on, `rfind` as that same user finds the per-user index on its
+# own — no --live, no sudo — and only falls back to a walk if the index
+# does not exist or does not cover the query:
+rfind "*.rs" --under ~/src
+```
+
+The CLI picks a per-user index automatically when the invoking user owns one;
+system-mode root searches are unaffected. A ready-made user unit ships at
+[`packaging/systemd/rfindd.user.service`](packaging/systemd/rfindd.user.service):
+
+```bash
+mkdir -p ~/.config/systemd/user
+install -m 644 packaging/systemd/rfindd.user.service \
+    ~/.config/systemd/user/rfindd.service
+systemctl --user daemon-reload
+systemctl --user enable --now rfindd
+loginctl enable-linger "$USER"   # keep it running across logout (optional)
+```
+
 ### Shell completions
 
 Installed for bash, zsh and fish by the installer; for other shells:
@@ -510,26 +570,55 @@ Default config is written to `/etc/rfindd/config.toml` on first run:
 ```toml
 [scan]
 roots = ["/"]
-exclude = ["/proc", "/sys", "/dev", "/run", "/media"]
+# Pseudo filesystems + package stores + container storage. /mnt is
+# intentionally NOT excluded (common place to mount drives, including
+# WSL2 Windows drives), snapshot roots are matched via `exclude_dir_names`
+# below.
+exclude = [
+    "/proc", "/sys", "/dev", "/run", "/media",
+    "/var/lib/flatpak", "/var/lib/snapd", "/snap",
+    "/nix/store", "/gnu/store",
+    "/var/lib/machines", "/var/lib/libvirt",
+    "/var/lib/docker/overlay2",
+    "/var/lib/containers/storage/overlay",
+]
+# Match these basenames anywhere in the tree (**/<name> semantics).
+# Catches btrfs/Snapper snapshots, ZFS snapshot auto-mounts, Timeshift
+# snapshot roots — all of which otherwise multiply the live tree many
+# times over in the index.
+exclude_dir_names = [".snapshots", "@snapshots", ".zfs"]
 workers = 0                    # 0 = auto-detect CPU count
 reindex_interval_hours = 6     # auto re-index every 6h in index-only mode
 collect_mtime = true           # modification times and sizes (recommended)
 io_uring = true                # batch statx through io_uring when available
+max_depth = 4096               # 0 = unbounded
 
 [index]
 db_path = "/var/lib/rfindd/index.db"
 batch_size = 10000
-compress = true                # zstd-compressed pages (~3× smaller); changing it rebuilds
+compress = true                # zstd-compressed pages (~2.2× smaller); changing it rebuilds
 
 [monitor]
 prefer_fanotify = true         # one mark per filesystem (kernel 5.9+, root)
 inotify_fallback = true        # per-directory watches if fanotify is unavailable
-watch_new_mounts = true        # index filesystems mounted under a live root later
+# Off by default: on kernels with unprivileged FUSE, an attacker-created
+# mount under a live root would otherwise trigger a root-owned walk of
+# attacker-controlled contents.
+watch_new_mounts = false
 
 [search]
 mode = "auto"                  # auto | index (never walk) | walk (never query DB)
 io_uring = true                # io_uring for walk-mode statx batching
 threads = 0                    # 0 = cores × 2 for walk mode
+# On shared boxes with multiple sudoers: re-stat each result through the
+# invoking user's fsuid/fsgid and drop paths they could not have reached
+# themselves. Off by default (one extra stat per result). See
+# docs/threat-model.md § 6a.
+filter_by_dac = false
+
+[log]
+level = "info"                 # error | warn | info | debug | trace
+                               # RFIND_LOG env takes precedence
 ```
 
 ### Periodic roots (WSL2 Windows drives, network mounts)
@@ -623,6 +712,16 @@ filesystems (`proc`, `sysfs`, …), bind-mount aliases and excluded paths are
 skipped; network, overlay and read-only filesystems are indexed but not
 monitored live (the log suggests `scan.periodic_roots` for them).
 
+**New-mount / replug detection.** `/proc/self/mountinfo` is polled; mounts
+that appear under a live root are indexed and marked, and mounts that
+disappear have their old paths swept from the index. The mount identity is
+the triple `(dev, mount_point, source)` so a USB drive unplugged and a
+different drive plugged in at the same mount point is recognised as a
+replug (the kernel can reuse `major:minor`, so `(dev, point)` alone would
+miss it and the index would keep serving stale paths from the old drive).
+`monitor.watch_new_mounts` is off by default on hosts where unprivileged
+FUSE can create mounts.
+
 **Fallback chain:**
 
 ```
@@ -678,20 +777,22 @@ rebuilt by a full scan.
 ### Compressed storage (`index.compress`, default on)
 
 `rfind-zvfs` is a SQLite VFS that keeps the database's pages
-zstd-compressed — about 3× smaller on real data:
+zstd-compressed — about 2× smaller on real data (2.24× on a typical
+Linux-side index; see Performance for the live `rfind status` numbers):
 
-- `index.db` stays an empty stub that carries SQLite's locks; the `-wal`
-  and `-shm` files work exactly as with plain SQLite, so WAL mode and
-  concurrent readers are unchanged.
+- `index.db` stays an empty stub that carries SQLite's locks; it runs
+  in `journal_mode=TRUNCATE` rather than WAL. WAL's `-shm` file is a
+  shared mmap, and 9p / virtiofs can evict a page from under the mmap
+  mid-read and SIGBUS the daemon — truncate-mode journaling avoids
+  the shared mmap entirely while keeping crash safety.
 - Pages live in an append-only `index.db-zdata.N` file of checksummed
   records; `index.db-zmap` is a page-map snapshot replaced atomically.
   Readers load the map when a read transaction starts and replay only the
   records appended since.
-- Crash safety comes from SQLite's WAL: the main database is written only
-  while checkpointing, and SQLite keeps the WAL until that checkpoint is
-  synced. A torn record at the end fails its CRC and is ignored — SQLite
-  redoes the checkpoint. Tested by SIGKILLing a writer 45 times mid-write:
-  `PRAGMA integrity_check` was `ok` every time.
+- A torn record at the end of `-zdata.N` fails its CRC and is ignored:
+  the next write re-appends past it, and the rollback journal keeps the
+  main database consistent. Tested by SIGKILLing a writer 45 times
+  mid-write — `PRAGMA integrity_check` was `ok` every time.
 - Old page versions are reclaimed by compaction (a new generation file);
   rfindd compacts after every scan, and readers still on the old file keep
   reading it until they reload.
@@ -732,37 +833,11 @@ On daemon restart:
 | 10M | ~400–500 MB | ~0.9–1.1 GB |
 | 100M | ~4–5 GB | ~9–11 GB |
 
-Measured: a real system with 1.54M entries → 69 MB compressed (45 B/entry),
-163 MB plain; 10M entries with realistic names (half random) → 396 MB
-compressed, 0.90 GB plain. v0.6.0 needed 302 MB and 1.35 GB for the same.
-
---------:|--------------------:|
-| 150k | ~30 MB |
-| 1.5M | ~300 MB |
-| 10M | ~1–2 GB |
-| 100M | ~10–20 GB |
-
-Measured: 1.52M real entries → 302 MB (~200 B/entry, long Windows paths);
-10M synthetic entries with short names → 1.03 GB (103 B/entry). Includes the
-name, directory, mtime and big-file indexes.
-
---------:|--------------------:|
-| 150k | ~30 MB |
-| 1.5M | ~300 MB |
-| 10M | ~2 GB |
-| 100M | ~20 GB |
-
-Measured: 1.46M entries (WSL2, Linux + a Windows drive) → 296 MB, about
-215 bytes/entry including the name, directory and mtime indexes.
-
---------:|--------------------:|
-| 136k | ~48 MB |
-| 1M | ~350 MB |
-| 10M | ~3.5 GB |
-| 100M | ~35 GB |
-
-Storage scales linearly. Includes mtime and discovered_at columns.
-Normalized parent-ID schema avoids storing full paths redundantly.
+Measured: 1.51M entries (WSL2, Linux + mounted Windows drives) → 68 MB
+compressed (~47 B/entry), 163 MB plain; 10M synthetic entries with
+realistic names → ~400 MB compressed, ~900 MB plain. Scaling is linear
+in the number of entries; name interning and the directory trie keep the
+per-entry bytes roughly flat as the index grows.
 
 ---
 
@@ -802,7 +877,19 @@ Normalized parent-ID schema avoids storing full paths redundantly.
 - The daemon takes `flock(LOCK_EX|LOCK_NB)` on `/run/rfindd/rfindd.pid` at startup, so a
   second instance refuses to run
 - When a filesystem is unmounted the fanotify mark and its cached mount fd are
-  dropped immediately, so a reused `fsid` cannot resolve against the wrong mount
+  dropped immediately, so a reused `fsid` cannot resolve against the wrong mount.
+  The mount watcher identifies mounts by `(dev, point, source)`, not `(dev, point)`
+  alone, so an unplug/replug at the same mount point is recognised even when the
+  kernel reuses the `major:minor` of the removed device
+- `rfindd --user` runs the daemon as the invoking user with no root and no
+  shared state: config, index, pidfile and progress file all live under the
+  user's XDG directories (`$XDG_CONFIG_HOME/rfind/`, `$XDG_DATA_HOME/rfind/`,
+  `$XDG_RUNTIME_DIR/rfind/`), each mode-0600 under a mode-0700 directory, so
+  one user's per-user index is not readable by another
+- `search.filter_by_dac` (off by default) re-stats each result through the
+  invoking user's `fsuid`/`fsgid` and drops paths they could not have reached
+  themselves, for shared boxes with multiple sudoers (see
+  [`docs/threat-model.md`](docs/threat-model.md) § 6a)
 
 ---
 
@@ -822,29 +909,23 @@ sudo ./scripts/bench.sh             # include periodic roots such as /mnt/c
 
 ### Test coverage
 
-| Suite | Tests | Needs a running rfindd |
-|-------|------:|:---:|
-| Index: upserts, subtrees, renames, sweeps, sizes, disk usage, read-only open | 17 | no |
-| Mount table: bind-mount aliases, fanotify mark points | 8 | no |
-| Config: parsing, validation, comment-preserving edits | 10 | no |
-| CLI: size parsing | 1 | no |
-| Integration: searches and invariants on the live index | 15 | yes |
+Roughly 170 `#[test]` cases across the workspace. The non-ignored suites
+run in a few seconds on a cold `cargo test`:
+
+| Area | What's covered | Needs a running rfindd |
+|------|---------------|:---:|
+| `rfind-core` | DB schema upgrades, upserts, subtrees, renames, sweeps, sizes, disk usage, mount table, bind-mount aliases, read-only open | no |
+| `rfind-config` | TOML parsing, validation, comment-preserving edits, XDG user paths | no |
+| `rfind-zvfs` | Compressed VFS pages, CRC, compaction, SIGKILL chaos | no |
+| `rfind-cli` | Search filter composition, walk-mode, size parsing, mode selection | no |
+| `rfindd` | Scanner, journal replay, mount watcher, pidfile flock, chaos under `/proc` noise | no |
+| `tests/integration` | Searches and invariants against the live index | yes |
+| `fuzz/` | libFuzzer harnesses: fanotify DFID_NAME decoder, zvfs record parser, zvfs round-trip | optional |
 
 End to end, the daemon is exercised in an isolated mount namespace
-(scanning, live events with fanotify and inotify, config reloads, new
-mounts, cancellation), and `scripts/bench.sh` checks every query against
-`find` on the real system.
-
-----------|------:|
-| Exact name match | 2 |
-| Case sensitivity | 2 |
-| Glob patterns (`*` and `?`) | 3 |
-| Scoped search (`--under`) | 3 |
-| Excluded paths | 1 |
-| Database integrity | 4 |
-| **Total** | **15** |
-
-All tests pass in ~0.2s.
+(scanning, live events with fanotify and inotify, config reloads, new /
+removed mounts, cancellation, SIGHUP reexec), and `scripts/bench.sh`
+checks every query against `find` on the real system.
 
 ---
 
@@ -871,6 +952,17 @@ All tests pass in ~0.2s.
 - [x] Searches pin a read snapshot; live-event GC runs in bulk; stats use the right dot
 - [x] Scanner work-queue uses mutex-protected notify (no lost-wakeup hang); worker panics
       are caught; io_uring buffer lifetime is sound on error paths
+- [x] WSL2 `/mnt/c` SIGBUS fix: `journal_mode=TRUNCATE` to avoid the WAL shared mmap on 9p
+- [x] `rfindd --user`: XDG per-user daemon, inotify-only, CLI auto-picks the user index
+- [x] Mount watcher: new-mount pickup and USB replug detection via `(dev, point, source)`
+- [x] `rfind status --mounts`: classify every mount (live / periodic / excluded / aliased)
+- [x] Expanded default excludes: snapshot roots, package stores, container overlays
+- [x] `search.filter_by_dac`: per-user DAC filter for shared sudoers hosts
+- [x] Signed releases: sigstore cosign keyless signing + SHA-256 fallback in `install.sh`
+- [x] Air-gapped install (`--from-tarball`) and glibc build artefacts alongside musl
+- [x] Containers / non-systemd release: OpenRC, runit, s6, dinit units; Containerfile
+- [x] Hardening docs: threat model, SELinux + AppArmor profiles, FIPS note
+- [x] libFuzzer harnesses: fanotify DFID_NAME decoder, zvfs record parser, zvfs round-trip
 - [ ] Extension index for `*.ext` globs
 - [ ] Debian / RPM packages
 
