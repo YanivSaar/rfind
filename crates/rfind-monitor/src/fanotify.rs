@@ -141,7 +141,19 @@ impl FanState {
 struct Scope {
     roots: Vec<PathBuf>,
     excludes: Vec<PathBuf>,
+    /// Max depth below each root for the moved_in / move-into subtree
+    /// walk. `None` means unbounded. An attacker who can create files
+    /// under a monitored root can otherwise make a very deep tree, move
+    /// it into scope, and have the root daemon walk it. See v1.11.
+    max_depth: Option<u32>,
 }
+
+/// Bound for the fanotify walker channel. A monitored tree can emit
+/// bursts of FAN_CREATE / FAN_MOVED_TO events far faster than
+/// `moved_in` drains them (one open+getdents per directory). Without
+/// this cap, the channel grows unbounded; with it, saturation surfaces
+/// as an overflow signal and the next tick reconciles via rescan.
+const WALKER_QUEUE_CAP: usize = 1024;
 
 /// Flips `alive` to false in Drop so the thread's exit path (clean,
 /// `break`-on-error, or panic unwind) all end up marking the monitor
@@ -182,6 +194,7 @@ impl FanotifyMonitor {
         roots: Vec<PathBuf>,
         sink: (EventSink, thread::JoinHandle<()>),
         excludes: Vec<PathBuf>,
+        max_depth: Option<u32>,
     ) -> Result<Self, FanotifyError> {
         if mark_points.is_empty() {
             return Err(FanotifyError::NoMarks);
@@ -233,7 +246,11 @@ impl FanotifyMonitor {
                 Arc::clone(&state),
                 Arc::clone(&alive),
             );
-            let scope = Arc::new(Scope { roots, excludes });
+            let scope = Arc::new(Scope {
+                roots,
+                excludes,
+                max_depth,
+            });
             thread::spawn(move || {
                 // The event loop can `break` on an unexpected read() error
                 // (lazy unmount, EIO) or panic. Either way the daemon must
@@ -579,8 +596,11 @@ fn event_loop(
 
     // Background walker: moved_in otherwise blocks the event drain while
     // read_dir()-ing a potentially huge new subtree, long enough for
-    // FAN_Q_OVERFLOW to fire. Offload the walk here.
-    let (walk_tx, walk_rx) = std::sync::mpsc::channel::<(PathBuf, bool)>();
+    // FAN_Q_OVERFLOW to fire. Offload the walk here. Bounded so an
+    // unprivileged event flood can't grow the queue without limit; on
+    // saturation we flip the kernel-overflow flag and the next tick
+    // reconciles the gap via rescan.
+    let (walk_tx, walk_rx) = std::sync::mpsc::sync_channel::<(PathBuf, bool)>(WALKER_QUEUE_CAP);
     let walker = {
         let sc = Arc::clone(&scope);
         let sk = sink.clone();
@@ -607,6 +627,18 @@ fn event_loop(
                 }
             }
         })
+    };
+
+    // Non-blocking enqueue onto the bounded walker channel. A full queue
+    // means the walker fell behind an event burst; promote to overflow
+    // (same signal path FAN_Q_OVERFLOW uses) so the next daemon tick
+    // forces a scoped reconcile instead of blocking the event drain.
+    let overflow_for_tx = Arc::clone(&overflow);
+    let try_enqueue = |p: PathBuf, is_dir: bool| {
+        if let Err(std::sync::mpsc::TrySendError::Full(_)) = walk_tx.try_send((p, is_dir)) {
+            warn!("fanotify walker queue full — rescan scheduled");
+            overflow_for_tx.store(true, Ordering::Relaxed);
+        }
     };
 
     loop {
@@ -677,9 +709,7 @@ fn event_loop(
                         Some(lossy(new.as_ref().unwrap())),
                         is_dir,
                     ),
-                    (false, true) => {
-                        let _ = walk_tx.send((new.unwrap(), is_dir));
-                    }
+                    (false, true) => try_enqueue(new.unwrap(), is_dir),
                     (true, false) => sink.send(
                         EventType::Delete,
                         lossy(old.as_ref().unwrap()),
@@ -695,7 +725,7 @@ fn event_loop(
             }
             let path = path.unwrap();
             if meta.mask & FAN_MOVED_TO != 0 {
-                let _ = walk_tx.send((path, is_dir));
+                try_enqueue(path, is_dir);
             } else if meta.mask & (FAN_DELETE | FAN_MOVED_FROM) != 0 {
                 sink.send(EventType::Delete, lossy(&path), None, is_dir);
             } else if meta.mask & FAN_CREATE != 0 {
@@ -723,11 +753,17 @@ fn moved_in(sink: &EventSink, scope: &Scope, path: &Path, is_dir: bool) {
     if !is_dir {
         return;
     }
-    let mut stack = vec![path.to_path_buf()];
-    while let Some(dir) = stack.pop() {
+    // Depth-bounded descent: without this, an unprivileged user who can
+    // write under a monitored root can create a very deep tree, rename
+    // it into scope, and have the root daemon walk every level. Mirrors
+    // the scanner's scan.max_depth enforcement.
+    let mut stack: Vec<(PathBuf, u32)> = vec![(path.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
         let Ok(rd) = read_dir_safe(&dir) else {
             continue;
         };
+        let child_depth = depth.saturating_add(1);
+        let push_allowed = scope.max_depth.is_none_or(|m| m == 0 || child_depth < m);
         for entry in rd.flatten() {
             // Reconstruct from the real dir — see watch_new_tree.
             let p = dir.join(entry.file_name());
@@ -736,8 +772,8 @@ fn moved_in(sink: &EventSink, scope: &Scope, path: &Path, is_dir: bool) {
             }
             let d = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
             sink.send(EventType::Create, lossy(&p), None, d);
-            if d {
-                stack.push(p);
+            if d && push_allowed {
+                stack.push((p, child_depth));
             }
         }
     }

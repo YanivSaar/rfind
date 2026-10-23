@@ -121,11 +121,7 @@ pub fn scan_root_with_counter(
     // behind the v1.10 WSL2 regression. We still keep siblings/other
     // branches of the exclude in effect; only ancestors of this scan
     // root are dropped.
-    let is_periodic = cfg
-        .scan
-        .periodic_roots
-        .iter()
-        .any(|r| r.path == *root);
+    let is_periodic = cfg.scan.periodic_roots.iter().any(|r| r.path == *root);
     let mut skip: Vec<PathBuf> = if is_periodic {
         cfg.scan
             .exclude

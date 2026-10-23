@@ -99,7 +99,11 @@ impl RuntimeEnv {
             self.caps.cap_sys_admin,
             self.caps.cap_dac_read_search,
             self.caps.in_userns,
-            if self.should_skip_fanotify() { "skip (will use inotify)" } else { "attempt" },
+            if self.should_skip_fanotify() {
+                "skip (will use inotify)"
+            } else {
+                "attempt"
+            },
         );
     }
 }

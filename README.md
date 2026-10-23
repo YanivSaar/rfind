@@ -231,15 +231,19 @@ systemd service. On WSL2 a first install configures Windows drives as
 periodic roots.
 
 Each release tarball is signed keyless with [sigstore cosign][cosign] via
-GitHub OIDC. If `cosign` is installed, `install.sh` verifies the signature
-against this repo's `release.yml` identity before unpacking; otherwise it
-falls back to the published SHA-256. For the strongest guarantee, install
-cosign first:
+GitHub OIDC. `install.sh` **requires** `cosign` by default and verifies
+the signature against this repo's `release.yml` identity before
+unpacking. Install cosign first:
 
 ```bash
 # Debian/Ubuntu example — see sigstore.dev for other distros.
 sudo apt install -y cosign
 ```
+
+To accept the published SHA-256 instead (checksum only — not provenance;
+the checksum ships from the same release bucket as the tarball, so a
+compromised release path defeats it), explicitly opt out:
+`RFIND_REQUIRE_COSIGN=0 curl … | sudo bash`.
 
 [cosign]: https://docs.sigstore.dev/cosign/overview/
 
@@ -851,10 +855,15 @@ per-entry bytes roughly flat as the index grows.
   plus `fanotify_*`/`*_handle_at` minus `@mount @reboot @swap @module @obsolete`.
   `systemd-analyze security rfindd`: **2.1 OK** (unconfined would score ~9.5).
 - Release tarballs are signed **keyless with sigstore cosign** via GitHub OIDC;
-  `install.sh` verifies the signature against this repo's `release.yml` identity when
-  `cosign` is installed, falling back to the published SHA-256 otherwise.
+  `install.sh` **requires** cosign by default (`RFIND_REQUIRE_COSIGN=1`) and verifies
+  the signature against this repo's `release.yml` identity. Set `RFIND_REQUIRE_COSIGN=0`
+  to accept the published SHA-256 instead — note that is a checksum, not provenance.
+  The air-gapped `--from-tarball` path fails closed when `RFIND_COSIGN_PUBKEY` is set.
 - `RFIND_CONFIG` on the **daemon** must be an absolute path under `/etc/rfindd/`; any
-  other value is logged and ignored. (The CLI stays permissive.)
+  other value is logged and ignored. The **CLI** applies the same restriction when it
+  detects it is running under sudo (`geteuid()==0 && SUDO_USER` is set), to defuse
+  `sudo -E RFIND_CONFIG=/etc/shadow rfind config reset`. Interactive non-sudo root is
+  still trusted (dev / CI setups).
 - The index is **root-only** (`/var/lib/rfindd` is `0700`, the database `0600`): it lists every
   file name on the system, including other users' files, so `rfind` searches need `sudo`
 - Index at `/var/lib/rfindd/index.db` — root-owned

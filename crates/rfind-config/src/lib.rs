@@ -305,7 +305,7 @@ pub mod user_paths {
     pub fn runtime_dir() -> PathBuf {
         std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|| data_dir())
+            .unwrap_or_else(data_dir)
             .join("rfind")
     }
 

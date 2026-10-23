@@ -43,6 +43,7 @@ impl Monitor {
     ///
     /// `mark_points`: one mount point per filesystem to cover (fanotify).
     /// `dirs`: directories to watch up front (inotify fast restart).
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         roots: &[PathBuf],
         mark_points: &[PathBuf],
@@ -51,6 +52,7 @@ impl Monitor {
         excludes: Vec<PathBuf>,
         prefer_fanotify: bool,
         inotify_fallback: bool,
+        max_depth: Option<u32>,
     ) -> Result<(Self, String), MonitorError> {
         // Each backend owns its own sink + writer. If fanotify fails and
         // we fall back to inotify, the first writer has already exited
@@ -59,7 +61,13 @@ impl Monitor {
         // spawn in practice — the fallback starts fresh.
         if prefer_fanotify {
             let sink = sink::spawn_writer(Arc::clone(&db));
-            match FanotifyMonitor::start(mark_points, roots.to_vec(), sink, excludes.clone()) {
+            match FanotifyMonitor::start(
+                mark_points,
+                roots.to_vec(),
+                sink,
+                excludes.clone(),
+                max_depth,
+            ) {
                 Ok(m) => return Ok((Monitor::Fanotify(m), "fanotify".to_string())),
                 Err(e) => {
                     tracing::warn!("fanotify unavailable: {e}");
@@ -72,7 +80,7 @@ impl Monitor {
 
         if inotify_fallback {
             let sink = sink::spawn_writer(Arc::clone(&db));
-            match InotifyMonitor::start(dirs, sink, excludes) {
+            match InotifyMonitor::start(dirs, sink, excludes, max_depth) {
                 Ok(m) => return Ok((Monitor::Inotify(m), "inotify".to_string())),
                 Err(e) => {
                     tracing::warn!("inotify unavailable: {e}");

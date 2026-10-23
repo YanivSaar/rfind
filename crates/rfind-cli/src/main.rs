@@ -1096,27 +1096,20 @@ fn print_mount_report(cfg: &rfind_config::Config) {
     let mounts = read_mountinfo();
     let under_live = |m: &rfind_core::mounts::MountEntry| {
         cfg.scan.roots.iter().any(|r| m.point.starts_with(r))
-            || cfg
-                .scan
-                .roots
-                .iter()
-                .any(|r| r.starts_with(&m.point))
+            || cfg.scan.roots.iter().any(|r| r.starts_with(&m.point))
     };
     let is_excluded = |p: &std::path::Path| cfg.scan.exclude.iter().any(|e| p.starts_with(e));
 
     println!();
     println!("Mounts under live roots:");
-    println!("  {:<30} {:<12} {}", "MOUNT", "FSTYPE", "STRATEGY — WHY");
+    println!("  {:<30} {:<12} STRATEGY — WHY", "MOUNT", "FSTYPE");
 
     let mut any = false;
     for m in mounts.iter().filter(|m| under_live(m)) {
         any = true;
         let excluded = is_excluded(&m.point);
         let (strat, why) = if excluded {
-            (
-                "skip",
-                "excluded by scan.exclude".to_string(),
-            )
+            ("skip", "excluded by scan.exclude".to_string())
         } else {
             let s = m.index_strategy();
             let w = match s {

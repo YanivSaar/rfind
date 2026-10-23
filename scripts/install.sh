@@ -225,17 +225,35 @@ from_tarball() {
 
     # Offline cosign: expects the signature + certificate as siblings and
     # a local public key at $tb.cosign.pub (or RFIND_COSIGN_PUBKEY).
-    local pub=${RFIND_COSIGN_PUBKEY:-$tb.cosign.pub}
+    #
+    # Policy (v1.11): an explicitly configured RFIND_COSIGN_PUBKEY means
+    # the operator wants provenance; any missing precondition (no cosign,
+    # no key, no signature, bad signature) is a hard failure. Without an
+    # explicit key, keep the opportunistic verify-if-possible behaviour
+    # for air-gapped bundles the operator built themselves.
     local sig=$tb.sig
-    if command -v cosign >/dev/null 2>&1 && [ -r "$sig" ] && [ -r "$pub" ]; then
-        if cosign verify-blob --key "$pub" --signature "$sig" "$tb" >/dev/null 2>&1; then
-            ok "cosign signature verified against $pub"
-        else
-            die "cosign signature check failed for $tb"
-        fi
+    if [ -n "${RFIND_COSIGN_PUBKEY:-}" ]; then
+        command -v cosign >/dev/null 2>&1 \
+            || die "RFIND_COSIGN_PUBKEY is set but cosign is not installed; install cosign or unset the variable"
+        [ -r "$RFIND_COSIGN_PUBKEY" ] \
+            || die "RFIND_COSIGN_PUBKEY=$RFIND_COSIGN_PUBKEY is unreadable"
+        [ -r "$sig" ] \
+            || die "RFIND_COSIGN_PUBKEY is set but $sig is missing — provenance cannot be verified"
+        cosign verify-blob --key "$RFIND_COSIGN_PUBKEY" --signature "$sig" "$tb" >/dev/null 2>&1 \
+            || die "cosign signature check failed for $tb"
+        ok "cosign signature verified against $RFIND_COSIGN_PUBKEY"
     else
-        warn "cosign offline verification skipped (no cosign, or no $sig / $pub)"
-        warn "re-run with RFIND_COSIGN_PUBKEY=/path/to/key.pub to require it"
+        local pub=$tb.cosign.pub
+        if command -v cosign >/dev/null 2>&1 && [ -r "$sig" ] && [ -r "$pub" ]; then
+            if cosign verify-blob --key "$pub" --signature "$sig" "$tb" >/dev/null 2>&1; then
+                ok "cosign signature verified against $pub"
+            else
+                die "cosign signature check failed for $tb"
+            fi
+        else
+            warn "cosign offline verification skipped (no cosign, or no $sig / $pub)"
+            warn "re-run with RFIND_COSIGN_PUBKEY=/path/to/key.pub to require it"
+        fi
     fi
 
     tar xzf "$tb" -C "$WORK"

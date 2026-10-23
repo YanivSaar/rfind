@@ -85,7 +85,15 @@ struct Watches {
     /// daemon tick re-indexes rather than silently losing events in
     /// newly-created directories we can't watch any more.
     overflow: Arc<AtomicBool>,
+    /// Max depth below each new subtree in watch_new_tree. `None` means
+    /// unbounded. Mirrors the fanotify backend's Scope.max_depth and the
+    /// scanner's scan.max_depth. See v1.11.
+    max_depth: Option<u32>,
 }
+
+/// Bound for the inotify walker channel. See WALKER_QUEUE_CAP in
+/// fanotify.rs for the rationale; same number here for symmetry.
+const WALKER_QUEUE_CAP: usize = 1024;
 
 /// Poison-tolerant lock on the wd→path map: a transient panic in a holder
 /// (e.g. inside watch_new_tree) must not take every subsequent operation
@@ -220,6 +228,7 @@ impl InotifyMonitor {
         dirs: Vec<String>,
         sink: (EventSink, thread::JoinHandle<()>),
         excludes: Vec<PathBuf>,
+        max_depth: Option<u32>,
     ) -> Result<Self, InotifyError> {
         let fd = unsafe { inotify_init1(IN_NONBLOCK | IN_CLOEXEC) };
         if fd < 0 {
@@ -232,6 +241,7 @@ impl InotifyMonitor {
             excludes,
             last_warn: Mutex::new(None),
             overflow: Arc::clone(&overflow),
+            max_depth,
         });
 
         for dir in &dirs {
@@ -336,8 +346,10 @@ fn event_loop(
     // Background walker: when a directory is created or moved into the
     // watched tree, draining the subtree inline would hold the kernel
     // event drain long enough that a large `mv` can overflow IN_Q.
-    // Offload the walk here instead.
-    let (walk_tx, walk_rx) = std::sync::mpsc::channel::<PathBuf>();
+    // Offload the walk here instead. Bounded so an unprivileged event
+    // flood cannot grow the queue without limit; on saturation we flip
+    // the overflow flag and the next tick reconciles via rescan.
+    let (walk_tx, walk_rx) = std::sync::mpsc::sync_channel::<PathBuf>(WALKER_QUEUE_CAP);
     let walker = {
         let w = Arc::clone(&watches);
         let s = sink.clone();
@@ -364,6 +376,18 @@ fn event_loop(
                 }
             }
         })
+    };
+
+    // Non-blocking enqueue onto the bounded walker channel. A full queue
+    // means the walker fell behind an event burst; promote to overflow
+    // so the next tick forces a scoped reconcile instead of blocking
+    // the event drain. See fanotify.rs for the same pattern.
+    let overflow_for_tx = Arc::clone(&overflow);
+    let try_enqueue = |p: PathBuf| {
+        if let Err(std::sync::mpsc::TrySendError::Full(_)) = walk_tx.try_send(p) {
+            warn!("inotify walker queue full — rescan scheduled");
+            overflow_for_tx.store(true, Ordering::Relaxed);
+        }
     };
 
     loop {
@@ -436,7 +460,7 @@ fn event_loop(
             if ev.mask & IN_CREATE != 0 {
                 sink.send(EventType::Create, lossy(&full_path), None, is_dir);
                 if is_dir {
-                    let _ = walk_tx.send(full_path.clone());
+                    try_enqueue(full_path.clone());
                 }
             } else if ev.mask & IN_DELETE_SELF != 0 {
                 // IN_DELETE on the parent is authoritative for this entry;
@@ -469,7 +493,7 @@ fn event_loop(
                     // Moved in from outside the watched tree.
                     sink.send(EventType::Create, lossy(&full_path), None, is_dir);
                     if is_dir {
-                        let _ = walk_tx.send(full_path.clone());
+                        try_enqueue(full_path.clone());
                     }
                 }
             } else if ev.mask & IN_CLOSE_WRITE != 0 {
@@ -511,12 +535,18 @@ fn expire_moves(watches: &Watches, sink: &EventSink, moves: &mut HashMap<u32, Pe
 /// descend. `read_dir_safe` fails that `openat2` and we skip the subtree.
 fn watch_new_tree(watches: &Watches, sink: &EventSink, root: &Path) {
     use rfind_core::safewalk::read_dir_safe;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
+    // Depth-bounded descent: mirrors moved_in in fanotify.rs. An
+    // unprivileged user who can write under a monitored root could
+    // otherwise create a very deep tree, rename it into scope, and have
+    // the daemon walk every level.
+    let mut stack: Vec<(PathBuf, u32)> = vec![(root.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
         watches.add(&dir);
         let Ok(rd) = read_dir_safe(&dir) else {
             continue;
         };
+        let child_depth = depth.saturating_add(1);
+        let push_allowed = watches.max_depth.is_none_or(|m| m == 0 || child_depth < m);
         for entry in rd.flatten() {
             // `read_dir_safe` reads via /proc/self/fd/<n>, so
             // `entry.path()` would be `/proc/self/fd/n/<name>` —
@@ -527,8 +557,8 @@ fn watch_new_tree(watches: &Watches, sink: &EventSink, root: &Path) {
             }
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
             sink.send(EventType::Create, lossy(&path), None, is_dir);
-            if is_dir {
-                stack.push(path);
+            if is_dir && push_allowed {
+                stack.push((path, child_depth));
             }
         }
     }

@@ -142,6 +142,24 @@ pub enum PeriodicCmd {
 /// trying (and failing) to read the root-owned system config.
 pub fn config_path() -> PathBuf {
     if let Some(v) = std::env::var_os("RFIND_CONFIG") {
+        // When the CLI runs as root through sudo (SUDO_USER is set), the
+        // RFIND_CONFIG value came from the invoking user's environment —
+        // either because sudoers preserved it, or because `sudo -E` was
+        // used. The daemon pins RFIND_CONFIG to /etc/rfindd/* for exactly
+        // this reason; mirror that here so a value like /etc/shadow or
+        // /etc/sudoers cannot be used as a `rfind config reset` target.
+        // Interactive non-sudo root is still trusted (dev / CI setups).
+        if is_privileged_via_sudo() {
+            let p = PathBuf::from(&v);
+            if !path_under_etc_rfindd(&p) {
+                eprintln!(
+                    "rfind: refusing RFIND_CONFIG={} under sudo: must be an absolute path under /etc/rfindd/",
+                    p.display()
+                );
+                std::process::exit(2);
+            }
+            return p;
+        }
         return PathBuf::from(v);
     }
     let user = rfind_config::user_paths::config_path();
@@ -149,6 +167,18 @@ pub fn config_path() -> PathBuf {
         return user;
     }
     PathBuf::from(rfind_config::DEFAULT_CONFIG_PATH)
+}
+
+fn is_privileged_via_sudo() -> bool {
+    (unsafe { libc::geteuid() } == 0) && std::env::var_os("SUDO_USER").is_some()
+}
+
+fn path_under_etc_rfindd(p: &Path) -> bool {
+    p.is_absolute()
+        && p.starts_with("/etc/rfindd/")
+        && !p
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
 }
 
 fn edit_err(e: EditError) -> Failed {
@@ -539,9 +569,21 @@ fn edit_cmd(out: &mut Out, path: &Path, reload: ReloadOpt) -> CmdResult {
         .map_err(|e| fail(format!("cannot write {}: {e}", tmp.display())))?;
     drop(f);
 
-    let editor = std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| "vi".into());
+    // Under sudo, follow the sudoedit convention: SUDO_EDITOR beats
+    // VISUAL/EDITOR. SUDO_EDITOR is sanitized by sudo and names the
+    // tool the admin configured for privileged edits, so a hostile
+    // VISUAL/EDITOR carried from the invoking user's shell cannot
+    // choose the root-executed binary.
+    let editor = if is_privileged_via_sudo() {
+        std::env::var("SUDO_EDITOR")
+            .or_else(|_| std::env::var("VISUAL"))
+            .or_else(|_| std::env::var("EDITOR"))
+            .unwrap_or_else(|_| "vi".into())
+    } else {
+        std::env::var("VISUAL")
+            .or_else(|_| std::env::var("EDITOR"))
+            .unwrap_or_else(|_| "vi".into())
+    };
     let result = loop {
         // Invoke the editor without shell re-parsing: `sh -c 'exec "$0" "$@"'`
         // runs $0 as a plain program argument, so a hostile EDITOR
