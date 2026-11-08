@@ -22,7 +22,7 @@
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use std::{collections::HashMap, path::Path};
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// `dirs.id` of the root directory `/`.
 const ROOT: i64 = 1;
@@ -96,11 +96,13 @@ pub fn open_with(path: &Path, compress: bool) -> Result<Connection> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS names (
-            id   INTEGER PRIMARY KEY,
-            name TEXT    NOT NULL,
-            hash INTEGER NOT NULL          -- name_hash(name)
+            id        INTEGER PRIMARY KEY,
+            name      TEXT    NOT NULL,
+            hash      INTEGER NOT NULL,    -- name_hash(name)
+            extension TEXT                 -- suffix after last '.'; NULL for no-extension names
         );
         CREATE INDEX IF NOT EXISTS idx_names_hash ON names (hash);
+        CREATE INDEX IF NOT EXISTS idx_names_ext  ON names (extension);
 
         CREATE TABLE IF NOT EXISTS dirs (
             id      INTEGER PRIMARY KEY,
@@ -269,12 +271,24 @@ fn find_name(conn: &Connection, name: &str) -> Result<Option<i64>> {
         .optional()
 }
 
+/// Extension of a file name: the part after the last `.`.
+/// Returns `None` for names with no dot, a leading dot only (`.bashrc`),
+/// or a trailing dot (`foo.`).
+fn name_extension(name: &str) -> Option<&str> {
+    let dot = name.rfind('.')?;
+    if dot == 0 || dot + 1 >= name.len() {
+        return None;
+    }
+    Some(&name[dot + 1..])
+}
+
 fn name_or_create(conn: &Connection, name: &str) -> Result<i64> {
     if let Some(id) = find_name(conn, name)? {
         return Ok(id);
     }
-    conn.prepare_cached("INSERT INTO names (name, hash) VALUES (?1, ?2)")?
-        .execute(params![name, name_hash(name)])?;
+    let ext = name_extension(name);
+    conn.prepare_cached("INSERT INTO names (name, hash, extension) VALUES (?1, ?2, ?3)")?
+        .execute(params![name, name_hash(name), ext])?;
     Ok(conn.last_insert_rowid())
 }
 
@@ -396,6 +410,9 @@ pub use stats::*;
 
 mod events;
 pub use events::*;
+
+mod dupes;
+pub use dupes::*;
 
 // ---------------------------------------------------------------------------
 // Metadata
@@ -630,18 +647,19 @@ mod tests {
         insert_entry(&c, "/d/sub/deep/c.txt", false, 0, 0, 3, None).unwrap();
         insert_entry(&c, "/dx/other", false, 0, 0, 5, None).unwrap();
 
-        let u = dir_usage(&c, "/d").unwrap();
+        let (u, _) = usage(&c, "/d", 0).unwrap();
         assert_eq!((u.files, u.dirs, u.bytes), (3, 1, 1023));
-        assert_eq!(dir_usage(&c, "/").unwrap().bytes, 1028);
+        assert_eq!(usage(&c, "/", 0).unwrap().0.bytes, 1028);
 
-        let b = usage_breakdown(&c, "/d", 10).unwrap();
+        let (_, b) = usage(&c, "/d", 10).unwrap();
         let rows: Vec<_> = b
             .iter()
             .map(|u| (u.name.as_str(), u.files, u.bytes))
             .collect();
         assert_eq!(rows, vec![("a.iso", 1, 1000), ("sub", 2, 23)]);
-        let top: Vec<_> = usage_breakdown(&c, "/", 10)
+        let top: Vec<_> = usage(&c, "/", 10)
             .unwrap()
+            .1
             .into_iter()
             .map(|u| (u.name, u.bytes))
             .collect();
@@ -674,6 +692,52 @@ mod tests {
         })
         .unwrap();
         assert_eq!(v, vec![("/a/big".into(), 5000), ("/a/mid".into(), 500)]);
+    }
+
+    #[test]
+    fn extension_index_stored_and_queried() {
+        let c = mem();
+        for p in ["/a/main.rs", "/b/lib.rs", "/c/main.py", "/d/Makefile"] {
+            add(&c, p, false, None);
+        }
+        // Verify extension column is populated.
+        let mut exts: Vec<Option<String>> = c
+            .prepare("SELECT extension FROM names WHERE name NOT IN ('a','b','c','d') ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        exts.sort();
+        assert_eq!(
+            exts,
+            vec![None, Some("py".into()), Some("rs".into()), Some("rs".into())]
+        );
+        // *.rs glob uses the extension index.
+        let mut rs_hits = glob(&c, "*.rs");
+        rs_hits.sort();
+        assert_eq!(rs_hits, vec!["/a/main.rs", "/b/lib.rs"]);
+        // Plain glob still works.
+        assert_eq!(glob(&c, "*.py"), vec!["/c/main.py"]);
+        // Exact name still works.
+        assert_eq!(glob(&c, "Makefile"), vec!["/d/Makefile"]);
+    }
+
+    #[test]
+    fn extension_null_for_dotfiles_and_no_extension() {
+        let c = mem();
+        for p in ["/a/.bashrc", "/b/Makefile", "/c/foo."] {
+            add(&c, p, false, None);
+        }
+        let exts: Vec<Option<String>> = c
+            .prepare("SELECT extension FROM names WHERE name IN ('.bashrc','Makefile','foo.') ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        // .bashrc: dot at position 0 → NULL; Makefile: no dot → NULL; foo.: trailing dot → NULL
+        assert_eq!(exts, vec![None, None, None]);
     }
 
     #[test]

@@ -116,16 +116,6 @@ pub fn usage(conn: &Connection, path: &str, top: usize) -> Result<(Usage, Vec<Us
     Ok((total, out))
 }
 
-/// Total files, directories and bytes under `path` (recursively).
-pub fn dir_usage(conn: &Connection, path: &str) -> Result<Usage> {
-    usage(conn, path, 0).map(|(t, _)| t)
-}
-
-/// The `limit` largest direct children of `path`; see [`usage`].
-pub fn usage_breakdown(conn: &Connection, path: &str, limit: usize) -> Result<Vec<Usage>> {
-    usage(conn, path, limit).map(|(_, c)| c)
-}
-
 /// Directories ranked by the total size of their subtree (sum of every
 /// file beneath them, recursive — like `du`), biggest first.
 pub fn largest_dirs_streaming(

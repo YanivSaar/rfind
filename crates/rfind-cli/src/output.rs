@@ -12,6 +12,14 @@ use rfind_core::{
 use serde_json::{json, Value};
 use std::io::{self, BufWriter, Write};
 
+/// How `--exec` / `--exec-batch` runs commands against results.
+pub enum ExecMode {
+    /// Run `CMD ARGS` once per result; `{}` in any arg is replaced by the path.
+    PerFile(Vec<String>),
+    /// Collect all paths, then run `CMD ARGS PATH1 PATH2 …` once at the end.
+    Batch(Vec<String>),
+}
+
 pub struct Out {
     /// Filters results against the invoking user's DAC permissions
     /// when `sudo rfind` runs on a shared box with
@@ -25,6 +33,12 @@ pub struct Out {
     /// Separate records with `\0` instead of `\n` (xargs -0, jq -0).
     /// Applies to text, long, and JSON hit lines.
     pub print0: bool,
+    /// Print a single count instead of streaming paths.
+    pub count_only: bool,
+    /// Execute a command for each result (or once for all, in batch mode).
+    pub exec: Option<ExecMode>,
+    exec_failed: bool,
+    batch_paths: Vec<String>,
     stdout: BufWriter<io::Stdout>,
 }
 
@@ -115,8 +129,60 @@ impl Out {
             json,
             long: false,
             print0: false,
+            count_only: false,
+            exec: None,
+            exec_failed: false,
+            batch_paths: Vec::new(),
             stdout: BufWriter::new(io::stdout()),
         }
+    }
+
+    /// Dispatch exec for one path: run immediately (PerFile) or enqueue (Batch).
+    fn run_exec(&mut self, path: &str) {
+        // Phase 1: read exec config and build per-file args (releases borrow).
+        let action: Option<Vec<String>> = match &self.exec {
+            None => return,
+            Some(ExecMode::PerFile(tmpl)) => {
+                Some(tmpl.iter().map(|a| a.replace("{}", path)).collect())
+            }
+            Some(ExecMode::Batch(_)) => None, // collect below
+        };
+        // Phase 2: act (may mutate self).
+        match action {
+            Some(args) if !args.is_empty() => {
+                match std::process::Command::new(&args[0]).args(&args[1..]).spawn() {
+                    Ok(mut child) => {
+                        if child.wait().map_or(true, |s| !s.success()) {
+                            self.exec_failed = true;
+                        }
+                    }
+                    Err(_) => self.exec_failed = true,
+                }
+            }
+            Some(_) => {} // empty template — nothing to run
+            None => self.batch_paths.push(path.to_string()),
+        }
+    }
+
+    /// Run the batch command (if any) with all collected paths. Returns false
+    /// if any exec command exited non-zero.
+    pub fn flush_exec(&mut self) -> bool {
+        if let Some(ExecMode::Batch(tmpl)) = &self.exec {
+            let tmpl = tmpl.clone();
+            let paths = std::mem::take(&mut self.batch_paths);
+            if !paths.is_empty() && !tmpl.is_empty() {
+                match std::process::Command::new(&tmpl[0])
+                    .args(&tmpl[1..])
+                    .args(&paths)
+                    .spawn()
+                    .and_then(|mut c| c.wait())
+                {
+                    Ok(st) if st.success() => {}
+                    _ => self.exec_failed = true,
+                }
+            }
+        }
+        !self.exec_failed
     }
 
     /// Write one line; false once stdout is closed (e.g. piped into head).
@@ -145,30 +211,37 @@ impl Out {
         if !self.dac_filter.keep(std::path::Path::new(h.path)) {
             return true;
         }
-        if self.json {
-            let v = json!({ "path": h.path, "type": kind(h.is_dir), "size": h.size, "mtime": h.mtime_sec });
-            self.line(&v.to_string())
-        } else if self.long {
-            // Directories don't carry their own size in the index — show
-            // "-" except when a sort fills it in (e.g. --largest --type d
-            // ranks dirs by their subtree size).
-            let size = if h.is_dir && h.size == 0 {
-                "-".to_string()
+        if !self.count_only {
+            let keep = if self.json {
+                let v = json!({ "path": h.path, "type": kind(h.is_dir), "size": h.size, "mtime": h.mtime_sec });
+                self.line(&v.to_string())
+            } else if self.long {
+                // Directories don't carry their own size in the index — show
+                // "-" except when a sort fills it in (e.g. --largest --type d
+                // ranks dirs by their subtree size).
+                let size = if h.is_dir && h.size == 0 {
+                    "-".to_string()
+                } else {
+                    human(h.size)
+                };
+                // mtime 0 means "not meaningful here" (e.g. the computed
+                // subtree total has no natural time); print a dash instead
+                // of 1970-01-01.
+                let when = if h.mtime_sec == 0 {
+                    "-".to_string()
+                } else {
+                    local_time(h.mtime_sec)
+                };
+                self.line(&format!("{size:>9}  {when:<19}  {}", h.path))
             } else {
-                human(h.size)
+                self.line(h.path)
             };
-            // mtime 0 means "not meaningful here" (e.g. the computed
-            // subtree total has no natural time); print a dash instead
-            // of 1970-01-01.
-            let when = if h.mtime_sec == 0 {
-                "-".to_string()
-            } else {
-                local_time(h.mtime_sec)
-            };
-            self.line(&format!("{size:>9}  {when:<19}  {}", h.path))
-        } else {
-            self.line(h.path)
+            if !keep {
+                return false;
+            }
         }
+        self.run_exec(h.path);
+        true
     }
 
     /// `rfind size`: a tree's total and its largest children.
@@ -203,32 +276,47 @@ impl Out {
     }
 
     pub fn recent(&mut self, e: &RecentEntry) -> bool {
-        if self.json {
-            let v = json!({
-                "path": e.full_path, "type": kind(e.is_dir), "size": e.size,
-                "mtime": e.mtime_sec, "modified": local_time(e.mtime_sec),
-            });
-            self.line(&v.to_string())
-        } else if self.long {
-            let size = if e.is_dir {
-                "-".to_string()
+        if !self.count_only {
+            let keep = if self.json {
+                let v = json!({
+                    "path": e.full_path, "type": kind(e.is_dir), "size": e.size,
+                    "mtime": e.mtime_sec, "modified": local_time(e.mtime_sec),
+                });
+                self.line(&v.to_string())
+            } else if self.long {
+                let size = if e.is_dir {
+                    "-".to_string()
+                } else {
+                    human(e.size)
+                };
+                self.line(&format!(
+                    "{size:>9}  {}  {}",
+                    local_time(e.mtime_sec),
+                    e.full_path
+                ))
             } else {
-                human(e.size)
+                self.line(&format!("{}  {}", local_time(e.mtime_sec), e.full_path))
             };
-            self.line(&format!(
-                "{size:>9}  {}  {}",
-                local_time(e.mtime_sec),
-                e.full_path
-            ))
-        } else {
-            self.line(&format!("{}  {}", local_time(e.mtime_sec), e.full_path))
+            if !keep {
+                return false;
+            }
         }
+        self.run_exec(&e.full_path);
+        true
     }
 
     /// End of a result stream.
     pub fn count(&mut self, n: u64) {
         let _ = self.stdout.flush();
-        if !self.json {
+        if self.count_only {
+            if self.json {
+                let v = json!({ "count": n });
+                let _ = writeln!(self.stdout, "{v}");
+            } else {
+                let _ = writeln!(self.stdout, "{n}");
+            }
+            let _ = self.stdout.flush();
+        } else if !self.json {
             eprintln!("\n{n} result(s)");
         }
     }

@@ -20,3 +20,4 @@ clap_complete = "4"
 serde = { version = "1.0.229", features = ["derive"] }
 regex-lite = "0.1"
 tempfile = "3"
+blake3 = "1"

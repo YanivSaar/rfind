@@ -197,6 +197,17 @@ fn is_glob(pattern: &str) -> bool {
     pattern.contains(['*', '?'])
 }
 
+/// If `pattern` is of the form `*.ext` where `ext` contains no `.`, `*`,
+/// `?`, or `[`, return `ext`. These patterns are answered by the extension
+/// index instead of a full names-table GLOB scan.
+fn pure_extension(pattern: &str) -> Option<&str> {
+    let ext = pattern.strip_prefix("*.")?;
+    if ext.is_empty() || ext.contains(['.', '*', '?', '[']) {
+        return None;
+    }
+    Some(ext)
+}
+
 /// Call `on_result` for each entry whose name matches `pattern` (exact, or
 /// GLOB when it contains `*`, `?` or `[`). Return false from the callback
 /// to stop early (e.g. --limit reached).
@@ -220,6 +231,33 @@ pub fn search_by_glob_streaming(
             conn,
             &sql,
             &[&nid],
+            limit,
+            limit.is_none(),
+            None,
+            &mut on_result,
+        );
+    }
+    // Fast path: `*.ext` patterns use the extension index — a single B-tree
+    // probe instead of a full names-table GLOB scan.
+    if let Some(ext) = pure_extension(pattern) {
+        let sql = if filter.big_only() {
+            format!(
+                "SELECT {HIT_COLS} FROM {} JOIN names n ON n.id = e.name_id
+                 WHERE n.extension = ?1{}",
+                entries_from(conn, true),
+                filter.clause()
+            )
+        } else {
+            format!(
+                "SELECT {HIT_COLS} FROM names n CROSS JOIN entries e ON e.name_id = n.id
+                 WHERE n.extension = ?1{}",
+                filter.clause()
+            )
+        };
+        return stream_hits(
+            conn,
+            &sql,
+            &[&ext],
             limit,
             limit.is_none(),
             None,
@@ -475,6 +513,119 @@ pub fn search_by_regex_streaming(
         (None, true) => stream_hits(conn, &sql, &[], limit, sort, check, &mut on_result),
         (Some(r), true) => stream_hits(conn, &sql, &[&r], limit, sort, check, &mut on_result),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Diff
+// ---------------------------------------------------------------------------
+
+/// Kind of change reported by [`diff_since`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum DiffChange {
+    /// Entry has a mtime newer than the cutoff (added or modified).
+    Changed,
+    /// Entry was deleted (sourced from `pending_events` — only recent
+    /// deletions are available before the events are pruned).
+    Deleted,
+}
+
+/// One entry in a diff result.
+#[derive(Debug, Clone)]
+pub struct DiffEntry {
+    pub path: String,
+    pub change: DiffChange,
+    pub mtime_sec: i64,
+}
+
+/// Stream entries whose mtime > `since_epoch` (added/modified) plus
+/// recent deletions from `pending_events`.
+pub fn diff_since(
+    conn: &Connection,
+    since_epoch: i64,
+    filter: &Filter,
+    mut on_result: impl FnMut(&DiffEntry) -> bool,
+) -> Result<u64> {
+    let mut count = 0u64;
+    // Phase 1: changed/added entries (mtime > cutoff).
+    let sql = format!(
+        "SELECT e.dir_id, n.name, e.mtime_sec FROM entries e
+         JOIN names n ON n.id = e.name_id
+         WHERE e.mtime_sec > ?1{}
+         ORDER BY e.mtime_sec DESC",
+        filter.clause()
+    );
+    let mut paths = PathCache::default();
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let mut rows = stmt.query(params![since_epoch])?;
+    while let Some(row) = rows.next()? {
+        let path = paths.full(conn, row.get(0)?, row.get_ref(1)?.as_str()?)?;
+        let entry = DiffEntry { path, change: DiffChange::Changed, mtime_sec: row.get(2)? };
+        if !on_result(&entry) {
+            return Ok(count);
+        }
+        count += 1;
+    }
+    // Phase 2: recent deletions still in pending_events (pruned after apply).
+    let mut stmt = conn.prepare_cached(
+        "SELECT path, timestamp FROM pending_events
+         WHERE applied = 1 AND event_type = 'DELETE' AND timestamp > ?1
+         ORDER BY timestamp DESC",
+    )?;
+    let mut rows = stmt.query(params![since_epoch])?;
+    while let Some(row) = rows.next()? {
+        let entry = DiffEntry {
+            path: row.get(0)?,
+            change: DiffChange::Deleted,
+            mtime_sec: row.get(1)?,
+        };
+        if !on_result(&entry) {
+            return Ok(count);
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
+// ---------------------------------------------------------------------------
+// Watch
+// ---------------------------------------------------------------------------
+
+/// One event returned by [`poll_applied_events_since`].
+#[derive(Debug, Clone)]
+pub struct WatchEvent {
+    pub id: i64,
+    pub event_type: String,
+    pub path: String,
+    pub new_path: Option<String>,
+}
+
+/// Poll for applied events newer than `after_id`. Returns events in id order.
+pub fn poll_applied_events_since(
+    conn: &Connection,
+    after_id: i64,
+) -> Result<Vec<WatchEvent>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, event_type, path, new_path FROM pending_events
+         WHERE applied = 1 AND id > ?1 ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map(params![after_id], |r| {
+        Ok(WatchEvent {
+            id: r.get(0)?,
+            event_type: r.get(1)?,
+            path: r.get(2)?,
+            new_path: r.get(3)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Largest applied event id, or 0 if no events exist.
+pub fn max_applied_event_id(conn: &Connection) -> Result<i64> {
+    conn.query_row(
+        "SELECT COALESCE(MAX(id), 0) FROM pending_events WHERE applied = 1",
+        [],
+        |r| r.get(0),
+    )
 }
 
 pub(super) fn register_regexp(conn: &Connection) -> Result<()> {

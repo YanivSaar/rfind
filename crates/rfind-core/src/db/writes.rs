@@ -164,18 +164,6 @@ fn maybe_gc(conn: &Connection, deletes: usize) -> Result<()> {
     Ok(())
 }
 
-pub fn delete_entry_by_path(conn: &Connection, path: &str) -> Result<usize> {
-    let n = match locate(conn, path)? {
-        Some((did, nid)) => conn.execute(
-            "DELETE FROM entries WHERE dir_id = ?1 AND name_id = ?2",
-            params![did, nid],
-        )?,
-        None => 0,
-    };
-    maybe_gc(conn, n)?;
-    Ok(n)
-}
-
 /// Run `f` inside a SQLite SAVEPOINT so a mid-op failure rolls back the
 /// partial writes. Savepoints nest cleanly inside an outer transaction
 /// (reconcile wraps a tx around a batch) AND work on an auto-commit

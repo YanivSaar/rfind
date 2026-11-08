@@ -12,7 +12,7 @@ mod privacy_report;
 mod uninstall;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
-use output::Out;
+use output::{ExecMode, Out};
 use rfind_config::load as load_config;
 use rfind_core::{
     db,
@@ -217,6 +217,26 @@ struct SearchArgs {
     /// End of a date range, inclusive (YYYY-MM-DD).
     #[arg(long, requires = "from", value_name = "DATE")]
     to: Option<String>,
+
+    /// Print a single integer count instead of streaming paths.
+    #[arg(long)]
+    count: bool,
+
+    /// After the initial results, stay running and print matching paths as
+    /// the index is updated (polls every 2 s). Ctrl+C to exit.
+    #[arg(long)]
+    watch: bool,
+
+    /// Run CMD per result; `{}` in any argument is replaced by the path.
+    /// Place `--exec` after all rfind flags: clap reads its args greedily.
+    #[arg(long, num_args = 1.., value_name = "CMD",
+          allow_hyphen_values = true, conflicts_with = "exec_batch")]
+    exec: Vec<String>,
+
+    /// Run CMD once with all matching paths appended as arguments.
+    #[arg(long = "exec-batch", num_args = 1.., value_name = "CMD",
+          allow_hyphen_values = true, conflicts_with = "exec")]
+    exec_batch: Vec<String>,
 
     /// Walk the filesystem instead of querying the index.
     #[arg(long, visible_alias = "no-index")]
@@ -475,6 +495,40 @@ enum Command {
         yes: bool,
     },
 
+    /// Show what changed on the filesystem since a point in time.
+    ///
+    /// Added/modified entries come from the index (mtime); deletions come
+    /// from pending_events (only recent ones, before they are pruned).
+    Diff {
+        /// Changed since N hours ago.
+        #[arg(long, conflicts_with_all = ["minutes", "days"], value_name = "N")]
+        hours: Option<i64>,
+        /// Changed since N minutes ago.
+        #[arg(long, conflicts_with_all = ["hours", "days"], value_name = "N")]
+        minutes: Option<i64>,
+        /// Changed since N days ago.
+        #[arg(long, conflicts_with_all = ["hours", "minutes"], value_name = "N")]
+        days: Option<i64>,
+        /// Only report changes under DIR.
+        #[arg(long, value_name = "DIR")]
+        under: Option<String>,
+        #[command(flatten)]
+        filter: FilterArgs,
+    },
+
+    /// Find files with identical content.
+    Dupes {
+        /// Only search under DIR.
+        #[arg(long, value_name = "DIR")]
+        under: Option<String>,
+        /// Ignore files smaller than SIZE (e.g. 1K, 1M). Default: 1.
+        #[arg(long, default_value = "1", value_name = "SIZE", value_parser = parse_size)]
+        min_size: u64,
+        /// Machine-readable: one JSON array per group.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Print a shell completion script (bash, zsh, fish, elvish, powershell).
     #[command(after_help = "\
 Install, e.g.:
@@ -657,6 +711,12 @@ fn cmd_search(out: &mut Out, a: &SearchArgs) -> CmdResult {
     // wants to see. Same with --print0.
     out.long = a.filter.long || a.largest;
     out.print0 = a.print0;
+    out.count_only = a.count;
+    if !a.exec.is_empty() {
+        out.exec = Some(ExecMode::PerFile(a.exec.clone()));
+    } else if !a.exec_batch.is_empty() {
+        out.exec = Some(ExecMode::Batch(a.exec_batch.clone()));
+    }
 
     let cfg = config()?;
     let request = mode::Request {
@@ -676,10 +736,19 @@ fn cmd_search(out: &mut Out, a: &SearchArgs) -> CmdResult {
             eprintln!("rfind: {msg}");
         }
     }
-    match chosen {
+    // --watch enters the watch loop first (it re-runs the search itself).
+    if a.watch && matches!(chosen, mode::Mode::Index) {
+        return cmd_watch(out, a);
+    }
+    let result = match chosen {
         mode::Mode::Index => cmd_search_index(out, a, &cfg),
         mode::Mode::Walk => cmd_search_walk(out, a),
+    };
+    // Flush batch exec (no-op when exec is PerFile or unset).
+    if !out.flush_exec() {
+        return Ok(ExitCode::FAILURE);
     }
+    result
 }
 
 /// Query the SQLite index (requires root). Previously the body of
@@ -1271,6 +1340,175 @@ fn legacy_largest(
 // main
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// diff — mtime-based index diff
+// ---------------------------------------------------------------------------
+
+fn cmd_diff(
+    out: &mut Out,
+    hours: Option<i64>,
+    minutes: Option<i64>,
+    days: Option<i64>,
+    under: Option<&str>,
+    filter: &FilterArgs,
+) -> CmdResult {
+    let conn = open_db()?;
+    let n_now = now();
+    let since = if let Some(h) = hours {
+        n_now - h * 3600
+    } else if let Some(m) = minutes {
+        n_now - m * 60
+    } else if let Some(d) = days {
+        n_now - d * 86400
+    } else {
+        n_now - 3600 // default: 1 hour
+    };
+    let db_filter = filter.filter(n_now)?;
+    let mut n = 0u64;
+    db::diff_since(&conn, since, &db_filter, |e| {
+        if let Some(u) = under {
+            if !under_prefix(&e.path, u) {
+                return true;
+            }
+        }
+        let prefix = match e.change {
+            db::DiffChange::Changed => "[~]",
+            db::DiffChange::Deleted => "[-]",
+        };
+        n += 1;
+        if out.json {
+            let kind = match e.change {
+                db::DiffChange::Changed => "changed",
+                db::DiffChange::Deleted => "deleted",
+            };
+            let v = serde_json::json!({ "path": e.path, "change": kind, "mtime": e.mtime_sec });
+            println!("{v}");
+        } else {
+            println!("{prefix} {}", e.path);
+        }
+        true
+    })
+    .map_err(|e| fail(format!("diff: {e}")))?;
+    found(n)
+}
+
+// ---------------------------------------------------------------------------
+// dupes — duplicate file finder
+// ---------------------------------------------------------------------------
+
+fn cmd_dupes(out: &mut Out, under: Option<&str>, min_size: u64, json_mode: bool) -> CmdResult {
+    let conn = open_db()?;
+    // Phase 1: find files sharing a size (SQL, no I/O).
+    let candidates = db::find_size_candidates(&conn, under, min_size)
+        .map_err(|e| fail(format!("dupes: {e}")))?;
+    if candidates.is_empty() {
+        out.count(0);
+        return found(0);
+    }
+    // Phase 2: hash candidates and group by hash.
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    for same_size in candidates {
+        let mut by_hash: std::collections::HashMap<[u8; 32], Vec<String>> =
+            std::collections::HashMap::new();
+        for path in same_size {
+            let hash = match hash_file(&path) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            by_hash.entry(hash).or_default().push(path);
+        }
+        for (_, mut paths) in by_hash {
+            if paths.len() >= 2 {
+                paths.sort();
+                groups.push(paths);
+            }
+        }
+    }
+    groups.sort_by(|a, b| a[0].cmp(&b[0]));
+    let total: u64 = groups.iter().map(|g| g.len() as u64).sum();
+    for group in &groups {
+        if json_mode {
+            let v = serde_json::json!(group);
+            println!("{v}");
+        } else {
+            for path in group {
+                println!("{path}");
+            }
+            println!();
+        }
+    }
+    found(total)
+}
+
+fn hash_file(path: &str) -> std::io::Result<[u8; 32]> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 65536];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+// ---------------------------------------------------------------------------
+// watch — tail the index for matching changes
+// ---------------------------------------------------------------------------
+
+fn cmd_watch(out: &mut Out, a: &SearchArgs) -> CmdResult {
+    // Initial search — reuse existing search path.
+    cmd_search(out, a)?;
+    // Open a second read-only connection for polling.
+    let conn = open_db()?;
+    let kind = PatternKind::build(a)?;
+    let under = a.under.as_deref();
+    let mut last_id = db::max_applied_event_id(&conn)
+        .map_err(|e| fail(format!("watch: {e}")))?;
+    eprintln!("rfind: watching for changes (Ctrl+C to exit)…");
+    loop {
+        thread::sleep(Duration::from_secs(2));
+        let events = match db::poll_applied_events_since(&conn, last_id) {
+            Ok(ev) => ev,
+            Err(_) => continue,
+        };
+        for ev in events {
+            last_id = ev.id;
+            // Check under constraint.
+            let path = &ev.path;
+            if let Some(u) = under {
+                if !under_prefix(path, u) {
+                    continue;
+                }
+            }
+            // Check pattern.
+            let basename_only = matches!(kind, PatternKind::NameGlob(_) | PatternKind::NameRegex(_));
+            let match_target = if basename_only { basename(path) } else { path.as_str() };
+            if !kind.matches(match_target) {
+                continue;
+            }
+            let prefix = match ev.event_type.as_str() {
+                "CREATE" => "[+]",
+                "DELETE" => "[-]",
+                "RENAME" => "[>]",
+                _ => "[~]",
+            };
+            if out.json {
+                let v = serde_json::json!({ "event": ev.event_type, "path": path });
+                println!("{v}");
+            } else {
+                println!("{prefix} {path}");
+                if let Some(np) = &ev.new_path {
+                    println!("    → {np}");
+                }
+            }
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let mut out = Out::new(cli.json);
@@ -1324,6 +1562,12 @@ fn main() -> ExitCode {
             Command::Reload => cmd_signal(&mut out, libc::SIGHUP, "Configuration reloaded"),
             Command::Config(cmd) => config_cmd::run(&mut out, cmd),
             Command::PrivacyReport => privacy_report::run(&mut out),
+            Command::Diff { hours, minutes, days, under, filter } => {
+                cmd_diff(&mut out, hours, minutes, days, under.as_deref(), &filter)
+            }
+            Command::Dupes { under, min_size, json: json_mode } => {
+                cmd_dupes(&mut out, under.as_deref(), min_size, json_mode)
+            }
             Command::Completions { shell } => {
                 clap_complete::generate(
                     shell,
